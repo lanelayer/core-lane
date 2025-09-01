@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*~
+*.pdb
+
+# Cargo
+Cargo.lock
+
+# Generated demo files
+*.json
+broadcast_info.json
+embedded_transaction.json
+envelope.json
+reveal_transaction.json
+
+# Bitcoin Core data
+bitcoin-regtest/
+.bitcoin/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment variables
+.env
+.env.local
