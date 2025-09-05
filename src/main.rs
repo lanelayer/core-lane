@@ -1173,7 +1173,7 @@ impl CoreMELNode {
         // The burnt value is the difference between inputs and spendable outputs
         if total_input > total_spendable_output {
             let burnt_value = total_input - total_spendable_output;
-            info!("   💰 Burn calculation (fallback): {} sats input - {} sats spendable output = {} sats burnt", 
+            info!("   💰 Burn calculation (fallback): {} sats input - {} sats spendable output = {} sats burnt",
                 total_input, total_spendable_output, burnt_value);
             burnt_value
         } else {
@@ -1388,7 +1388,7 @@ impl CoreMELNode {
         chain_id: u32,
         eth_address: &str,
         wallet: &str,
-        _network: &str,
+        network: &str,
     ) -> Result<()> {
         info!(
             "🔥 Creating Bitcoin burn transaction using wallet '{}'...",
@@ -1415,8 +1415,18 @@ impl CoreMELNode {
             ));
         }
 
+        // Convert network string to Bitcoin Network enum
+        let bitcoin_network = match network.to_lowercase().as_str() {
+            "mainnet" => bitcoin::Network::Bitcoin,
+            "testnet" => bitcoin::Network::Testnet,
+            "signet" => bitcoin::Network::Signet,
+            "regtest" => bitcoin::Network::Regtest,
+            _ => bitcoin::Network::Regtest,
+        };
+
         info!("📋 Burn Details:");
         info!("   Wallet: {}", wallet);
+        info!("   Network: {} ({:?})", network, bitcoin_network);
         info!("   Burn amount: {} sats", burn_amount);
         info!("   Chain ID: {}", chain_id);
         info!("   ETH address: {}", eth_address);
@@ -1523,7 +1533,7 @@ impl CoreMELNode {
             bitcoin::blockdata::script::WScriptHash::from_slice(&script_hash.to_byte_array())?;
         let p2wsh_address = bitcoin::Address::p2wsh(
             &ScriptBuf::new_p2wsh(&wscript_hash),
-            bitcoin::Network::Regtest,
+            bitcoin_network,
         );
 
         info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
@@ -1559,7 +1569,7 @@ impl CoreMELNode {
             if let Ok(change_addr) = change_addr_result {
                 let change_addr_str = change_addr.as_str().unwrap();
                 let change_address = bitcoin::Address::from_str(change_addr_str)?
-                    .require_network(bitcoin::Network::Regtest)?;
+                    .require_network(bitcoin_network)?;
                 tx_outputs.push(TxOut {
                     value: Amount::from_sat(change_amount),
                     script_pubkey: change_address.script_pubkey(),
