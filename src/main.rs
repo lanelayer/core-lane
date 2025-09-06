@@ -306,6 +306,16 @@ impl CoreMELNode {
         }
     }
 
+    fn parse_network(network: &str) -> Result<bitcoin::Network, String> {
+        match network.to_lowercase().as_str() {
+            "mainnet" => Ok(bitcoin::Network::Bitcoin),
+            "testnet" => Ok(bitcoin::Network::Testnet),
+            "signet" => Ok(bitcoin::Network::Signet),
+            "regtest" => Ok(bitcoin::Network::Regtest),
+            _ => Err(format!("unknown network: {}", network)),
+        }
+    }
+
     // Helper function to get current state
     async fn get_state(&self) -> CoreMELState {
         self.state.lock().await.clone()
@@ -534,7 +544,7 @@ impl CoreMELNode {
                     "   🔥 Found Bitcoin burn in tx {}: {} ({}sats)",
                     tx_index, txid, burn_value
                 );
-                self.process_bitcoin_burn(payload, burn_value, txid.to_string())
+                self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
                     .await?;
 
                 // Add burn transaction to current block
@@ -1191,6 +1201,7 @@ impl CoreMELNode {
         payload: Vec<u8>,
         burn_value: u64,
         txid: String,
+        _network: &str,
     ) -> Result<()> {
         // Extract chain ID and ETH address from BRN1 payload
         if payload.len() >= 28 && &payload[0..4] == b"BRN1" {
@@ -1416,13 +1427,7 @@ impl CoreMELNode {
         }
 
         // Convert network string to Bitcoin Network enum
-        let bitcoin_network = match network.to_lowercase().as_str() {
-            "mainnet" => bitcoin::Network::Bitcoin,
-            "testnet" => bitcoin::Network::Testnet,
-            "signet" => bitcoin::Network::Signet,
-            "regtest" => bitcoin::Network::Regtest,
-            _ => bitcoin::Network::Regtest,
-        };
+        let bitcoin_network = Self::parse_network(network).map_err(|e| anyhow!(e))?;
 
         info!("📋 Burn Details:");
         info!("   Wallet: {}", wallet);
@@ -1531,10 +1536,8 @@ impl CoreMELNode {
         let script_hash = sha256::Hash::hash(burn_script.as_bytes());
         let wscript_hash =
             bitcoin::blockdata::script::WScriptHash::from_slice(&script_hash.to_byte_array())?;
-        let p2wsh_address = bitcoin::Address::p2wsh(
-            &ScriptBuf::new_p2wsh(&wscript_hash),
-            bitcoin_network,
-        );
+        let p2wsh_address =
+            bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), bitcoin_network);
 
         info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
         debug!("📝 Burn script: {}", burn_script);
@@ -1744,6 +1747,127 @@ impl CoreMELNode {
             .send_transaction_to_da(raw_tx_hex, fee_sats, wallet, network)
             .await?;
         Ok(())
+    }
+
+    /// Confirm burns by scanning blocks from a specific starting height
+    /// This allows users to verify burns and optionally process DA transactions
+    async fn confirm_burns_from_height(&self, start_height: u64, include_da: bool) -> Result<()> {
+        info!(
+            "🔥 Starting burn confirmation scan from height {}",
+            start_height
+        );
+
+        let tip = self.bitcoin_client.get_block_count()?;
+
+        if start_height > tip {
+            return Err(anyhow!(
+                "Start height {} is greater than current tip {}",
+                start_height,
+                tip
+            ));
+        }
+
+        info!(
+            "📊 Scanning blocks {} to {} for burn confirmations",
+            start_height, tip
+        );
+
+        let mut total_burns_found = 0;
+        let mut total_da_found = 0;
+        let mut total_burn_value = 0u64;
+
+        for height in start_height..=tip {
+            match self
+                .process_block_for_confirmation(height, include_da)
+                .await
+            {
+                Ok((burns, da_count, burn_value)) => {
+                    total_burns_found += burns;
+                    total_da_found += da_count;
+                    total_burn_value += burn_value;
+
+                    if burns > 0 {
+                        info!(
+                            "✅ Block {}: Found {} burns ({} sats total)",
+                            height, burns, burn_value
+                        );
+                    }
+                    if include_da && da_count > 0 {
+                        info!("📦 Block {}: Found {} DA transactions", height, da_count);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Error processing block {}: {}", height, e);
+                }
+            }
+        }
+
+        info!("🏁 Burn confirmation scan completed!");
+        info!("📊 Summary:");
+        info!(
+            "   🔥 Total burns found: {} ({} sats)",
+            total_burns_found, total_burn_value
+        );
+        if include_da {
+            info!("   📦 Total DA transactions found: {}", total_da_found);
+        }
+        info!("   📏 Blocks scanned: {}", tip - start_height + 1);
+
+        Ok(())
+    }
+
+    /// Process a single block for burn confirmation (similar to process_block but focused on confirmation)
+    async fn process_block_for_confirmation(
+        &self,
+        height: u64,
+        include_da: bool,
+    ) -> Result<(usize, usize, u64)> {
+        let hash = self.bitcoin_client.get_block_hash(height)?;
+        let block = self.bitcoin_client.get_block(&hash)?;
+
+        let mut burn_count = 0;
+        let mut da_count = 0;
+        let mut total_burn_value = 0u64;
+
+        // Process burns
+        for (tx_index, tx) in block.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+
+            if let Some((payload, burn_value)) = self.extract_burn_payload_from_tx(&tx) {
+                burn_count += 1;
+                total_burn_value += burn_value;
+
+                info!(
+                    "   🔥 Confirmed burn in tx {}: {} ({} sats) - Block {}",
+                    tx_index, txid, burn_value, height
+                );
+
+                // Process the burn (mint tokens)
+                self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
+                    .await?;
+            }
+        }
+
+        // Process DA transactions if requested
+        if include_da {
+            for (tx_index, tx) in block.txdata.iter().enumerate() {
+                let txid = tx.compute_txid();
+
+                if let Some(mel_tx) = self.extract_core_mel_transaction(tx) {
+                    da_count += 1;
+
+                    info!(
+                        "   📦 Confirmed DA transaction in tx {}: {} - Block {}",
+                        tx_index, txid, height
+                    );
+
+                    // Process the DA transaction
+                    self.process_core_mel_transaction(mel_tx).await?;
+                }
+            }
+        }
+
+        Ok((burn_count, da_count, total_burn_value))
     }
 }
 
