@@ -617,7 +617,10 @@ impl RpcServer {
                 // Add block information
                 result.insert(
                     "blockHash".to_string(),
-                    json!(format!("0x{:x}", state.blocks.get(&stored_tx.block_number).unwrap().hash)),
+                    json!(format!(
+                        "0x{:x}",
+                        state.blocks.get(&stored_tx.block_number).unwrap().hash
+                    )),
                 );
                 result.insert(
                     "blockNumber".to_string(),
@@ -683,7 +686,10 @@ impl RpcServer {
             );
             if let Some(block) = state.blocks.get(&receipt.block_number) {
                 let block_hash = block.hash;
-                result.insert("blockHash".to_string(), json!(format!("0x{:x}", block_hash)));
+                result.insert(
+                    "blockHash".to_string(),
+                    json!(format!("0x{:x}", block_hash)),
+                );
             } else {
                 return Ok(JsonResponse::from(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
@@ -1547,7 +1553,7 @@ impl RpcServer {
             id: request.id,
         }))
     }
- 
+
     async fn handle_net_listening(
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
