@@ -1,6 +1,11 @@
-use anyhow::{Result, anyhow};
-use bitcoin::{ScriptBuf, blockdata::script::Builder, blockdata::opcodes::{OP_FALSE, OP_TRUE}, blockdata::opcodes::all::{OP_IF, OP_ENDIF}, Address as BitcoinAddress, Network, Transaction, Witness};
-use bitcoincore_rpc::{RpcApi, Client};
+use anyhow::{anyhow, Result};
+use bitcoin::{
+    blockdata::opcodes::all::{OP_ENDIF, OP_IF},
+    blockdata::opcodes::{OP_FALSE, OP_TRUE},
+    blockdata::script::Builder,
+    Address as BitcoinAddress, Network, ScriptBuf, Transaction, Witness,
+};
+use bitcoincore_rpc::{Client, RpcApi};
 use serde_json;
 use std::sync::Arc;
 
@@ -13,18 +18,30 @@ impl TaprootDA {
         Self { bitcoin_client }
     }
 
-    pub async fn send_transaction_to_da(&self, raw_tx_hex: &str, fee_sats: u64, wallet: &str, network: &str) -> Result<String> {
+    pub async fn send_transaction_to_da(
+        &self,
+        raw_tx_hex: &str,
+        fee_sats: u64,
+        wallet: &str,
+        network: &str,
+    ) -> Result<String> {
         println!("🚀 Creating Core MEL transaction in Bitcoin DA (commit + reveal in one tx)...");
-        println!("📝 Ethereum transaction: {}...", &raw_tx_hex[..64.min(raw_tx_hex.len())]);
+        println!(
+            "📝 Ethereum transaction: {}...",
+            &raw_tx_hex[..64.min(raw_tx_hex.len())]
+        );
         println!("💰 Fee: {} sats", fee_sats);
 
         // Validate the Ethereum transaction hex
-        let tx_bytes = hex::decode(raw_tx_hex)
-            .map_err(|e| anyhow!("Invalid hex format: {}", e))?;
+        let tx_bytes = hex::decode(raw_tx_hex).map_err(|e| anyhow!("Invalid hex format: {}", e))?;
 
         println!("🔍 Raw Ethereum transaction:");
         println!("   📝 Input hex: {}", raw_tx_hex);
-        println!("   📏 Input length: {} chars ({} bytes)", raw_tx_hex.len(), tx_bytes.len());
+        println!(
+            "   📏 Input length: {} chars ({} bytes)",
+            raw_tx_hex.len(),
+            tx_bytes.len()
+        );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
         // Create Core MEL payload: CORE_MEL prefix + Ethereum transaction
@@ -36,10 +53,8 @@ impl TaprootDA {
         println!("📦 Core MEL payload hex: {}", hex::encode(&payload));
 
         // Check wallet balance
-        let balance_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "getbalances",
-            &[]
-        );
+        let balance_result: Result<serde_json::Value, _> =
+            self.bitcoin_client.call("getbalances", &[]);
 
         let available_balance = match balance_result {
             Ok(balances) => {
@@ -60,13 +75,23 @@ impl TaprootDA {
         println!("💰 Available balance: {} sats", available_balance);
 
         if available_balance < fee_sats {
-            return Err(anyhow!("Insufficient balance: {} sats available, {} sats needed", available_balance, fee_sats));
+            return Err(anyhow!(
+                "Insufficient balance: {} sats available, {} sats needed",
+                available_balance,
+                fee_sats
+            ));
         }
 
         // Get unspent outputs
         let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "listunspent", 
-            &[serde_json::json!(0), serde_json::json!(9999999), serde_json::json!([]), serde_json::json!(true), serde_json::json!({"minimumAmount": (fee_sats as f64 + 1000.0) / 100_000_000.0})]
+            "listunspent",
+            &[
+                serde_json::json!(0),
+                serde_json::json!(9999999),
+                serde_json::json!([]),
+                serde_json::json!(true),
+                serde_json::json!({"minimumAmount": (fee_sats as f64 + 1000.0) / 100_000_000.0}),
+            ],
         );
 
         let unspent = match unspent_result {
@@ -84,12 +109,16 @@ impl TaprootDA {
         let prev_vout = utxo["vout"].as_u64().unwrap() as u32;
         let prev_amount = (utxo["amount"].as_f64().unwrap() * 100_000_000.0) as u64;
 
-        println!("📍 Using UTXO: {}:{} ({} sats)", prev_txid, prev_vout, prev_amount);
+        println!(
+            "📍 Using UTXO: {}:{} ({} sats)",
+            prev_txid, prev_vout, prev_amount
+        );
 
         // Create a Taproot output with Core MEL data embedded
         let envelope_script = self.create_taproot_envelope_script(&payload)?;
-        let (taproot_address, internal_key, control_block) = self.create_taproot_address_with_info(&payload, network)?;
-        
+        let (taproot_address, internal_key, control_block) =
+            self.create_taproot_address_with_info(&payload, network)?;
+
         println!("🎯 Created Taproot address: {}", taproot_address);
         println!("🔑 Internal key: {}", internal_key);
 
@@ -103,20 +132,29 @@ impl TaprootDA {
         let mut outputs = serde_json::Map::new();
 
         // Add the Taproot output with the Core MEL data
-        outputs.insert(taproot_address.to_string(), serde_json::json!(fee_sats as f64 / 100_000_000.0));
+        outputs.insert(
+            taproot_address.to_string(),
+            serde_json::json!(fee_sats as f64 / 100_000_000.0),
+        );
 
         // Add change output if substantial enough
         let estimated_tx_fee = 2000u64; // Higher fee for complex transaction
-        let change_amount = prev_amount.saturating_sub(fee_sats).saturating_sub(estimated_tx_fee);
-        if change_amount > 546 { // dust threshold
+        let change_amount = prev_amount
+            .saturating_sub(fee_sats)
+            .saturating_sub(estimated_tx_fee);
+        if change_amount > 546 {
+            // dust threshold
             let change_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
                 "getnewaddress",
-                &[serde_json::json!(wallet), serde_json::json!("bech32")]
+                &[serde_json::json!(wallet), serde_json::json!("bech32")],
             );
-            
+
             if let Ok(change_addr) = change_addr_result {
                 let change_addr_str = change_addr.as_str().unwrap();
-                outputs.insert(change_addr_str.to_string(), serde_json::json!(change_amount as f64 / 100_000_000.0));
+                outputs.insert(
+                    change_addr_str.to_string(),
+                    serde_json::json!(change_amount as f64 / 100_000_000.0),
+                );
                 println!("💰 Change: {} sats -> {}", change_amount, change_addr_str);
             }
         }
@@ -124,7 +162,7 @@ impl TaprootDA {
         // Create and sign the commit transaction using RPC
         let rawtx_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
             "createrawtransaction",
-            &[serde_json::json!(inputs), serde_json::json!(outputs)]
+            &[serde_json::json!(inputs), serde_json::json!(outputs)],
         );
 
         let raw_tx = match rawtx_result {
@@ -132,10 +170,9 @@ impl TaprootDA {
             Err(e) => return Err(anyhow!("Failed to create raw transaction: {}", e)),
         };
 
-        let signed_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "signrawtransactionwithwallet",
-            &[serde_json::json!(raw_tx)]
-        );
+        let signed_result: Result<serde_json::Value, _> = self
+            .bitcoin_client
+            .call("signrawtransactionwithwallet", &[serde_json::json!(raw_tx)]);
 
         let signed_tx = match signed_result {
             Ok(result) => {
@@ -149,10 +186,9 @@ impl TaprootDA {
         };
 
         // Broadcast the commit transaction
-        let commit_tx_result: Result<bitcoin::Txid, _> = self.bitcoin_client.call(
-            "sendrawtransaction",
-            &[serde_json::json!(signed_tx)]
-        );
+        let commit_tx_result: Result<bitcoin::Txid, _> = self
+            .bitcoin_client
+            .call("sendrawtransaction", &[serde_json::json!(signed_tx)]);
 
         let commit_txid = match commit_tx_result {
             Ok(txid) => {
@@ -168,13 +204,13 @@ impl TaprootDA {
 
         // Now immediately create a reveal transaction that spends the Taproot output
         println!("🔍 Creating reveal transaction to immediately expose Core MEL data...");
-        
+
         // Get a new address for the reveal output
         let reveal_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
             "getnewaddress",
-            &[serde_json::json!(wallet), serde_json::json!("bech32")]
+            &[serde_json::json!(wallet), serde_json::json!("bech32")],
         );
-        
+
         let reveal_addr = match reveal_addr_result {
             Ok(addr) => addr.as_str().unwrap().to_string(),
             Err(e) => return Err(anyhow!("Failed to get reveal address: {}", e)),
@@ -189,12 +225,18 @@ impl TaprootDA {
         // Create reveal transaction outputs
         let mut reveal_outputs = serde_json::Map::new();
         let reveal_amount = fee_sats.saturating_sub(1000); // Small fee for reveal tx
-        reveal_outputs.insert(reveal_addr, serde_json::json!(reveal_amount as f64 / 100_000_000.0));
+        reveal_outputs.insert(
+            reveal_addr,
+            serde_json::json!(reveal_amount as f64 / 100_000_000.0),
+        );
 
         // Create raw reveal transaction
         let reveal_raw_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
             "createrawtransaction",
-            &[serde_json::json!(reveal_inputs), serde_json::json!(reveal_outputs)]
+            &[
+                serde_json::json!(reveal_inputs),
+                serde_json::json!(reveal_outputs),
+            ],
         );
 
         let reveal_raw_tx = match reveal_raw_result {
@@ -203,8 +245,9 @@ impl TaprootDA {
         };
 
         // Sign the reveal transaction with the internal key
-        let mut reveal_tx: Transaction = bitcoin::consensus::deserialize(&hex::decode(&reveal_raw_tx)?)?;
-        
+        let mut reveal_tx: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(&reveal_raw_tx)?)?;
+
         // Add the witness data to reveal the Core MEL transaction
         let mut witness = Witness::new();
         witness.push(&envelope_script.as_bytes());
@@ -214,21 +257,24 @@ impl TaprootDA {
         let reveal_final_hex = hex::encode(bitcoin::consensus::serialize(&reveal_tx));
 
         // Broadcast the reveal transaction
-        let reveal_tx_result: Result<bitcoin::Txid, _> = self.bitcoin_client.call(
-            "sendrawtransaction",
-            &[serde_json::json!(reveal_final_hex)]
-        );
+        let reveal_tx_result: Result<bitcoin::Txid, _> = self
+            .bitcoin_client
+            .call("sendrawtransaction", &[serde_json::json!(reveal_final_hex)]);
 
         match reveal_tx_result {
             Ok(reveal_txid) => {
-                println!("✅ Core MEL transaction (commit + reveal in same block) created successfully!");
+                println!(
+                    "✅ Core MEL transaction (commit + reveal in same block) created successfully!"
+                );
                 println!("📍 Commit transaction ID: {}", commit_txid);
                 println!("📍 Reveal transaction ID: {}", reveal_txid);
                 println!("📦 Core MEL data embedded AND revealed in the same block");
                 println!("🎯 Taproot address: {}", taproot_address);
                 println!("💰 Fee paid: {} sats", fee_sats);
-                println!("\n🔍 Core MEL node will detect the reveal transaction when scanning blocks!");
-                
+                println!(
+                    "\n🔍 Core MEL node will detect the reveal transaction when scanning blocks!"
+                );
+
                 Ok(commit_txid.to_string())
             }
             Err(e) => {
@@ -242,23 +288,27 @@ impl TaprootDA {
         // Create Taproot envelope script: OP_FALSE OP_IF <data> OP_ENDIF OP_TRUE
         let mut script = Builder::new();
         script = script.push_opcode(OP_FALSE).push_opcode(OP_IF);
-        
+
         // Add data in chunks of 520 bytes (Bitcoin script push limit)
         for chunk in data.chunks(520) {
             if let Ok(push_bytes) = <&bitcoin::blockdata::script::PushBytes>::try_from(chunk) {
                 script = script.push_slice(push_bytes);
             }
         }
-        
+
         script = script.push_opcode(OP_ENDIF).push_opcode(OP_TRUE);
         Ok(script.into_script())
     }
 
-    fn create_taproot_address_with_info(&self, data: &[u8], network: &str) -> Result<(BitcoinAddress, String, Vec<u8>)> {
-        use bitcoin::secp256k1::{Secp256k1, Keypair};
-        use bitcoin::taproot::{TaprootBuilder, LeafVersion};
+    fn create_taproot_address_with_info(
+        &self,
+        data: &[u8],
+        network: &str,
+    ) -> Result<(BitcoinAddress, String, Vec<u8>)> {
+        use bitcoin::secp256k1::{Keypair, Secp256k1};
+        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
         use secp256k1::rand::rngs::OsRng;
-        
+
         let secp = Secp256k1::new();
         let keypair = Keypair::new(&secp, &mut OsRng);
         let (xonly, _parity) = bitcoin::secp256k1::XOnlyPublicKey::from_keypair(&keypair);
@@ -268,7 +318,7 @@ impl TaprootDA {
             "testnet" => Network::Testnet,
             "signet" => Network::Signet,
             "regtest" => Network::Regtest,
-            _ => Network::Regtest,
+            _ => return Err(anyhow!("unknown network: {}", network)),
         };
 
         // Create envelope script for the data
@@ -282,13 +332,14 @@ impl TaprootDA {
 
         let output_key = spend_info.output_key();
         let address = BitcoinAddress::p2tr_tweaked(output_key, network_enum);
-        
-        let control_block = spend_info.control_block(&(envelope_script.clone().into(), LeafVersion::TapScript))
+
+        let control_block = spend_info
+            .control_block(&(envelope_script.clone().into(), LeafVersion::TapScript))
             .ok_or_else(|| anyhow!("Failed to get control block"))?;
-        
+
         let internal_key_hex = keypair.display_secret().to_string();
         let control_block_bytes = control_block.serialize();
-        
+
         Ok((address, internal_key_hex, control_block_bytes))
     }
 }
