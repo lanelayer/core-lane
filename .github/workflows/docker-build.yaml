@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: Build, Test and Push Docker Image
 
 on:
   push:
@@ -11,8 +11,69 @@ env:
   IMAGE_NAME: ${{ github.repository }}/core-lane
 
 jobs:
+  # Integration testing job
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install required system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq bc lsof
+
+      - name: Build Core MEL node
+        run: |
+          cargo build
+
+      - name: Make test scripts executable
+        run: |
+          chmod +x tests/*.sh
+
+      - name: Run integration tests
+        run: |
+          ./tests/integration_test.sh
+        env:
+          RUST_LOG: info
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: |
+            /tmp/core_mel_node_output
+            /tmp/core_mel_node_rpc_output
+            /tmp/core_mel_test_output
+          retention-days: 7
+
+  # Build and push Docker image job
   build:
     runs-on: ubuntu-latest
+    needs: integration-test
     permissions:
       contents: read
       id-token: write
