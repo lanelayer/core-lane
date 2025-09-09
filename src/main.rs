@@ -31,9 +31,7 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
-use transaction::{
-    execute_transaction, get_transaction_type, recover_sender, validate_transaction,
-};
+use transaction::{execute_transaction, recover_sender, validate_transaction};
 
 #[derive(Parser)]
 #[command(name = "core-mel-node")]
@@ -1303,10 +1301,6 @@ impl CoreMELNode {
                         return Ok(());
                     }
                 };
-
-                // Get transaction type
-                let tx_type = get_transaction_type(&tx);
-                debug!("   🔄 Transaction type: {:?}", tx_type);
 
                 // Execute the transaction
                 let execution_result = {
