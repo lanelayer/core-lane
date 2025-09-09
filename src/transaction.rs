@@ -7,14 +7,6 @@ use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, SECP256
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-/// Core MEL transaction types that can be embedded in Bitcoin DA
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CoreMELTransactionType {
-    Burn,
-    Transfer,
-    Exit,
-}
-
 /// Core MEL specific addresses for special operations
 #[derive(Debug, Clone)]
 pub struct CoreMELAddresses;
@@ -101,13 +93,6 @@ pub fn encode_core_mel_transaction(tx: &TxEnvelope) -> Result<Vec<u8>> {
     data.extend_from_slice(&tx_bytes);
 
     Ok(data)
-}
-
-/// Get transaction type based on destination address
-pub fn get_transaction_type(_tx: &TxEnvelope) -> CoreMELTransactionType {
-    // For now, return Transfer as default since we need to properly access Signed transaction fields
-    // In a full implementation, this would extract the 'to' address from the signed transaction
-    CoreMELTransactionType::Transfer
 }
 
 /// Validate Core MEL transaction
@@ -243,13 +228,11 @@ pub fn execute_transaction(
     account_manager: &mut crate::account::AccountManager,
 ) -> Result<ExecutionResult> {
     // Basic execution framework
-    let tx_type = get_transaction_type(tx);
     let gas_limit = get_gas_limit(tx);
     let gas_price = get_gas_price(tx);
 
     info!("🔄 Executing transaction:");
     info!("   Sender: {}", sender);
-    info!("   Type: {:?}", tx_type);
     info!("   Gas limit: {}", gas_limit);
     info!("   Gas price: {}", gas_price);
 
@@ -268,12 +251,7 @@ pub fn execute_transaction(
         });
     }
 
-    // Execute based on transaction type
-    match tx_type {
-        CoreMELTransactionType::Burn => execute_burn(tx, sender, account_manager),
-        CoreMELTransactionType::Transfer => execute_transfer(tx, sender, account_manager),
-        CoreMELTransactionType::Exit => execute_exit(tx, sender, account_manager),
-    }
+    execute_transfer(tx, sender, account_manager)
 }
 
 /// Get gas limit from transaction
@@ -336,41 +314,6 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
     }
 }
 
-/// Execute burn operation
-fn execute_burn(
-    tx: &TxEnvelope,
-    sender: Address,
-    account_manager: &mut crate::account::AccountManager,
-) -> Result<ExecutionResult> {
-    let value = get_transaction_value(tx);
-    let gas_used = U256::from(21000u64);
-
-    // Check if sender has enough balance to burn
-    if account_manager.get_balance(sender) < value {
-        return Ok(ExecutionResult {
-            success: false,
-            gas_used,
-            gas_refund: U256::ZERO,
-            output: Bytes::new(),
-            logs: vec!["Insufficient balance to burn".to_string()],
-            error: Some("Insufficient balance to burn".to_string()),
-        });
-    }
-
-    // Burn tokens from sender
-    account_manager.sub_balance(sender, value)?;
-    account_manager.increment_nonce(sender)?;
-
-    Ok(ExecutionResult {
-        success: true,
-        gas_used,
-        gas_refund: U256::ZERO,
-        output: Bytes::new(),
-        logs: vec![format!("Burned {} tokens from {}", value, sender)],
-        error: None,
-    })
-}
-
 /// Execute transfer operation
 fn execute_transfer(
     tx: &TxEnvelope,
@@ -419,44 +362,6 @@ fn execute_transfer(
         logs: vec![format!(
             "Transferred {} tokens from {} to {}",
             value, sender, to
-        )],
-        error: None,
-    })
-}
-
-/// Execute exit operation (withdrawal to Bitcoin)
-fn execute_exit(
-    tx: &TxEnvelope,
-    sender: Address,
-    account_manager: &mut crate::account::AccountManager,
-) -> Result<ExecutionResult> {
-    let value = get_transaction_value(tx);
-    let gas_used = U256::from(30000u64); // Higher gas for exit operations
-
-    // Check if sender has enough balance to exit
-    if account_manager.get_balance(sender) < value {
-        return Ok(ExecutionResult {
-            success: false,
-            gas_used,
-            gas_refund: U256::ZERO,
-            output: Bytes::new(),
-            logs: vec!["Insufficient balance for exit".to_string()],
-            error: Some("Insufficient balance for exit".to_string()),
-        });
-    }
-
-    // Lock tokens for exit (in practice, this would trigger Bitcoin withdrawal)
-    account_manager.sub_balance(sender, value)?;
-    account_manager.increment_nonce(sender)?;
-
-    Ok(ExecutionResult {
-        success: true,
-        gas_used,
-        gas_refund: U256::ZERO,
-        output: Bytes::new(),
-        logs: vec![format!(
-            "Initiated exit of {} tokens from {}",
-            value, sender
         )],
         error: None,
     })
