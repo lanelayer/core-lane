@@ -1,3 +1,4 @@
+use alloy_primitives::Bytes;
 use anyhow::{anyhow, Result};
 use bitcoin::{
     blockdata::opcodes::all::{OP_ENDIF, OP_IF, OP_RETURN},
@@ -31,7 +32,10 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
-use transaction::{execute_transaction, recover_sender, validate_transaction};
+use transaction::{
+    decode_intent_calldata, execute_transaction, get_transaction_input_bytes, recover_sender,
+    validate_transaction,
+};
 
 #[derive(Parser)]
 #[command(name = "core-mel-node")]
@@ -114,6 +118,20 @@ struct StoredTransaction {
     envelope: TxEnvelope,
     raw_data: Vec<u8>, // Raw transaction data for hash calculation
     block_number: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntentStatus {
+    Submitted,
+    Locked,
+    Solved,
+}
+
+#[derive(Debug, Clone)]
+struct Intent {
+    data: Bytes,
+    value: u64,
+    status: IntentStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +286,7 @@ struct CoreMELState {
     block_hashes: HashMap<B256, u64>,    // Block hash -> Block number
     current_block: Option<CoreMELBlock>, // Current block being built
     genesis_block: CoreMELBlock,         // Genesis block
+    intents: HashMap<B256, Intent>,
 }
 
 struct CoreMELNode {
@@ -296,6 +315,7 @@ impl CoreMELNode {
             block_hashes,
             current_block: None,
             genesis_block,
+            intents: HashMap::new(),
         }));
 
         Self {
@@ -1302,10 +1322,15 @@ impl CoreMELNode {
                     }
                 };
 
-                // Execute the transaction
+                let input_bytes = get_transaction_input_bytes(&tx);
+                if !input_bytes.is_empty() {
+                    if let Some(intent_call) = decode_intent_calldata(&input_bytes) {
+                        info!("Decoded IntentSystem call: {:?}", intent_call);
+                    }
+                }
                 let execution_result = {
                     let mut state = self.state.lock().await;
-                    execute_transaction(&tx, sender, &mut state.account_manager)
+                    execute_transaction(&tx, sender, &mut state)
                 };
 
                 match execution_result {
