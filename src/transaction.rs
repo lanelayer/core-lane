@@ -1,11 +1,221 @@
+use crate::{CoreMELState, Intent, IntentStatus};
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{SignableTransaction, Signed, TxEnvelope};
+use alloy_primitives::B256;
 use alloy_primitives::{keccak256, Address, Bytes, U256};
 use alloy_rlp::{Decodable, Encodable};
-use anyhow::{anyhow, Result};
+use alloy_sol_types::{sol, SolCall};
 use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, SECP256K1};
-use serde::{Deserialize, Serialize};
+
+use anyhow::{anyhow, Result};
 use tracing::{debug, info};
+
+sol! {
+    #[allow(missing_docs)]
+    interface IntentSystem {
+        function storeBlob(bytes data, uint256 expiryTime) payable;
+        function prolongBlob(bytes32 blobHash) payable;
+        function blobStored(bytes32 blobHash) view returns (bool);
+        function intent(bytes intentData, uint256 nonce) payable returns (bytes32 intentId);
+        function intentFromBlob(bytes32 blobHash, uint256 nonce, bytes extraData) payable returns (bytes32 encumberFromBlob);
+        function cancelIntent(bytes32 intentId, bytes data) payable;
+        function lockIntentForSolving(bytes32 intentId, bytes data) payable;
+        function solveIntent(bytes32 intentId, bytes data) payable;
+        function cancelIntentLock(bytes32 intentId, bytes data) payable;
+        function isIntentSolved(bytes32 intentId) view returns (bool);
+        function intentLocker(bytes32 intentId) view returns (address);
+        function valueStoredInIntent(bytes32 intentId) view returns (uint256);
+    }
+}
+
+/// IntentSystem ABI decoding using alloy-sol-types
+#[derive(Debug, Clone)]
+pub enum IntentCall {
+    StoreBlob {
+        data: Vec<u8>,
+        expiry_time: U256,
+    },
+    ProlongBlob {
+        blob_hash: B256,
+    },
+    BlobStored {
+        blob_hash: B256,
+    },
+    Intent {
+        intent_data: Vec<u8>,
+        nonce: U256,
+    },
+    IntentFromBlob {
+        blob_hash: B256,
+        nonce: U256,
+        extra_data: Vec<u8>,
+    },
+    CancelIntent {
+        intent_id: B256,
+        data: Vec<u8>,
+    },
+    CancelIntentLock {
+        intent_id: B256,
+        data: Vec<u8>,
+    },
+    LockIntentForSolving {
+        intent_id: B256,
+        data: Vec<u8>,
+    },
+    SolveIntent {
+        intent_id: B256,
+        data: Vec<u8>,
+    },
+    IsIntentSolved {
+        intent_id: B256,
+    },
+    IntentLocker {
+        intent_id: B256,
+    },
+    ValueStoredInIntent {
+        intent_id: B256,
+    },
+}
+
+fn extract_selector(calldata: &[u8]) -> Option<[u8; 4]> {
+    if calldata.len() < 4 {
+        return None;
+    }
+    Some([calldata[0], calldata[1], calldata[2], calldata[3]])
+}
+
+pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
+    let selector = extract_selector(calldata)?;
+
+    match selector {
+        IntentSystem::storeBlobCall::SELECTOR => {
+            let Ok(call) = IntentSystem::storeBlobCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::StoreBlob {
+                data: call.data.to_vec(),
+                expiry_time: call.expiryTime,
+            })
+        }
+        IntentSystem::prolongBlobCall::SELECTOR => {
+            let Ok(call) = IntentSystem::prolongBlobCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::ProlongBlob {
+                blob_hash: B256::from_slice(call.blobHash.as_slice()),
+            })
+        }
+        IntentSystem::blobStoredCall::SELECTOR => {
+            let Ok(call) = IntentSystem::blobStoredCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::BlobStored {
+                blob_hash: B256::from_slice(call.blobHash.as_slice()),
+            })
+        }
+        IntentSystem::intentCall::SELECTOR => {
+            let Ok(call) = IntentSystem::intentCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::Intent {
+                intent_data: call.intentData.to_vec(),
+                nonce: call.nonce,
+            })
+        }
+        IntentSystem::intentFromBlobCall::SELECTOR => {
+            let Ok(call) = IntentSystem::intentFromBlobCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::IntentFromBlob {
+                blob_hash: B256::from_slice(call.blobHash.as_slice()),
+                nonce: call.nonce,
+                extra_data: call.extraData.to_vec(),
+            })
+        }
+        IntentSystem::cancelIntentCall::SELECTOR => {
+            let Ok(call) = IntentSystem::cancelIntentCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::CancelIntent {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+                data: call.data.to_vec(),
+            })
+        }
+        IntentSystem::lockIntentForSolvingCall::SELECTOR => {
+            let Ok(call) = IntentSystem::lockIntentForSolvingCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::LockIntentForSolving {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+                data: call.data.to_vec(),
+            })
+        }
+        IntentSystem::solveIntentCall::SELECTOR => {
+            let Ok(call) = IntentSystem::solveIntentCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::SolveIntent {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+                data: call.data.to_vec(),
+            })
+        }
+        IntentSystem::cancelIntentLockCall::SELECTOR => {
+            let Ok(call) = IntentSystem::cancelIntentLockCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::CancelIntentLock {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+                data: call.data.to_vec(),
+            })
+        }
+        IntentSystem::isIntentSolvedCall::SELECTOR => {
+            let Ok(call) = IntentSystem::isIntentSolvedCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::IsIntentSolved {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+            })
+        }
+        IntentSystem::intentLockerCall::SELECTOR => {
+            let Ok(call) = IntentSystem::intentLockerCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::IntentLocker {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+            })
+        }
+        IntentSystem::valueStoredInIntentCall::SELECTOR => {
+            let Ok(call) = IntentSystem::valueStoredInIntentCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::ValueStoredInIntent {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Get the calldata bytes from a transaction envelope (the EVM input payload)
+pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
+    match tx {
+        TxEnvelope::Legacy(signed) => signed.tx().input.as_ref().to_vec(),
+        TxEnvelope::Eip1559(signed) => signed.tx().input.as_ref().to_vec(),
+        TxEnvelope::Eip2930(signed) => signed.tx().input.as_ref().to_vec(),
+        TxEnvelope::Eip4844(_signed) => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+/// Get the transaction nonce
+fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
+    match tx {
+        TxEnvelope::Legacy(signed) => signed.tx().nonce,
+        TxEnvelope::Eip1559(signed) => signed.tx().nonce,
+        TxEnvelope::Eip2930(signed) => signed.tx().nonce,
+        _ => 0,
+    }
+}
 
 /// Core MEL specific addresses for special operations
 #[derive(Debug, Clone)]
@@ -225,7 +435,9 @@ pub struct ExecutionResult {
 pub fn execute_transaction(
     tx: &TxEnvelope,
     sender: Address,
-    account_manager: &mut crate::account::AccountManager,
+    //account_manager: &mut crate::account::AccountManager,
+    //intents: &mut HashMap<B256, (Bytes, u64)>,
+    state: &mut CoreMELState,
 ) -> Result<ExecutionResult> {
     // Basic execution framework
     let gas_limit = get_gas_limit(tx);
@@ -237,7 +449,7 @@ pub fn execute_transaction(
     info!("   Gas price: {}", gas_price);
 
     // Check if sender has enough balance for gas
-    let sender_balance = account_manager.get_balance(sender);
+    let sender_balance = state.account_manager.get_balance(sender);
     let max_gas_cost = U256::from(gas_limit) * U256::from(gas_price);
 
     if sender_balance < max_gas_cost {
@@ -251,7 +463,7 @@ pub fn execute_transaction(
         });
     }
 
-    execute_transfer(tx, sender, account_manager)
+    execute_transfer(tx, sender, state)
 }
 
 /// Get gas limit from transaction
@@ -318,7 +530,8 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 fn execute_transfer(
     tx: &TxEnvelope,
     sender: Address,
-    account_manager: &mut crate::account::AccountManager,
+    //account_manager: &mut crate::account::AccountManager,
+    state: &mut CoreMELState,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
@@ -337,8 +550,207 @@ fn execute_transfer(
         }
     };
 
-    // Check if sender has enough balance
-    if account_manager.get_balance(sender) < value {
+    if to == CoreMELAddresses::exit_marketplace() {
+        let input = Bytes::from(get_transaction_input_bytes(tx));
+        let nonce = get_transaction_nonce(tx);
+        if input.len() < 4 {
+            return Ok(ExecutionResult {
+                success: false,
+                gas_used,
+                gas_refund: U256::ZERO,
+                output: Bytes::new(),
+                logs: vec!["Intent ABI: calldata too short".to_string()],
+                error: Some("Malformed calldata".to_string()),
+            });
+        }
+
+        match decode_intent_calldata(&input) {
+            Some(IntentCall::Intent { intent_data, .. }) => {
+                // Explicit intent submission via ABI: use the intent payload for ID
+                if state.account_manager.get_balance(sender) < value {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Insufficient balance for intent lock".to_string()],
+                        error: Some("Insufficient balance".to_string()),
+                    });
+                }
+                state.account_manager.sub_balance(sender, value)?;
+                state.account_manager.increment_nonce(sender)?;
+                let value_u64: u64 = value.try_into().unwrap_or(u64::MAX);
+                let intent_id =
+                    calculate_intent_id(sender, nonce, Bytes::from(intent_data.clone()));
+                state.intents.insert(
+                    intent_id,
+                    Intent {
+                        data: Bytes::from(intent_data),
+                        value: value_u64,
+                        status: IntentStatus::Submitted,
+                    },
+                );
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec!["Intent submitted and value locked".to_string()],
+                    error: None,
+                });
+            }
+            Some(IntentCall::IsIntentSolved { intent_id }) => {
+                let solved = match state.intents.get(&intent_id) {
+                    Some(intent) => matches!(intent.status, IntentStatus::Solved),
+                    None => false,
+                };
+                let mut ret = vec![0u8; 32];
+                if solved {
+                    ret[31] = 1;
+                }
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::from(ret),
+                    logs: vec!["isIntentSolved".to_string()],
+                    error: None,
+                });
+            }
+            Some(IntentCall::LockIntentForSolving { intent_id, .. }) => {
+                if let Some(intent) = state.intents.get_mut(&intent_id) {
+                    match intent.status {
+                        IntentStatus::Submitted => {
+                            intent.status = IntentStatus::Locked;
+                            let _ = state.account_manager.increment_nonce(sender);
+                            return Ok(ExecutionResult {
+                                success: true,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["Intent locked".to_string()],
+                                error: None,
+                            });
+                        }
+                        IntentStatus::Locked => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["lockIntentForSolving: already locked".to_string()],
+                                error: Some("Already locked".to_string()),
+                            });
+                        }
+                        IntentStatus::Solved => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["lockIntentForSolving: already solved".to_string()],
+                                error: Some("Already solved".to_string()),
+                            });
+                        }
+                    }
+                } else {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["lockIntentForSolving: intent not found".to_string()],
+                        error: Some("Intent not found".to_string()),
+                    });
+                }
+            }
+            Some(IntentCall::SolveIntent { intent_id, .. }) => {
+                if let Some(intent) = state.intents.get(&intent_id) {
+                    if matches!(intent.status, IntentStatus::Solved) {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["solveIntent: already solved".to_string()],
+                            error: Some("Already solved".to_string()),
+                        });
+                    }
+                }
+                if let Some(intent) = state.intents.get(&intent_id) {
+                    if !matches!(intent.status, IntentStatus::Locked) {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["solveIntent: intent not locked".to_string()],
+                            error: Some("Not locked".to_string()),
+                        });
+                    }
+                }
+                if let Some(intent) = state.intents.get_mut(&intent_id) {
+                    state
+                        .account_manager
+                        .add_balance(sender, U256::from(intent.value))?;
+                    intent.status = IntentStatus::Solved;
+                    let _ = state.account_manager.increment_nonce(sender);
+                    return Ok(ExecutionResult {
+                        success: true,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Intent solved".to_string()],
+                        error: None,
+                    });
+                } else {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["solveIntent: intent not found".to_string()],
+                        error: Some("Intent not found".to_string()),
+                    });
+                }
+            }
+            _ => {
+                // Default: treat as new intent submission and value lock
+                if state.account_manager.get_balance(sender) < value {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Insufficient balance for intent lock".to_string()],
+                        error: Some("Insufficient balance".to_string()),
+                    });
+                }
+                state.account_manager.sub_balance(sender, value)?;
+                state.account_manager.increment_nonce(sender)?;
+                let value_u64: u64 = value.try_into().unwrap_or(u64::MAX);
+                let intent_id = calculate_intent_id(sender, nonce, input.clone());
+                state.intents.insert(
+                    intent_id,
+                    Intent {
+                        data: input.clone(),
+                        value: value_u64,
+                        status: IntentStatus::Submitted,
+                    },
+                );
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec!["Intent submitted and value locked".to_string()],
+                    error: None,
+                });
+            }
+        }
+    }
+
+    if state.account_manager.get_balance(sender) < value {
         return Ok(ExecutionResult {
             success: false,
             gas_used,
@@ -349,10 +761,9 @@ fn execute_transfer(
         });
     }
 
-    // Transfer tokens
-    account_manager.sub_balance(sender, value)?;
-    account_manager.add_balance(to, value)?;
-    account_manager.increment_nonce(sender)?;
+    state.account_manager.sub_balance(sender, value)?;
+    state.account_manager.add_balance(to, value)?;
+    state.account_manager.increment_nonce(sender)?;
 
     Ok(ExecutionResult {
         success: true,
@@ -365,4 +776,12 @@ fn execute_transfer(
         )],
         error: None,
     })
+}
+
+fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
+    let mut preimage = Vec::new();
+    preimage.extend_from_slice(sender.as_slice());
+    preimage.extend_from_slice(&nonce.to_be_bytes());
+    preimage.extend_from_slice(&input);
+    keccak256(preimage)
 }
