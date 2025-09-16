@@ -237,13 +237,6 @@ impl CoreMELBlock {
         B256::from_slice(hash_bytes.as_slice())
     }
 
-    fn add_transaction(&mut self, tx_hash: String) {
-        self.transactions.push(tx_hash);
-        self.transaction_count = self.transactions.len() as u64;
-        // Recalculate hash after adding transaction
-        self.hash = self.calculate_hash();
-    }
-
     fn to_json(&self, full: bool) -> serde_json::Value {
         let mut block_json = json!({
             "number": format!("0x{:x}", self.number),
@@ -377,7 +370,7 @@ impl CoreMELNode {
         bitcoin_block_hash: String,
         bitcoin_block_height: u64,
         bitcoin_block_timestamp: u64,
-    ) -> Result<()> {
+    ) -> Result<CoreMELBlock> {
         let mut state = self.state.lock().await;
 
         // Get the latest block number
@@ -402,62 +395,46 @@ impl CoreMELNode {
 
         // Calculate hash
         new_block.hash = new_block.calculate_hash();
-
-        // Store the block
-        state.blocks.insert(next_number, new_block.clone());
-        state.block_hashes.insert(new_block.hash, next_number);
-
         // Set as current block
-        state.current_block = Some(new_block);
-
         info!(
             "🆕 Created Core MEL block {} (parent: {}) with timestamp {}",
-            next_number, latest_number, bitcoin_block_timestamp
+                   next_number, latest_number, bitcoin_block_timestamp
         );
-
-        Ok(())
+        Ok(new_block)
     }
 
-    async fn finalize_current_block(&self) -> Result<()> {
+    async fn finalize_current_block(&self, transactions: Vec<(StoredTransaction, TransactionReceipt, String)>, mut new_block: CoreMELBlock) -> Result<()> {
         let mut state = self.state.lock().await;
 
-        if let Some(mut current_block) = state.current_block.take() {
-            // Update state root, receipts root, etc.
-            current_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-            current_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-            current_block.transactions_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+        // Update state root, receipts root, etc.
+        new_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+        new_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+        new_block.transactions_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+        for (stored_tx, receipt, tx_hash) in transactions.clone() {
+            new_block.transactions.push(tx_hash.clone());
+            new_block.transaction_count = new_block.transactions.len() as u64;
+        }
+        // Recalculate hash with updated roots
+        new_block.hash = new_block.calculate_hash();
 
-            // Recalculate hash with updated roots
-            current_block.hash = current_block.calculate_hash();
-
-            // Update stored block
-            state
-                .blocks
-                .insert(current_block.number, current_block.clone());
-            state
-                .block_hashes
-                .insert(current_block.hash, current_block.number);
-
-            info!(
-                "✅ Finalized Core MEL block {} with {} transactions",
-                current_block.number, current_block.transaction_count
-            );
+        // Update stored block
+        state
+            .blocks
+            .insert(new_block.number, new_block.clone());
+        state
+            .block_hashes
+            .insert(new_block.hash,  new_block.number);
+        
+        for (stored_tx, receipt, tx_hash) in transactions {
+            state.transactions.push(stored_tx);
+            state.transaction_receipts.insert(tx_hash, receipt);
         }
 
-        Ok(())
-    }
-
-    async fn add_transaction_to_current_block(&self, tx_hash: String) -> Result<()> {
-        let mut state = self.state.lock().await;
-
-        if let Some(ref mut current_block) = state.current_block {
-            let block_number = current_block.number;
-            current_block.add_transaction(tx_hash.clone());
-            debug!("📝 Added transaction {} to block {}", tx_hash, block_number);
-        } else {
-            return Err(anyhow!("No current block to add transaction to"));
-        }
-
+        info!(
+            "✅ Finalized Core MEL block {} with {} transactions",
+            new_block.number, new_block.transaction_count
+        );
+        state.current_block = Some(new_block);
         Ok(())
     }
 
@@ -540,7 +517,6 @@ impl CoreMELNode {
         let mut burn_transactions_found = 0;
         let mut da_transactions_found = 0;
         let mut core_mel_transactions = Vec::new();
-
         // Create a new Core MEL block for this Bitcoin block
         let bitcoin_block_hash = hash.to_string();
         let bitcoin_block_timestamp = block.header.time as u64;
@@ -548,7 +524,7 @@ impl CoreMELNode {
             "📅 Using Bitcoin block timestamp: {} (block {})",
             bitcoin_block_timestamp, height
         );
-        self.create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
+        let new_block = self.create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
             .await?;
 
         // Phase 1: Process ALL Bitcoin burns first to mint Core MEL tokens
@@ -564,13 +540,9 @@ impl CoreMELNode {
                 );
                 self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
                     .await?;
-
-                // Add burn transaction to current block
-                self.add_transaction_to_current_block(format!("burn_{}", txid))
-                    .await?;
             }
         }
-
+        let mut tx_count = 0;
         // Phase 2: Process ALL Core MEL DA transactions after all burns are complete
         debug!("🔍 Phase 2: Processing Core MEL DA transactions...");
         for (tx_index, tx) in block.txdata.iter().enumerate() {
@@ -582,17 +554,16 @@ impl CoreMELNode {
                     "   🔍 Found Core MEL DA transaction in tx {}: {}",
                     tx_index, txid
                 );
-                self.process_core_mel_transaction(mel_tx).await?;
-
-                // Add DA transaction to current block
-                self.add_transaction_to_current_block(format!("da_{}", txid))
-                    .await?;
-                core_mel_transactions.push(txid.to_string());
+                let tx = self.process_core_mel_transaction(mel_tx, new_block.number, tx_count).await;
+                if let Some((stored_tx, receipt, tx_hash)) = tx {
+                    core_mel_transactions.push((stored_tx, receipt, tx_hash));
+                    tx_count += 1;
+                }
             }
         }
 
         // Finalize the Core MEL block
-        self.finalize_current_block().await?;
+        self.finalize_current_block(core_mel_transactions, new_block).await?;
 
         if burn_transactions_found > 0 {
             info!(
@@ -1281,7 +1252,7 @@ impl CoreMELNode {
         Ok(())
     }
 
-    async fn process_core_mel_transaction(&self, tx_data: Vec<u8>) -> Result<()> {
+    async fn process_core_mel_transaction(&self, tx_data: Vec<u8>, block_number: u64, tx_number: u64) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         // The tx_data now contains the raw Ethereum transaction bytes (without CORE_MEL prefix)
         debug!(
             "   📝 Processing {} bytes of Ethereum transaction data",
@@ -1306,7 +1277,7 @@ impl CoreMELNode {
                 // Validate the transaction
                 if let Err(e) = validate_transaction(&tx) {
                     error!("   ❌ Transaction validation failed: {}", e);
-                    return Ok(());
+                    return None;
                 }
                 debug!("   ✅ Transaction validation passed");
 
@@ -1318,7 +1289,7 @@ impl CoreMELNode {
                     }
                     Err(e) => {
                         error!("   ❌ Failed to recover sender: {}", e);
-                        return Ok(());
+                        return None;
                     }
                 };
 
@@ -1371,21 +1342,19 @@ impl CoreMELNode {
                 }
 
                 // Store the transaction with both envelope and raw data
-                let mut state = self.state.lock().await;
+                let state = self.state.lock().await;
                 let stored_tx = StoredTransaction {
                     envelope: tx.clone(),
                     raw_data: tx_data.clone(),
-                    block_number: state.last_processed_block,
+                    block_number: block_number,
                 };
-                state.transactions.push(stored_tx);
-
                 // Create and store transaction receipt
                 let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx_data)));
 
                 let receipt = TransactionReceipt {
                     transaction_hash: tx_hash.clone(),
-                    block_number: state.last_processed_block,
-                    transaction_index: state.transactions.len() as u64 - 1,
+                    block_number: block_number,
+                    transaction_index: tx_number,
                     from: format!("0x{}", hex::encode(sender.as_slice())),
                     to: None, // Will be set based on transaction type
                     cumulative_gas_used: "0x0".to_string(),
@@ -1395,20 +1364,19 @@ impl CoreMELNode {
                     status: "0x1".to_string(), // Success
                     effective_gas_price: "0x3b9aca00".to_string(), // 1 gwei
                 };
-                state.transaction_receipts.insert(tx_hash, receipt);
 
                 // Print account balances after execution
                 debug!(
                     "   💰 Account balance after execution: {}",
                     state.account_manager.get_balance(sender)
                 );
+                Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
             }
             Err(e) => {
                 error!("❌ Failed to parse Ethereum transaction: {}", e);
+                None
             }
         }
-
-        Ok(())
     }
 
     /// Create a Bitcoin burn transaction using RPC wallet
@@ -1766,127 +1734,6 @@ impl CoreMELNode {
             .send_transaction_to_da(raw_tx_hex, fee_sats, wallet, network)
             .await?;
         Ok(())
-    }
-
-    /// Confirm burns by scanning blocks from a specific starting height
-    /// This allows users to verify burns and optionally process DA transactions
-    async fn confirm_burns_from_height(&self, start_height: u64, include_da: bool) -> Result<()> {
-        info!(
-            "🔥 Starting burn confirmation scan from height {}",
-            start_height
-        );
-
-        let tip = self.bitcoin_client.get_block_count()?;
-
-        if start_height > tip {
-            return Err(anyhow!(
-                "Start height {} is greater than current tip {}",
-                start_height,
-                tip
-            ));
-        }
-
-        info!(
-            "📊 Scanning blocks {} to {} for burn confirmations",
-            start_height, tip
-        );
-
-        let mut total_burns_found = 0;
-        let mut total_da_found = 0;
-        let mut total_burn_value = 0u64;
-
-        for height in start_height..=tip {
-            match self
-                .process_block_for_confirmation(height, include_da)
-                .await
-            {
-                Ok((burns, da_count, burn_value)) => {
-                    total_burns_found += burns;
-                    total_da_found += da_count;
-                    total_burn_value += burn_value;
-
-                    if burns > 0 {
-                        info!(
-                            "✅ Block {}: Found {} burns ({} sats total)",
-                            height, burns, burn_value
-                        );
-                    }
-                    if include_da && da_count > 0 {
-                        info!("📦 Block {}: Found {} DA transactions", height, da_count);
-                    }
-                }
-                Err(e) => {
-                    error!("❌ Error processing block {}: {}", height, e);
-                }
-            }
-        }
-
-        info!("🏁 Burn confirmation scan completed!");
-        info!("📊 Summary:");
-        info!(
-            "   🔥 Total burns found: {} ({} sats)",
-            total_burns_found, total_burn_value
-        );
-        if include_da {
-            info!("   📦 Total DA transactions found: {}", total_da_found);
-        }
-        info!("   📏 Blocks scanned: {}", tip - start_height + 1);
-
-        Ok(())
-    }
-
-    /// Process a single block for burn confirmation (similar to process_block but focused on confirmation)
-    async fn process_block_for_confirmation(
-        &self,
-        height: u64,
-        include_da: bool,
-    ) -> Result<(usize, usize, u64)> {
-        let hash = self.bitcoin_client.get_block_hash(height)?;
-        let block = self.bitcoin_client.get_block(&hash)?;
-
-        let mut burn_count = 0;
-        let mut da_count = 0;
-        let mut total_burn_value = 0u64;
-
-        // Process burns
-        for (tx_index, tx) in block.txdata.iter().enumerate() {
-            let txid = tx.compute_txid();
-
-            if let Some((payload, burn_value)) = self.extract_burn_payload_from_tx(&tx) {
-                burn_count += 1;
-                total_burn_value += burn_value;
-
-                info!(
-                    "   🔥 Confirmed burn in tx {}: {} ({} sats) - Block {}",
-                    tx_index, txid, burn_value, height
-                );
-
-                // Process the burn (mint tokens)
-                self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
-                    .await?;
-            }
-        }
-
-        // Process DA transactions if requested
-        if include_da {
-            for (tx_index, tx) in block.txdata.iter().enumerate() {
-                let txid = tx.compute_txid();
-
-                if let Some(mel_tx) = self.extract_core_mel_transaction(tx) {
-                    da_count += 1;
-
-                    info!(
-                        "   📦 Confirmed DA transaction in tx {}: {} - Block {}",
-                        tx_index, txid, height
-                    );
-
-                    // Process the DA transaction
-                    self.process_core_mel_transaction(mel_tx).await?;
-                }
-            }
-        }
-
-        Ok((burn_count, da_count, total_burn_value))
     }
 }
 
