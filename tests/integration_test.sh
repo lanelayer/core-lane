@@ -1331,7 +1331,6 @@ run_all_tests() {
     local passed=0
     local failed=0
     local warned=0
-    
     for result in "${TEST_RESULTS[@]}"; do
         local test_name=$(echo "$result" | cut -d: -f1)
         local test_result=$(echo "$result" | cut -d: -f2)
@@ -1339,15 +1338,15 @@ run_all_tests() {
         case $test_result in
             "PASS")
                 print_success "$test_name"
-                ((passed++))
+                ((passed+=1))
                 ;;
             "FAIL")
                 print_error "$test_name"
-                ((failed++))
+                ((failed+=1))
                 ;;
             "WARN")
                 print_warning "$test_name"
-                ((warned++))
+                ((warned+=1))
                 ;;
         esac
     done
