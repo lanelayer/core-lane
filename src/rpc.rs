@@ -613,15 +613,17 @@ impl RpcServer {
                         );
                     }
                 }
-
-                // Add block information
-                result.insert(
-                    "blockHash".to_string(),
-                    json!(format!(
-                        "0x{:x}",
-                        state.blocks.get(&stored_tx.block_number).unwrap().hash
-                    )),
-                );
+                if let Some(block) = state.blocks.get(&stored_tx.block_number) {                                  // Add block information
+                    result.insert(
+                        "blockHash".to_string(),
+                        json!(format!(
+                            "0x{:x}",
+                            block.hash
+                        )),
+                    );
+                } else {
+                    panic!("Block not found for block_number: {}, max is {}", stored_tx.block_number, state.blocks.len());
+                }
                 result.insert(
                     "blockNumber".to_string(),
                     json!(format!("0x{:x}", stored_tx.block_number)),
