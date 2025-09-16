@@ -622,7 +622,19 @@ impl RpcServer {
                         )),
                     );
                 } else {
-                    panic!("Block not found for block_number: {}, max is {}", stored_tx.block_number, state.blocks.len());
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!(
+                                "Internal error: block {} not found (blocks={})",
+                                stored_tx.block_number,
+                                state.blocks.len()
+                            ),
+                        }),
+                        id: request.id,
+                    }));
                 }
                 result.insert(
                     "blockNumber".to_string(),
