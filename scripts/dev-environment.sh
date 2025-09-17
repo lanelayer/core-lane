@@ -146,12 +146,12 @@ start_core_mel_node() {
         exit 1
     fi
 
-    RUST_LOG=info ./target/debug/core-mel-node start \
+    RUST_LOG=info,debug ./target/debug/core-mel-node start \
         --start-block 0 \
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
-        --http-port $JSON_RPC_PORT > /tmp/core_mel_dev_output 2>&1 &
+        --http-port $JSON_RPC_PORT &
 
     CORE_MEL_NODE_PID=$!
 

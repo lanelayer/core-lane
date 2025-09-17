@@ -280,6 +280,13 @@ struct CoreMELState {
     current_block: Option<CoreMELBlock>, // Current block being built
     genesis_block: CoreMELBlock,         // Genesis block
     intents: HashMap<B256, Intent>,
+    bitcoin_client: Arc<Client>,
+}
+
+impl CoreMELState {
+    pub fn bitcoin_client(&self) -> Arc<Client> {
+        self.bitcoin_client.clone()
+    }
 }
 
 struct CoreMELNode {
@@ -294,6 +301,7 @@ impl CoreMELNode {
 
         let mut blocks = HashMap::new();
         let mut block_hashes = HashMap::new();
+        let bitcoin_client = Arc::new(bitcoin_client);
 
         // Store genesis block
         blocks.insert(0, genesis_block.clone());
@@ -309,10 +317,11 @@ impl CoreMELNode {
             current_block: None,
             genesis_block,
             intents: HashMap::new(),
+            bitcoin_client: bitcoin_client.clone(),
         }));
 
         Self {
-            bitcoin_client: Arc::new(bitcoin_client),
+            bitcoin_client: bitcoin_client.clone(),
             state,
         }
     }
@@ -398,12 +407,16 @@ impl CoreMELNode {
         // Set as current block
         info!(
             "🆕 Created Core MEL block {} (parent: {}) with timestamp {}",
-                   next_number, latest_number, bitcoin_block_timestamp
+            next_number, latest_number, bitcoin_block_timestamp
         );
         Ok(new_block)
     }
 
-    async fn finalize_current_block(&self, transactions: Vec<(StoredTransaction, TransactionReceipt, String)>, mut new_block: CoreMELBlock) -> Result<()> {
+    async fn finalize_current_block(
+        &self,
+        transactions: Vec<(StoredTransaction, TransactionReceipt, String)>,
+        mut new_block: CoreMELBlock,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
 
         // Update state root, receipts root, etc.
@@ -418,13 +431,9 @@ impl CoreMELNode {
         new_block.hash = new_block.calculate_hash();
 
         // Update stored block
-        state
-            .blocks
-            .insert(new_block.number, new_block.clone());
-        state
-            .block_hashes
-            .insert(new_block.hash,  new_block.number);
-        
+        state.blocks.insert(new_block.number, new_block.clone());
+        state.block_hashes.insert(new_block.hash, new_block.number);
+
         for (stored_tx, receipt, tx_hash) in transactions {
             state.transactions.push(stored_tx);
             state.transaction_receipts.insert(tx_hash, receipt);
@@ -524,7 +533,8 @@ impl CoreMELNode {
             "📅 Using Bitcoin block timestamp: {} (block {})",
             bitcoin_block_timestamp, height
         );
-        let new_block = self.create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
+        let new_block = self
+            .create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
             .await?;
 
         // Phase 1: Process ALL Bitcoin burns first to mint Core MEL tokens
@@ -554,7 +564,9 @@ impl CoreMELNode {
                     "   🔍 Found Core MEL DA transaction in tx {}: {}",
                     tx_index, txid
                 );
-                let tx = self.process_core_mel_transaction(mel_tx, new_block.number, tx_count).await;
+                let tx = self
+                    .process_core_mel_transaction(mel_tx, new_block.number, tx_count)
+                    .await;
                 if let Some((stored_tx, receipt, tx_hash)) = tx {
                     core_mel_transactions.push((stored_tx, receipt, tx_hash));
                     tx_count += 1;
@@ -563,7 +575,8 @@ impl CoreMELNode {
         }
 
         // Finalize the Core MEL block
-        self.finalize_current_block(core_mel_transactions, new_block).await?;
+        self.finalize_current_block(core_mel_transactions, new_block)
+            .await?;
 
         if burn_transactions_found > 0 {
             info!(
@@ -1252,7 +1265,12 @@ impl CoreMELNode {
         Ok(())
     }
 
-    async fn process_core_mel_transaction(&self, tx_data: Vec<u8>, block_number: u64, tx_number: u64) -> Option<(StoredTransaction, TransactionReceipt, String)> {
+    async fn process_core_mel_transaction(
+        &self,
+        tx_data: Vec<u8>,
+        block_number: u64,
+        tx_number: u64,
+    ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         // The tx_data now contains the raw Ethereum transaction bytes (without CORE_MEL prefix)
         debug!(
             "   📝 Processing {} bytes of Ethereum transaction data",
