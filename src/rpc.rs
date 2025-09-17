@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub method: String,
+    #[serde(default)]
     pub params: Vec<Value>,
     pub id: Value,
 }
@@ -613,13 +614,11 @@ impl RpcServer {
                         );
                     }
                 }
-                if let Some(block) = state.blocks.get(&stored_tx.block_number) {                                  // Add block information
+                if let Some(block) = state.blocks.get(&stored_tx.block_number) {
+                    // Add block information
                     result.insert(
                         "blockHash".to_string(),
-                        json!(format!(
-                            "0x{:x}",
-                            block.hash
-                        )),
+                        json!(format!("0x{:x}", block.hash)),
                     );
                 } else {
                     return Ok(JsonResponse::from(JsonRpcResponse {
