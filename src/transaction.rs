@@ -5,11 +5,15 @@ use alloy_primitives::B256;
 use alloy_primitives::{keccak256, Address, Bytes, U256};
 use alloy_rlp::{Decodable, Encodable};
 use alloy_sol_types::{sol, SolCall};
-use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, SECP256K1};
-
 use anyhow::{anyhow, Result};
+use bitcoin::Address as BitcoinAddress;
+use bitcoincore_rpc::RpcApi;
+use ciborium::de::from_reader;
+use ciborium::into_writer;
+use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, SECP256K1};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 use tracing::{debug, info};
-
 sol! {
     #[allow(missing_docs)]
     interface IntentSystem {
@@ -25,6 +29,114 @@ sol! {
         function isIntentSolved(bytes32 intentId) view returns (bool);
         function intentLocker(bytes32 intentId) view returns (address);
         function valueStoredInIntent(bytes32 intentId) view returns (uint256);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum IntentType {
+    AnchorBitcoinFill = 1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentData {
+    pub intent_type: IntentType,
+    pub data: Vec<u8>,
+}
+
+impl IntentData {
+    pub fn from_cbor(cbor_bytes: &[u8]) -> Result<Self> {
+        let mut cursor = std::io::Cursor::new(cbor_bytes);
+        let intent_data: IntentData = from_reader(&mut cursor)?;
+        Ok(intent_data)
+    }
+
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        into_writer(&self, &mut buffer)?;
+        Ok(buffer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorBitcoinFill {
+    pub bitcoin_address: Vec<u8>,
+    pub amount: U256,
+    pub max_fee: U256,
+    pub expire_by: u64,
+}
+
+impl IntentData {
+    pub fn parse_anchor_bitcoin_fill(&self) -> Result<AnchorBitcoinFill> {
+        if self.intent_type != IntentType::AnchorBitcoinFill {
+            return Err(anyhow!("Expected AnchorBitcoinFill intent type"));
+        }
+        let mut cursor = std::io::Cursor::new(&self.data);
+        let fill_data: AnchorBitcoinFill = from_reader(&mut cursor).unwrap();
+        Ok(fill_data)
+    }
+}
+
+impl AnchorBitcoinFill {
+    pub fn from_cbor(cbor_bytes: &[u8]) -> Result<Self> {
+        let mut cursor = std::io::Cursor::new(cbor_bytes);
+        let fill_data: AnchorBitcoinFill = from_reader(&mut cursor)?;
+        Ok(fill_data)
+    }
+
+    pub fn to_cbor(&self) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        into_writer(&self, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    pub fn parse_bitcoin_address(&self) -> Result<String> {
+        let address_str = String::from_utf8(self.bitcoin_address.clone())
+            .map_err(|e| anyhow!("Invalid UTF-8 in bitcoin_address: {}", e))?;
+        let _ = BitcoinAddress::from_str(&address_str)
+            .map_err(|e| anyhow!("Invalid Bitcoin address in intent data: {}", e))?;
+        Ok(address_str)
+    }
+
+    pub fn from_bitcoin_address(
+        bitcoin_address: &str,
+        amount: U256,
+        max_fee: U256,
+        expire_by: u64,
+    ) -> Result<Self> {
+        Ok(AnchorBitcoinFill {
+            bitcoin_address: bitcoin_address.as_bytes().to_vec(),
+            amount,
+            max_fee,
+            expire_by,
+        })
+    }
+}
+
+pub fn create_anchor_bitcoin_fill_intent(
+    bitcoin_address: &str,
+    amount: U256,
+    max_fee: U256,
+    expire_by: u64,
+) -> Result<IntentData> {
+    let fill_data =
+        AnchorBitcoinFill::from_bitcoin_address(bitcoin_address, amount, max_fee, expire_by)?;
+    let fill_cbor = fill_data.to_cbor()?;
+
+    Ok(IntentData {
+        intent_type: IntentType::AnchorBitcoinFill,
+        data: fill_cbor,
+    })
+}
+
+pub fn parse_bitcoin_address_from_cbor_intent(cbor_intent: &IntentData) -> Result<String> {
+    match cbor_intent.intent_type {
+        IntentType::AnchorBitcoinFill => {
+            let fill_data = cbor_intent.parse_anchor_bitcoin_fill().unwrap();
+            let address_str = fill_data.parse_bitcoin_address().unwrap();
+            info!("Address string: {}", address_str);
+            Ok(address_str)
+        }
     }
 }
 
@@ -530,7 +642,6 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 fn execute_transfer(
     tx: &TxEnvelope,
     sender: Address,
-    //account_manager: &mut crate::account::AccountManager,
     state: &mut CoreMELState,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
@@ -595,7 +706,7 @@ fn execute_transfer(
                     gas_used,
                     gas_refund: U256::ZERO,
                     output: Bytes::new(),
-                    logs: vec!["Intent submitted and value locked".to_string()],
+                    logs: vec![format!("Intent submitted: intent_id = {}", intent_id)],
                     error: None,
                 });
             }
@@ -664,19 +775,11 @@ fn execute_transfer(
                     });
                 }
             }
-            Some(IntentCall::SolveIntent { intent_id, .. }) => {
-                if let Some(intent) = state.intents.get(&intent_id) {
-                    if matches!(intent.status, IntentStatus::Solved) {
-                        return Ok(ExecutionResult {
-                            success: false,
-                            gas_used,
-                            gas_refund: U256::ZERO,
-                            output: Bytes::new(),
-                            logs: vec!["solveIntent: already solved".to_string()],
-                            error: Some("Already solved".to_string()),
-                        });
-                    }
-                }
+            Some(IntentCall::SolveIntent { intent_id, data }) => {
+                let block_number = u64::from_le_bytes(
+                    data[..8].try_into().expect("data must be at least 8 bytes"),
+                );
+
                 if let Some(intent) = state.intents.get(&intent_id) {
                     if !matches!(intent.status, IntentStatus::Locked) {
                         return Ok(ExecutionResult {
@@ -688,21 +791,6 @@ fn execute_transfer(
                             error: Some("Not locked".to_string()),
                         });
                     }
-                }
-                if let Some(intent) = state.intents.get_mut(&intent_id) {
-                    state
-                        .account_manager
-                        .add_balance(sender, U256::from(intent.value))?;
-                    intent.status = IntentStatus::Solved;
-                    let _ = state.account_manager.increment_nonce(sender);
-                    return Ok(ExecutionResult {
-                        success: true,
-                        gas_used,
-                        gas_refund: U256::ZERO,
-                        output: Bytes::new(),
-                        logs: vec!["Intent solved".to_string()],
-                        error: None,
-                    });
                 } else {
                     return Ok(ExecutionResult {
                         success: false,
@@ -713,38 +801,63 @@ fn execute_transfer(
                         error: Some("Intent not found".to_string()),
                     });
                 }
+
+                match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
+                    Ok(true) => {
+                        if let Some(intent) = state.intents.get_mut(&intent_id) {
+                            state
+                                .account_manager
+                                .add_balance(sender, U256::from(intent.value))?;
+                            intent.status = IntentStatus::Solved;
+                            let _ = state.account_manager.increment_nonce(sender);
+                            return Ok(ExecutionResult {
+                                success: true,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["Intent solved (Bitcoin L1 proof verified)".to_string()],
+                                error: None,
+                            });
+                        }
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["solveIntent: intent disappeared".to_string()],
+                            error: Some("Intent not found".to_string()),
+                        });
+                    }
+                    Ok(false) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["solveIntent: L1 fill not found in block".to_string()],
+                            error: Some("L1 fill not found".to_string()),
+                        });
+                    }
+                    Err(e) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec![format!("solveIntent: verifier error: {}", e)],
+                            error: Some("Verifier error".to_string()),
+                        });
+                    }
+                }
             }
             _ => {
-                // Default: treat as new intent submission and value lock
-                if state.account_manager.get_balance(sender) < value {
-                    return Ok(ExecutionResult {
-                        success: false,
-                        gas_used,
-                        gas_refund: U256::ZERO,
-                        output: Bytes::new(),
-                        logs: vec!["Insufficient balance for intent lock".to_string()],
-                        error: Some("Insufficient balance".to_string()),
-                    });
-                }
-                state.account_manager.sub_balance(sender, value)?;
-                state.account_manager.increment_nonce(sender)?;
-                let value_u64: u64 = value.try_into().unwrap_or(u64::MAX);
-                let intent_id = calculate_intent_id(sender, nonce, input.clone());
-                state.intents.insert(
-                    intent_id,
-                    Intent {
-                        data: input.clone(),
-                        value: value_u64,
-                        status: IntentStatus::Submitted,
-                    },
-                );
                 return Ok(ExecutionResult {
-                    success: true,
+                    success: false,
                     gas_used,
                     gas_refund: U256::ZERO,
                     output: Bytes::new(),
-                    logs: vec!["Intent submitted and value locked".to_string()],
-                    error: None,
+                    logs: vec!["Unsupported intent call".to_string()],
+                    error: Some("Unsupported intent call".to_string()),
                 });
             }
         }
@@ -784,4 +897,66 @@ fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
     preimage.extend_from_slice(&nonce.to_be_bytes());
     preimage.extend_from_slice(&input);
     keccak256(preimage)
+}
+
+fn verify_intent_fill_on_bitcoin(
+    state: &crate::CoreMELState,
+    intent_id: B256,
+    block_number: u64,
+) -> Result<bool> {
+    let client = state.bitcoin_client();
+
+    let network = bitcoin::Network::Regtest;
+    let intent = state
+        .intents
+        .get(&intent_id)
+        .ok_or_else(|| anyhow!("Intent not found for verification"))
+        .unwrap();
+
+    let cbor_intent = IntentData::from_cbor(&intent.data)?;
+    let fill = cbor_intent.parse_anchor_bitcoin_fill()?;
+    let dest_script = {
+        let addr_str = fill.parse_bitcoin_address()?;
+        let addr = BitcoinAddress::from_str(&addr_str).unwrap();
+        let addr_checked = addr.require_network(network).unwrap();
+        addr_checked.script_pubkey()
+    };
+    let expected_amount_u256 = fill.amount;
+
+    let hash = client.get_block_hash(block_number).unwrap();
+    let block = client.get_block(&hash)?;
+    let tag = intent_id.as_slice();
+    for tx in block.txdata.iter() {
+        // We expect exactly two outputs: one payment and one OP_RETURN with the intent id
+        if tx.output.len() == 2 {
+            let mut has_correct_payment = false;
+            let mut has_matching_tag = false;
+            for out in &tx.output {
+                // Check payment output to the expected address with exact amount
+                if out.script_pubkey == dest_script {
+                    let out_amount_u256 = U256::from(out.value.to_sat());
+                    if out_amount_u256 == expected_amount_u256 {
+                        has_correct_payment = true;
+                    } else {
+                        has_correct_payment = false;
+                    }
+                } else if out.script_pubkey.is_op_return() {
+                    // Check the OP_RETURN output contains the intent id bytes
+                    let script = out.script_pubkey.as_bytes();
+                    if script.len() >= 2 {
+                        let data = &script[2..];
+                        let tag_found = data.windows(tag.len()).any(|window| window == tag);
+                        if tag_found {
+                            has_matching_tag = true;
+                        }
+                    }
+                }
+            }
+
+            if has_correct_payment && has_matching_tag {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
