@@ -25,7 +25,7 @@ impl TaprootDA {
         wallet: &str,
         network: &str,
     ) -> Result<String> {
-        println!("🚀 Creating Core MEL transaction in Bitcoin DA (commit + reveal in one tx)...");
+        println!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
         println!(
             "📝 Ethereum transaction: {}...",
             &raw_tx_hex[..64.min(raw_tx_hex.len())]
@@ -44,13 +44,13 @@ impl TaprootDA {
         );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // Create Core MEL payload: CORE_MEL prefix + Ethereum transaction
+        // Create Core Lane payload: CORE_LANE prefix + Ethereum transaction
         let mut payload = Vec::new();
-        payload.extend_from_slice(b"CORE_MEL");
+        payload.extend_from_slice(b"CORE_LANE");
         payload.extend_from_slice(&tx_bytes);
 
-        println!("📦 Core MEL payload size: {} bytes", payload.len());
-        println!("📦 Core MEL payload hex: {}", hex::encode(&payload));
+        println!("📦 Core Lane payload size: {} bytes", payload.len());
+        println!("📦 Core Lane payload hex: {}", hex::encode(&payload));
 
         // Check wallet balance
         let balance_result: Result<serde_json::Value, _> =
@@ -114,7 +114,7 @@ impl TaprootDA {
             prev_txid, prev_vout, prev_amount
         );
 
-        // Create a Taproot output with Core MEL data embedded
+        // Create a Taproot output with Core Lane data embedded
         let envelope_script = self.create_taproot_envelope_script(&payload)?;
         let (taproot_address, internal_key, control_block) =
             self.create_taproot_address_with_info(&payload, network)?;
@@ -128,10 +128,10 @@ impl TaprootDA {
             "vout": prev_vout
         })];
 
-        // Create outputs with Core MEL data in Taproot envelope
+        // Create outputs with Core Lane data in Taproot envelope
         let mut outputs = serde_json::Map::new();
 
-        // Add the Taproot output with the Core MEL data
+        // Add the Taproot output with the Core Lane data
         outputs.insert(
             taproot_address.to_string(),
             serde_json::json!(fee_sats as f64 / 100_000_000.0),
@@ -193,7 +193,7 @@ impl TaprootDA {
         let commit_txid = match commit_tx_result {
             Ok(txid) => {
                 println!("✅ Commit transaction broadcast: {}", txid);
-                println!("📦 Core MEL data embedded in Taproot envelope");
+                println!("📦 Core Lane data embedded in Taproot envelope");
                 txid
             }
             Err(e) => {
@@ -203,7 +203,7 @@ impl TaprootDA {
         };
 
         // Now immediately create a reveal transaction that spends the Taproot output
-        println!("🔍 Creating reveal transaction to immediately expose Core MEL data...");
+        println!("🔍 Creating reveal transaction to immediately expose Core Lane data...");
 
         // Get a new address for the reveal output
         let reveal_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
@@ -248,7 +248,7 @@ impl TaprootDA {
         let mut reveal_tx: Transaction =
             bitcoin::consensus::deserialize(&hex::decode(&reveal_raw_tx)?)?;
 
-        // Add the witness data to reveal the Core MEL transaction
+        // Add the witness data to reveal the Core Lane transaction
         let mut witness = Witness::new();
         witness.push(&envelope_script.as_bytes());
         witness.push(&control_block);
@@ -264,15 +264,15 @@ impl TaprootDA {
         match reveal_tx_result {
             Ok(reveal_txid) => {
                 println!(
-                    "✅ Core MEL transaction (commit + reveal in same block) created successfully!"
+                    "✅ Core Lane transaction (commit + reveal in same block) created successfully!"
                 );
                 println!("📍 Commit transaction ID: {}", commit_txid);
                 println!("📍 Reveal transaction ID: {}", reveal_txid);
-                println!("📦 Core MEL data embedded AND revealed in the same block");
+                println!("📦 Core Lane data embedded AND revealed in the same block");
                 println!("🎯 Taproot address: {}", taproot_address);
                 println!("💰 Fee paid: {} sats", fee_sats);
                 println!(
-                    "\n🔍 Core MEL node will detect the reveal transaction when scanning blocks!"
+                    "\n🔍 Core Lane node will detect the reveal transaction when scanning blocks!"
                 );
 
                 Ok(commit_txid.to_string())

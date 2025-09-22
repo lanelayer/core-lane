@@ -45,7 +45,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc lsof
 
-      - name: Build Core MEL node
+      - name: Build Core Lane node
         run: |
           cargo build
 
@@ -65,9 +65,9 @@ jobs:
         with:
           name: integration-test-results
           path: |
-            /tmp/core_mel_node_output
-            /tmp/core_mel_node_rpc_output
-            /tmp/core_mel_test_output
+            /tmp/core_lane_node_output
+            /tmp/core_lane_node_rpc_output
+            /tmp/core_lane_test_output
           retention-days: 7
 
   # Build and push Docker image job
