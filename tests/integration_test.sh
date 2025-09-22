@@ -53,7 +53,7 @@ bitcoin_cli() {
     docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=$RPC_USER -rpcpassword=$RPC_PASSWORD "$@"
 }
 
-# Function to call Core MEL JSON-RPC
+# Function to call Core Lane JSON-RPC
 call_json_rpc() {
     local method="$1"
     local params="$2"
@@ -141,9 +141,9 @@ test_environment_setup() {
         return 1
     fi
     
-    # Check if Core MEL is built
-    if [ ! -f "target/debug/core-mel-node" ]; then
-        print_error "Core MEL node is not built"
+    # Check if Core Lane is built
+    if [ ! -f "target/debug/core-lane-node" ]; then
+        print_error "Core Lane node is not built"
         record_test "environment_setup" "FAIL"
         return 1
     fi
@@ -187,7 +187,7 @@ test_burn_transaction() {
     print_status "Creating burn transaction for $TEST_BURN_AMOUNT sats..."
     
     # Create burn transaction
-    local burn_output=$(./target/debug/core-mel-node burn \
+    local burn_output=$(./target/debug/core-lane-node burn \
         --burn-amount $TEST_BURN_AMOUNT \
         --chain-id $TEST_CHAIN_ID \
         --eth-address $TEST_ETH_ADDRESS \
@@ -218,17 +218,17 @@ test_send_ethereum_transaction() {
     print_status "Ethereum TX: ${sample_eth_tx:0:64}..."
     
     # Send the transaction using CLI for verification purposes
-    local send_output=$(./target/debug/core-mel-node send-transaction \
+    local send_output=$(./target/debug/core-lane-node send-transaction \
         --raw-tx-hex "$sample_eth_tx" \
         --fee-sats 15000 \
         --wallet "mine" \
         --rpc-password $RPC_PASSWORD 2>&1)
     
-    if echo "$send_output" | grep -q "✅ Core MEL transaction.*created successfully"; then
+    if echo "$send_output" | grep -q "✅ Core Lane transaction.*created successfully"; then
         # Extract transaction IDs
         local commit_txid=$(echo "$send_output" | grep "📍 Commit transaction ID:" | grep -o '[a-f0-9]\{64\}')
         local reveal_txid=$(echo "$send_output" | grep "📍 Reveal transaction ID:" | grep -o '[a-f0-9]\{64\}')
-        print_success "Core MEL DA transaction created: $commit_txid"
+        print_success "Core Lane DA transaction created: $commit_txid"
         print_success "Reveal transaction created: $reveal_txid"
         print_success "Ethereum transaction embedded in Bitcoin via Taproot envelope"
         
@@ -280,16 +280,16 @@ test_send_ethereum_transaction() {
     
     print_status "Part B: Testing eth_sendRawTransaction RPC method..."
     
-    # Start the Core MEL node with JSON-RPC to test the RPC interface
-    print_status "Starting Core MEL node with JSON-RPC for RPC testing..."
-    RUST_LOG=info ./target/debug/core-mel-node start \
+    # Start the Core Lane node with JSON-RPC to test the RPC interface
+    print_status "Starting Core Lane node with JSON-RPC for RPC testing..."
+    RUST_LOG=info ./target/debug/core-lane-node start \
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_rpc_output 2>&1 &
     
     local rpc_node_pid=$!
-    print_status "Started Core MEL node for RPC testing (PID: $rpc_node_pid)"
+    print_status "Started Core Lane node for RPC testing (PID: $rpc_node_pid)"
     
     # Wait for RPC server to start
     print_status "Waiting for JSON-RPC server to start..."
@@ -386,7 +386,7 @@ test_send_ethereum_transaction() {
         print_status "Mining block to include RPC transaction and test receipt availability..."
         docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 generatetoaddress 1 "$(docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 getnewaddress)" > /dev/null 2>&1
         
-        # Wait for Core MEL to process the block
+        # Wait for Core Lane to process the block
         sleep 3
         
         # Test transaction receipt again after mining
@@ -397,7 +397,7 @@ test_send_ethereum_transaction() {
         local receipt_after_found=$(echo "$receipt_after_mine" | jq -r '.result')
         if [ "$receipt_after_found" = "null" ]; then
             print_warning "⚠️  Transaction receipt still not found after mining"
-            print_status "   This is expected since the RPC node is separate from the main Core MEL node"
+            print_status "   This is expected since the RPC node is separate from the main Core Lane node"
             print_status "   The transaction was mined in Bitcoin but not processed by this RPC instance"
         else
             print_success "✅ Transaction receipt found after mining!"
@@ -415,7 +415,7 @@ test_send_ethereum_transaction() {
         local tx_after_found=$(echo "$tx_after_mine" | jq -r '.result')
         if [ "$tx_after_found" = "null" ]; then
             print_warning "⚠️  Transaction still not found after mining"
-            print_status "   This is expected since the RPC node is separate from the main Core MEL node"
+            print_status "   This is expected since the RPC node is separate from the main Core Lane node"
         else
             print_success "✅ Transaction found after mining!"
             print_success "   Hash: $(echo "$tx_after_mine" | jq -r '.result.hash')"
@@ -423,7 +423,7 @@ test_send_ethereum_transaction() {
         fi
         
         print_status "✅ Transaction receipt RPC methods implemented and working correctly"
-        print_status "   Note: For full receipt testing, transactions need to be processed by the same Core MEL node"
+        print_status "   Note: For full receipt testing, transactions need to be processed by the same Core Lane node"
         
         record_test "send_ethereum_transaction" "PASS"
     else
@@ -520,13 +520,13 @@ test_verify_reveal_in_block() {
     fi
 }
 
-# Test 7: Start Core MEL Node with JSON-RPC
+# Test 7: Start Core Lane Node with JSON-RPC
 test_start_core_lane_node() {
-    print_status "Test 7: Start Core MEL Node with JSON-RPC"
+    print_status "Test 7: Start Core Lane Node with JSON-RPC"
     
-    # Kill any existing Core MEL processes
-    print_status "Cleaning up any existing Core MEL processes..."
-    pkill -f "core-mel-node" 2>/dev/null || true
+    # Kill any existing Core Lane processes
+    print_status "Cleaning up any existing Core Lane processes..."
+    pkill -f "core-lane-node" 2>/dev/null || true
     sleep 1
     
     # Check if port is available
@@ -540,10 +540,10 @@ test_start_core_lane_node() {
     local current_block=$(bitcoin_cli getblockcount)
     local scan_from_block=$((current_block - 3))  # Scan last 3 blocks
     
-    print_status "Starting Core MEL node from block $scan_from_block to catch recent burn..."
+    print_status "Starting Core Lane node from block $scan_from_block to catch recent burn..."
     
-    # Start Core MEL node with JSON-RPC in background
-    RUST_LOG=info ./target/debug/core-mel-node start \
+    # Start Core Lane node with JSON-RPC in background
+    RUST_LOG=info ./target/debug/core-lane-node start \
         --start-block $scan_from_block \
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
@@ -551,7 +551,7 @@ test_start_core_lane_node() {
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_output 2>&1 &
     
     NODE_PID=$!
-    print_status "Started Core MEL node (PID: $NODE_PID)"
+    print_status "Started Core Lane node (PID: $NODE_PID)"
     
     # Wait for node to start and process blocks
     print_status "Waiting for node to scan all blocks and detect our burn transaction..."
@@ -575,10 +575,10 @@ test_start_core_lane_node() {
         fi
     done
     
-    # Check for Core MEL DA transaction detection (both CLI and RPC)
+    # Check for Core Lane DA transaction detection (both CLI and RPC)
     if [ -f ".test-da-txid" ]; then
         local da_txid=$(cat .test-da-txid)
-        print_status "Checking for Core MEL DA transaction detection (CLI): $da_txid"
+        print_status "Checking for Core Lane DA transaction detection (CLI): $da_txid"
         
         # Wait for the reveal transaction to be detected
         local max_wait=30  # Maximum 30 seconds
@@ -586,28 +586,28 @@ test_start_core_lane_node() {
         
         while [ $wait_count -lt $max_wait ]; do
             local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
-            if echo "$node_output" | grep -q "Found Core MEL transaction in Taproot envelope"; then
-                print_success "✅ Core MEL DA transaction detected in reveal transaction (CLI)!"
+            if echo "$node_output" | grep -q "Found Core Lane transaction in Taproot envelope"; then
+                print_success "✅ Core Lane DA transaction detected in reveal transaction (CLI)!"
                 break
             fi
             sleep 1
             wait_count=$((wait_count + 1))
             if [ $((wait_count % 5)) -eq 0 ]; then
-                print_status "Still waiting for Core MEL transaction detection (CLI)... ($wait_count seconds)"
+                print_status "Still waiting for Core Lane transaction detection (CLI)... ($wait_count seconds)"
             fi
         done
         
         if [ $wait_count -eq $max_wait ]; then
-            print_warning "⚠️  Core MEL DA transaction not detected within timeout (CLI)"
+            print_warning "⚠️  Core Lane DA transaction not detected within timeout (CLI)"
             print_status "💡 This might be because the reveal transaction hasn't been mined yet"
             print_status "💡 The commit and reveal transactions were created successfully"
         fi
     fi
     
-    # Check for RPC Core MEL DA transaction detection
+    # Check for RPC Core Lane DA transaction detection
     if [ -f ".test-rpc-da-txid" ]; then
         local rpc_da_txid=$(cat .test-rpc-da-txid)
-        print_status "Checking for Core MEL DA transaction detection (RPC): $rpc_da_txid"
+        print_status "Checking for Core Lane DA transaction detection (RPC): $rpc_da_txid"
         
         # Wait for the reveal transaction to be detected
         local max_wait=30  # Maximum 30 seconds
@@ -615,19 +615,19 @@ test_start_core_lane_node() {
         
         while [ $wait_count -lt $max_wait ]; do
             local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
-            if echo "$node_output" | grep -q "Found Core MEL transaction in Taproot envelope"; then
-                print_success "✅ Core MEL DA transaction detected in reveal transaction (RPC)!"
+            if echo "$node_output" | grep -q "Found Core Lane transaction in Taproot envelope"; then
+                print_success "✅ Core Lane DA transaction detected in reveal transaction (RPC)!"
                 break
             fi
             sleep 1
             wait_count=$((wait_count + 1))
             if [ $((wait_count % 5)) -eq 0 ]; then
-                print_status "Still waiting for Core MEL transaction detection (RPC)... ($wait_count seconds)"
+                print_status "Still waiting for Core Lane transaction detection (RPC)... ($wait_count seconds)"
             fi
         done
         
         if [ $wait_count -eq $max_wait ]; then
-            print_warning "⚠️  Core MEL DA transaction not detected within timeout (RPC)"
+            print_warning "⚠️  Core Lane DA transaction not detected within timeout (RPC)"
             print_status "💡 This might be because the reveal transaction hasn't been mined yet"
             print_status "💡 The RPC transaction was sent successfully"
         fi
@@ -643,10 +643,10 @@ test_start_core_lane_node() {
     
     # Check if process is still running
     if kill -0 $NODE_PID 2>/dev/null; then
-        print_success "Core MEL node is running with JSON-RPC"
+        print_success "Core Lane node is running with JSON-RPC"
         record_test "start_core_lane_node" "PASS"
     else
-        print_error "Core MEL node failed to start"
+        print_error "Core Lane node failed to start"
         local output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
         echo "Node output: $output"
         record_test "start_core_lane_node" "FAIL"
@@ -654,12 +654,12 @@ test_start_core_lane_node() {
     fi
 }
 
-# Test 8: Test Transaction Receipts with Main Core MEL Node
+# Test 8: Test Transaction Receipts with Main Core Lane Node
 test_transaction_receipts() {
-    print_status "Test 8: Test Transaction Receipts with Main Core MEL Node"
+    print_status "Test 8: Test Transaction Receipts with Main Core Lane Node"
     
     if [ $NODE_PID -eq 0 ] || ! kill -0 $NODE_PID 2>/dev/null; then
-        print_error "Core MEL node is not running"
+        print_error "Core Lane node is not running"
         record_test "transaction_receipts" "FAIL"
         return 1
     fi
@@ -725,7 +725,7 @@ test_verify_burn_detection_and_minting() {
     print_status "Test 9: Verify Burn Detection and Minting"
     
     if [ $NODE_PID -eq 0 ] || ! kill -0 $NODE_PID 2>/dev/null; then
-        print_error "Core MEL node is not running"
+        print_error "Core Lane node is not running"
         record_test "verify_burn_detection_and_minting" "FAIL"
         return 1
     fi
@@ -734,7 +734,7 @@ test_verify_burn_detection_and_minting() {
     local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
     
     if echo "$node_output" | grep -q "🔥 Found Bitcoin burn"; then
-        print_success "Core MEL detected burn transaction in node output"
+        print_success "Core Lane detected burn transaction in node output"
         
         # Check if our specific burn transaction was processed
         if [ -n "$BURN_TXID" ] && echo "$node_output" | grep -q "$BURN_TXID"; then
@@ -786,7 +786,7 @@ test_json_rpc_api() {
     print_status "Test 9: JSON-RPC API Validation"
     
     if [ $NODE_PID -eq 0 ] || ! kill -0 $NODE_PID 2>/dev/null; then
-        print_error "Core MEL node is not running"
+        print_error "Core Lane node is not running"
         record_test "json_rpc_api" "FAIL"
         return 1
     fi
@@ -842,7 +842,7 @@ test_block_system() {
     print_status "Test 10: Block System Tests"
     
     if [ $NODE_PID -eq 0 ] || ! kill -0 $NODE_PID 2>/dev/null; then
-        print_error "Core MEL node is not running"
+        print_error "Core Lane node is not running"
         record_test "block_system" "FAIL"
         return 1
     fi
@@ -850,7 +850,7 @@ test_block_system() {
     # Wait for the node to finish processing blocks
     sleep 3
     
-    print_status "Testing Core MEL block system functionality..."
+    print_status "Testing Core Lane block system functionality..."
     
     # Test 1: Get latest block number
     print_status "Test 10.1: Getting latest block number"
@@ -952,7 +952,7 @@ test_block_system() {
     local pending_response=$(call_json_rpc "eth_getBlockByNumber" "\"pending\", false")
     local pending_found=$(echo "$pending_response" | jq -r '.result')
     if [ "$pending_found" = "null" ]; then
-        print_success "✅ Pending block correctly returns null (no pending blocks in Core MEL)"
+        print_success "✅ Pending block correctly returns null (no pending blocks in Core Lane)"
     else
         print_error "Pending block should return null: $pending_response"
         record_test "block_system" "FAIL"
@@ -1019,31 +1019,31 @@ test_block_system() {
         return 1
     fi
     
-    # Test 10: Check for Core MEL blocks created from Bitcoin blocks
-    print_status "Test 10.10: Checking for Core MEL blocks created from Bitcoin blocks"
+    # Test 10: Check for Core Lane blocks created from Bitcoin blocks
+    print_status "Test 10.10: Checking for Core Lane blocks created from Bitcoin blocks"
     
     # Check node output for block creation messages
     local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
-    if echo "$node_output" | grep -q "🆕 Created Core MEL block"; then
-        print_success "✅ Core MEL blocks are being created from Bitcoin blocks!"
+    if echo "$node_output" | grep -q "🆕 Created Core Lane block"; then
+        print_success "✅ Core Lane blocks are being created from Bitcoin blocks!"
         
         # Count the number of blocks created
-        local block_count=$(echo "$node_output" | grep -c "🆕 Created Core MEL block" || echo "0")
-        print_success "   Number of Core MEL blocks created: $block_count"
+        local block_count=$(echo "$node_output" | grep -c "🆕 Created Core Lane block" || echo "0")
+        print_success "   Number of Core Lane blocks created: $block_count"
         
         # Check for block finalization
-        if echo "$node_output" | grep -q "✅ Finalized Core MEL block"; then
-            print_success "   ✅ Core MEL blocks are being finalized"
+        if echo "$node_output" | grep -q "✅ Finalized Core Lane block"; then
+            print_success "   ✅ Core Lane blocks are being finalized"
             
             # Count finalized blocks
-            local finalized_count=$(echo "$node_output" | grep -c "✅ Finalized Core MEL block" || echo "0")
+            local finalized_count=$(echo "$node_output" | grep -c "✅ Finalized Core Lane block" || echo "0")
             print_success "   Number of finalized blocks: $finalized_count"
         else
             print_warning "   ⚠️  No block finalization messages found"
         fi
     else
-        print_warning "⚠️  No Core MEL block creation messages found in node output"
-        print_status "   This might be normal if no Bitcoin blocks contained Core MEL transactions"
+        print_warning "⚠️  No Core Lane block creation messages found in node output"
+        print_status "   This might be normal if no Bitcoin blocks contained Core Lane transactions"
     fi
     
     print_success "Block system tests completed successfully!"
@@ -1055,7 +1055,7 @@ test_enhanced_transaction_methods() {
     print_status "Test 11: Enhanced Transaction Methods Tests"
     
     if [ $NODE_PID -eq 0 ] || ! kill -0 $NODE_PID 2>/dev/null; then
-        print_error "Core MEL node is not running"
+        print_error "Core Lane node is not running"
         record_test "enhanced_transaction_methods" "FAIL"
         return 1
     fi
@@ -1202,7 +1202,7 @@ test_enhanced_transaction_methods() {
         fi
     else
         print_warning "⚠️  No transactions in genesis block to test transaction methods"
-        print_status "   This is normal if no Core MEL transactions were processed"
+        print_status "   This is normal if no Core Lane transactions were processed"
     fi
     
     # Test 8: Test non-existent transaction
@@ -1249,9 +1249,9 @@ test_enhanced_transaction_methods() {
 test_node_cleanup() {
     print_status "Test 12: Node Cleanup"
     
-    # Stop the Core MEL node if it's running
+    # Stop the Core Lane node if it's running
     if [ $NODE_PID -ne 0 ] && kill -0 $NODE_PID 2>/dev/null; then
-        print_status "Stopping Core MEL node (PID: $NODE_PID)..."
+        print_status "Stopping Core Lane node (PID: $NODE_PID)..."
         kill $NODE_PID 2>/dev/null || true
         sleep 2
         
@@ -1260,14 +1260,14 @@ test_node_cleanup() {
             kill -9 $NODE_PID 2>/dev/null || true
         fi
         
-        print_success "Core MEL node stopped"
+        print_success "Core Lane node stopped"
     else
-        print_status "Core MEL node was not running"
+        print_status "Core Lane node was not running"
     fi
     
     # Show node output for debugging
     if [ -f "/tmp/core_lane_node_output" ]; then
-        print_status "Core MEL node output"
+        print_status "Core Lane node output"
         cat /tmp/core_lane_node_output
         
         # Check for minting success messages
@@ -1286,13 +1286,13 @@ test_node_cleanup() {
         
         # Check for block system messages
         print_status "Checking for block system messages..."
-        if grep -q "🆕 Created Core MEL block" /tmp/core_lane_node_output; then
+        if grep -q "🆕 Created Core Lane block" /tmp/core_lane_node_output; then
             print_success "✅ Block creation messages found in node output!"
         else
             print_warning "No block creation messages found in node output"
         fi
         
-        if grep -q "✅ Finalized Core MEL block" /tmp/core_lane_node_output; then
+        if grep -q "✅ Finalized Core Lane block" /tmp/core_lane_node_output; then
             print_success "✅ Block finalization messages found in node output!"
         else
             print_warning "No block finalization messages found in node output"
@@ -1304,7 +1304,7 @@ test_node_cleanup() {
 
 # Function to run all tests
 run_all_tests() {
-    print_status "Starting Core MEL Integration Test Suite"
+    print_status "Starting Core Lane Integration Test Suite"
     echo "================================================"
     
     # Run tests
@@ -1371,7 +1371,7 @@ run_all_tests() {
 
 # Function to show help
 show_help() {
-    echo "Core MEL Integration Test Suite"
+    echo "Core Lane Integration Test Suite"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -1379,15 +1379,15 @@ show_help() {
     echo "  --help, -h     Show this help"
     echo "  --clean        Clean up test files"
     echo ""
-    echo "This script tests the complete Core MEL workflow:"
+    echo "This script tests the complete Core Lane workflow:"
     echo "1. Environment setup verification"
     echo "2. Wallet balance check"
     echo "3. Bitcoin burn transaction creation"
     echo "4. Ethereum transaction embedding in Bitcoin DA with transaction receipt tracking (CLI + RPC test)"
     echo "5. Block mining and confirmation"
     echo "6. Burn transaction verification in block"
-    echo "7. Start Core MEL node with JSON-RPC server"
-    echo "8. Test transaction receipts with main Core MEL node"
+    echo "7. Start Core Lane node with JSON-RPC server"
+    echo "8. Test transaction receipts with main Core Lane node"
     echo "9. Verify burn detection and automatic minting"
     echo "10. JSON-RPC API validation (eth_getBalance, eth_sendRawTransaction)"
     echo "11. Block system tests (genesis block, block querying, block creation)"
@@ -1406,16 +1406,16 @@ cleanup() {
     rm -f /tmp/core_lane_node_rpc_output
     rm -f /tmp/core_lane_test_output
     
-    # Stop any running Core MEL nodes
+    # Stop any running Core Lane nodes
     if [ $NODE_PID -ne 0 ] && kill -0 $NODE_PID 2>/dev/null; then
-        print_status "Stopping running Core MEL node..."
+        print_status "Stopping running Core Lane node..."
         kill $NODE_PID 2>/dev/null || true
         sleep 2
         kill -9 $NODE_PID 2>/dev/null || true
     fi
     
-    # Stop any running Core MEL processes
-    pkill -f "core-mel-node" 2>/dev/null || true
+    # Stop any running Core Lane processes
+    pkill -f "core-lane-node" 2>/dev/null || true
     
     # Stop the Bitcoin environment (with database cleanup)
     print_status "Stopping Bitcoin environment..."
