@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Core MEL Integration Test Suite
-# Tests the complete Bitcoin → Core MEL bridge workflow
+# Core Lane Integration Test Suite
+# Tests the complete Bitcoin → Core Lane bridge workflow
 
 set -e
 
@@ -286,7 +286,7 @@ test_send_ethereum_transaction() {
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
-        --http-port $JSON_RPC_PORT > /tmp/core_mel_node_rpc_output 2>&1 &
+        --http-port $JSON_RPC_PORT > /tmp/core_lane_node_rpc_output 2>&1 &
     
     local rpc_node_pid=$!
     print_status "Started Core MEL node for RPC testing (PID: $rpc_node_pid)"
@@ -521,7 +521,7 @@ test_verify_reveal_in_block() {
 }
 
 # Test 7: Start Core MEL Node with JSON-RPC
-test_start_core_mel_node() {
+test_start_core_lane_node() {
     print_status "Test 7: Start Core MEL Node with JSON-RPC"
     
     # Kill any existing Core MEL processes
@@ -548,7 +548,7 @@ test_start_core_mel_node() {
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
-        --http-port $JSON_RPC_PORT > /tmp/core_mel_node_output 2>&1 &
+        --http-port $JSON_RPC_PORT > /tmp/core_lane_node_output 2>&1 &
     
     NODE_PID=$!
     print_status "Started Core MEL node (PID: $NODE_PID)"
@@ -561,8 +561,8 @@ test_start_core_mel_node() {
     local wait_count=0
     
     while [ $wait_count -lt $max_wait ]; do
-        if [ -f "/tmp/core_mel_node_output" ]; then
-            local node_output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "")
+        if [ -f "/tmp/core_lane_node_output" ]; then
+            local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
             if echo "$node_output" | grep -q "$BURN_TXID"; then
                 print_success "✅ Our burn transaction $BURN_TXID was detected!"
                 break
@@ -585,7 +585,7 @@ test_start_core_mel_node() {
         local wait_count=0
         
         while [ $wait_count -lt $max_wait ]; do
-            local node_output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "")
+            local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
             if echo "$node_output" | grep -q "Found Core MEL transaction in Taproot envelope"; then
                 print_success "✅ Core MEL DA transaction detected in reveal transaction (CLI)!"
                 break
@@ -614,7 +614,7 @@ test_start_core_mel_node() {
         local wait_count=0
         
         while [ $wait_count -lt $max_wait ]; do
-            local node_output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "")
+            local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
             if echo "$node_output" | grep -q "Found Core MEL transaction in Taproot envelope"; then
                 print_success "✅ Core MEL DA transaction detected in reveal transaction (RPC)!"
                 break
@@ -644,12 +644,12 @@ test_start_core_mel_node() {
     # Check if process is still running
     if kill -0 $NODE_PID 2>/dev/null; then
         print_success "Core MEL node is running with JSON-RPC"
-        record_test "start_core_mel_node" "PASS"
+        record_test "start_core_lane_node" "PASS"
     else
         print_error "Core MEL node failed to start"
-        local output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "No output")
+        local output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
         echo "Node output: $output"
-        record_test "start_core_mel_node" "FAIL"
+        record_test "start_core_lane_node" "FAIL"
         return 1
     fi
 }
@@ -731,7 +731,7 @@ test_verify_burn_detection_and_minting() {
     fi
     
     # Check node output for burn detection
-    local node_output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "No output")
+    local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
     
     if echo "$node_output" | grep -q "🔥 Found Bitcoin burn"; then
         print_success "Core MEL detected burn transaction in node output"
@@ -1023,7 +1023,7 @@ test_block_system() {
     print_status "Test 10.10: Checking for Core MEL blocks created from Bitcoin blocks"
     
     # Check node output for block creation messages
-    local node_output=$(cat /tmp/core_mel_node_output 2>/dev/null || echo "No output")
+    local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "No output")
     if echo "$node_output" | grep -q "🆕 Created Core MEL block"; then
         print_success "✅ Core MEL blocks are being created from Bitcoin blocks!"
         
@@ -1266,19 +1266,19 @@ test_node_cleanup() {
     fi
     
     # Show node output for debugging
-    if [ -f "/tmp/core_mel_node_output" ]; then
+    if [ -f "/tmp/core_lane_node_output" ]; then
         print_status "Core MEL node output"
-        cat /tmp/core_mel_node_output
+        cat /tmp/core_lane_node_output
         
         # Check for minting success messages
         print_status "Checking for minting success messages..."
-        if grep -q "✅ Minted" /tmp/core_mel_node_output; then
+        if grep -q "✅ Minted" /tmp/core_lane_node_output; then
             print_success "✅ Minting success message found in node output!"
         else
             print_warning "No minting success message found in node output"
         fi
         
-        if grep -q "🎯 Minting successful" /tmp/core_mel_node_output; then
+        if grep -q "🎯 Minting successful" /tmp/core_lane_node_output; then
             print_success "✅ Minting completion message found!"
         else
             print_warning "No minting completion message found"
@@ -1286,13 +1286,13 @@ test_node_cleanup() {
         
         # Check for block system messages
         print_status "Checking for block system messages..."
-        if grep -q "🆕 Created Core MEL block" /tmp/core_mel_node_output; then
+        if grep -q "🆕 Created Core MEL block" /tmp/core_lane_node_output; then
             print_success "✅ Block creation messages found in node output!"
         else
             print_warning "No block creation messages found in node output"
         fi
         
-        if grep -q "✅ Finalized Core MEL block" /tmp/core_mel_node_output; then
+        if grep -q "✅ Finalized Core MEL block" /tmp/core_lane_node_output; then
             print_success "✅ Block finalization messages found in node output!"
         else
             print_warning "No block finalization messages found in node output"
@@ -1314,7 +1314,7 @@ run_all_tests() {
     test_send_ethereum_transaction
     test_mine_confirmation
     test_verify_reveal_in_block
-    test_start_core_mel_node
+    test_start_core_lane_node
     test_transaction_receipts
     test_verify_burn_detection_and_minting
     test_json_rpc_api
@@ -1402,9 +1402,9 @@ cleanup() {
     rm -f .test-da-txid
     rm -f .test-rpc-da-txid
     rm -f .test-address
-    rm -f /tmp/core_mel_node_output
-    rm -f /tmp/core_mel_node_rpc_output
-    rm -f /tmp/core_mel_test_output
+    rm -f /tmp/core_lane_node_output
+    rm -f /tmp/core_lane_node_rpc_output
+    rm -f /tmp/core_lane_test_output
     
     # Stop any running Core MEL nodes
     if [ $NODE_PID -ne 0 ] && kill -0 $NODE_PID 2>/dev/null; then

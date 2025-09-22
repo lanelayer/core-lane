@@ -2,7 +2,7 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
-/// Core MEL account structure
+/// Core Lane account structure
 #[derive(Debug, Clone)]
 pub struct CoreMELAccount {
     pub balance: U256,
@@ -70,7 +70,7 @@ impl CoreMELAccount {
     }
 }
 
-/// Account manager for Core MEL
+/// Account manager for Core Lane
 #[derive(Debug, Clone)]
 pub struct AccountManager {
     accounts: HashMap<Address, CoreMELAccount>,

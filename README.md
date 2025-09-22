@@ -1,10 +1,10 @@
-# Core MEL Node
+# Core Lane Node
 
 A Bitcoin-anchored execution environment (L1.5) that provides Ethereum-style transactions anchored to Bitcoin blocks.
 
 ## Overview
 
-Core MEL (Minimal Execution Lane) is a Bitcoin-anchored execution environment that provides the absolute minimum set of transaction types for building higher-level applications. It looks and feels like Ethereum JSON-RPC + EIP-155 transactions, but every block is anchored in Bitcoin (forced inclusion).
+Core Lane (Minimal Execution Lane) is a Bitcoin-anchored execution environment that provides the absolute minimum set of transaction types for building higher-level applications. It looks and feels like Ethereum JSON-RPC + EIP-155 transactions, but every block is anchored in Bitcoin (forced inclusion).
 
 ## Current Implementation Status
 
@@ -12,8 +12,8 @@ Core MEL (Minimal Execution Lane) is a Bitcoin-anchored execution environment th
 
 - **Bitcoin RPC Integration**: Connected to Bitcoin Core via RPC
 - **Block Scanning**: Continuous Bitcoin block monitoring
-- **DA Extraction**: Core MEL transaction detection from Bitcoin DA envelopes
-- **State Management**: Basic in-memory state for Core MEL accounts and transactions
+- **DA Extraction**: Core Lane transaction detection from Bitcoin DA envelopes
+- **State Management**: Basic in-memory state for Core Lane accounts and transactions
 
 ### Phase 1.2: EIP-1559 Transaction Support ✅ COMPLETED
 
@@ -27,7 +27,7 @@ Core MEL (Minimal Execution Lane) is a Bitcoin-anchored execution environment th
 
 - **Bitcoin Burn Detection**: Automatic detection of Bitcoin OP_RETURN burns with BRN1 format
 - **Hybrid P2WSH + OP_RETURN Burn Method**: Reliable burn transactions with clear value separation
-- **Automatic Minting**: Core MEL tokens minted 1:1 for Bitcoin burns (chain ID 1)
+- **Automatic Minting**: Core Lane tokens minted 1:1 for Bitcoin burns (chain ID 1)
 - **Transaction Execution**: Full execution engine for Burn (transfer to unspendable), Transfer, and Exit
 - **State Transitions**: Proper balance updates, nonce increments, and account management
 - **Gas System**: Gas metering and fee charging for transaction processing
@@ -36,17 +36,17 @@ Core MEL (Minimal Execution Lane) is a Bitcoin-anchored execution environment th
 
 ## Features
 
-### Core MEL Transaction Detection
-- Scans Bitcoin blocks for Core MEL transactions embedded in DA envelopes
-- Recognizes transactions with `CORE_MEL` prefix in Bitcoin script data
+### Core Lane Transaction Detection
+- Scans Bitcoin blocks for Core Lane transactions embedded in DA envelopes
+- Recognizes transactions with `CORE_LANE` prefix in Bitcoin script data
 - Processes EIP-1559 transaction format using alloy primitives
 - Supports transaction validation and gas calculation
 
-### Bitcoin Burn to Core MEL Bridge
+### Bitcoin Burn to Core Lane Bridge
 - Detects Bitcoin OP_RETURN transactions with BRN1 format
 - **Hybrid P2WSH + OP_RETURN burn method**: P2WSH output carries burn value, 0-value OP_RETURN carries BRN1 data
-- Automatically mints Core MEL tokens when Bitcoin is burned (1:1 ratio)
-- Supports chain ID filtering (Core MEL uses chain ID 1)
+- Automatically mints Core Lane tokens when Bitcoin is burned (1:1 ratio)
+- Supports chain ID filtering (Core Lane uses chain ID 1)
 - Extracts Ethereum addresses from burn transactions for token distribution
 - No manual mint transactions needed - fully automated via Bitcoin scanning
 - **Two-phase block processing**: Ensures all burns are processed before DA transactions
@@ -91,28 +91,28 @@ cargo build
 
 ### Running
 
-#### Start the Core MEL node (continuous block scanning)
+#### Start the Core Lane node (continuous block scanning)
 ```bash
 # Start from recent blocks (default)
-./target/debug/core-mel-node start --rpc-user bitcoin --rpc-password bitcoin123
+./target/debug/core-lane-node start --rpc-user bitcoin --rpc-password bitcoin123
 
 # Start from a specific block
-./target/debug/core-mel-node start --start-block 200 --rpc-user bitcoin --rpc-password bitcoin123
+./target/debug/core-lane-node start --start-block 200 --rpc-user bitcoin --rpc-password bitcoin123
 ```
 
-#### Scan recent blocks for Core MEL transactions
+#### Scan recent blocks for Core Lane transactions
 ```bash
 # Scan last 10 blocks (default)
-./target/debug/core-mel-node scan-blocks --blocks 10 --rpc-user bitcoin --rpc-password bitcoin123
+./target/debug/core-lane-node scan-blocks --blocks 10 --rpc-user bitcoin --rpc-password bitcoin123
 
 # Scan 5 blocks starting from block 200
-./target/debug/core-mel-node scan-blocks --blocks 5 --start-block 200 --rpc-user bitcoin --rpc-password bitcoin123
+./target/debug/core-lane-node scan-blocks --blocks 5 --start-block 200 --rpc-user bitcoin --rpc-password bitcoin123
 ```
 
 #### Create Bitcoin burn transaction (for testing)
 ```bash
-# Burn Bitcoin to mint Core MEL tokens (uses your Bitcoin wallet)
-./target/debug/core-mel-node burn \
+# Burn Bitcoin to mint Core Lane tokens (uses your Bitcoin wallet)
+./target/debug/core-lane-node burn \
   --burn-amount 500000 \
   --chain-id 1 \
   --eth-address "0x1234567890123456789012345678901234567890" \
@@ -124,7 +124,7 @@ cargo build
 
 # The burn creates a hybrid transaction:
 # - P2WSH output: Carries the burn value (e.g., 500,000 sats)
-# - 0-value OP_RETURN output: Carries BRN1 data for Core MEL detection
+# - 0-value OP_RETURN output: Carries BRN1 data for Core Lane detection
 ```
 
 ### Configuration Options
@@ -139,13 +139,13 @@ cargo build
 
 ### Core Components
 
-1. **CoreMELNode**: Main node implementation
+1. **CoreLaneNode**: Main node implementation
    - Bitcoin RPC client integration
    - Block scanner and processor
    - State management
    - Transaction processing
 
-2. **CoreMELState**: In-memory state storage
+2. **CoreLaneState**: In-memory state storage
    - Account manager integration
    - Transaction history
    - Block processing state
@@ -153,7 +153,7 @@ cargo build
 3. **Transaction Module**: EIP-1559 transaction handling
    - TxEnvelope for transaction encoding/decoding
    - Transaction validation and gas calculation
-   - Core MEL transaction type detection
+   - Core Lane transaction type detection
 
 4. **Account Module**: Ethereum-style account management
    - U256 balance handling
@@ -162,13 +162,13 @@ cargo build
 
 ### Bitcoin DA Integration
 
-Core MEL transactions are embedded in Bitcoin blocks using Taproot envelopes:
+Core Lane transactions are embedded in Bitcoin blocks using Taproot envelopes:
 
 ```
 OP_FALSE OP_IF <data> OP_ENDIF OP_TRUE
 ```
 
-Where `<data>` contains Core MEL transaction data prefixed with `CORE_MEL`.
+Where `<data>` contains Core Lane transaction data prefixed with `CORE_LANE`.
 
 ## Development Status
 
@@ -176,14 +176,14 @@ Where `<data>` contains Core MEL transaction data prefixed with `CORE_MEL`.
 - ✅ Basic Bitcoin RPC integration
 - ✅ Block scanning infrastructure
 - ✅ DA envelope detection and extraction
-- ✅ Core MEL transaction parsing
+- ✅ Core Lane transaction parsing
 - ✅ In-memory state management
 - ✅ CLI interface
 - ✅ EIP-1559 transaction support with alloy primitives
 - ✅ Account management with balances and nonces
 
 ### Completed (Phase 2.1)
-- ✅ **Bitcoin burn detection and automatic Core MEL token minting**
+- ✅ **Bitcoin burn detection and automatic Core Lane token minting**
 - ✅ **Hybrid P2WSH + OP_RETURN burn method**
 - ✅ **Two-phase block processing (burns before DA transactions)**
 - ✅ **Full transaction execution engine**

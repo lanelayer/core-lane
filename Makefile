@@ -1,15 +1,15 @@
-# Core MEL Makefile
-# Provides easy commands for building, testing, and running Core MEL
+# Core Lane Makefile
+# Provides easy commands for building, testing, and running Core Lane
 
 .PHONY: help build test test-unit test-integration clean start-env stop-env reset-env run-burn run-scan
 
 # Default target
 help:
-	@echo "Core MEL Development Commands"
+	@echo "Core Lane Development Commands"
 	@echo "============================="
 	@echo ""
 	@echo "Build Commands:"
-	@echo "  build          - Build the Core MEL node"
+	@echo "  build          - Build the Core Lane node"
 	@echo "  clean          - Clean build artifacts"
 	@echo ""
 	@echo "Test Commands:"
@@ -23,14 +23,14 @@ help:
 	@echo "  reset-env      - Reset Bitcoin regtest environment"
 	@echo ""
 	@echo "Dev Environment Commands (recommended):"
-	@echo "  dev-start      - Start complete Core MEL dev environment"
-	@echo "  dev-stop       - Stop Core MEL dev environment"
+	@echo "  dev-start      - Start complete Core Lane dev environment"
+	@echo "  dev-stop       - Stop Core Lane dev environment"
 	@echo "  dev-status     - Check dev environment status"
-	@echo "  dev-balances   - Check Core MEL balances"
+	@echo "  dev-balances   - Check Core Lane balances"
 	@echo ""
 	@echo "Demo Commands:"
 	@echo "  run-burn       - Run a demo burn transaction"
-	@echo "  run-node       - Run the Core MEL node"
+	@echo "  run-node       - Run the Core Lane node"
 	@echo ""
 	@echo "Development Commands:"
 	@echo "  check          - Run cargo check"
@@ -39,7 +39,7 @@ help:
 
 # Build commands
 build:
-	@echo "Building Core MEL node..."
+	@echo "Building Core Lane node..."
 	cargo build
 
 clean:
@@ -56,8 +56,8 @@ test-unit:
 
 test-integration:
 	@echo "Running integration tests..."
-	@if [ ! -f "target/debug/core-mel-node" ]; then \
-		echo "Building Core MEL node first..."; \
+	@if [ ! -f "target/debug/core-lane-node" ]; then \
+		echo "Building Core Lane node first..."; \
 		cargo build; \
 	fi
 	@if [ ! -f "tests/integration_test.sh" ]; then \
@@ -88,7 +88,7 @@ reset-env: stop-env start-env
 
 # Dev Environment commands (recommended for development)
 dev-start:
-	@echo "Starting Core MEL development environment..."
+	@echo "Starting Core Lane development environment..."
 	@if [ ! -f "scripts/dev-environment.sh" ]; then \
 		echo "dev-environment.sh not found"; \
 		exit 1; \
@@ -97,13 +97,13 @@ dev-start:
 	@./scripts/dev-environment.sh start
 
 dev-stop:
-	@echo "Stopping Core MEL development environment..."
+	@echo "Stopping Core Lane development environment..."
 	@if [ -f "scripts/dev-environment.sh" ]; then \
 		./scripts/dev-environment.sh stop; \
 	fi
 
 dev-status:
-	@echo "Checking Core MEL development environment status..."
+	@echo "Checking Core Lane development environment status..."
 	@if [ ! -f "scripts/dev-environment.sh" ]; then \
 		echo "dev-environment.sh not found"; \
 		exit 1; \
@@ -112,7 +112,7 @@ dev-status:
 	@./scripts/dev-environment.sh status
 
 dev-balances:
-	@echo "Checking Core MEL balances..."
+	@echo "Checking Core Lane balances..."
 	@if [ ! -f "scripts/dev-environment.sh" ]; then \
 		echo "dev-environment.sh not found"; \
 		exit 1; \
@@ -130,15 +130,15 @@ run-burn: build
 	@./test-environment.sh status
 	@echo ""
 	@echo "Creating burn transaction..."
-	@./target/debug/core-mel-node burn \
+	@./target/debug/core-lane-node burn \
 		--burn-amount 500000 \
 		--chain-id 1 \
 		--eth-address "0x1234567890123456789012345678901234567890" \
 		--rpc-password bitcoin123
 
 run-node: build
-	@echo "Running Core MEL node with JSON-RPC server..."
-	@echo "🚀 Starting Core MEL node with block scanning and JSON-RPC on http://localhost:8545"
+	@echo "Running Core Lane node with JSON-RPC server..."
+	@echo "🚀 Starting Core Lane node with block scanning and JSON-RPC on http://localhost:8545"
 	@echo "📡 JSON-RPC endpoints available:"
 	@echo "   - eth_getBalance: POST http://localhost:8545"
 	@echo ""
