@@ -1,4 +1,4 @@
-use crate::{CoreMELState, Intent, IntentStatus};
+use crate::{CoreLaneState, Intent, IntentStatus};
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{SignableTransaction, Signed, TxEnvelope};
 use alloy_primitives::B256;
@@ -329,7 +329,7 @@ fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
     }
 }
 
-/// Core MEL specific addresses for special operations
+/// Core Lane specific addresses for special operations
 #[derive(Debug, Clone)]
 pub struct CoreMELAddresses;
 
@@ -351,15 +351,15 @@ impl CoreMELAddresses {
     }
 }
 
-/// Parse Core MEL transaction from Bitcoin DA data
-pub fn parse_core_mel_transaction(data: &[u8]) -> Result<TxEnvelope> {
-    if data.len() < 8 || !data.starts_with(b"CORE_MEL") {
+/// Parse Core Lane transaction from Bitcoin DA data
+pub fn parse_core_lane_transaction(data: &[u8]) -> Result<TxEnvelope> {
+    if data.len() < 8 || !data.starts_with(b"CORE_LANE") {
         return Err(anyhow!(
-            "Invalid Core MEL transaction format - missing CORE_MEL prefix"
+            "Invalid Core Lane transaction format - missing CORE_LANE prefix"
         ));
     }
 
-    // Extract the Ethereum transaction data (skip CORE_MEL prefix)
+    // Extract the Ethereum transaction data (skip CORE_LANE prefix)
     let tx_data = &data[8..];
 
     // Try to decode as RLP-encoded Ethereum transaction envelope
@@ -396,16 +396,16 @@ pub fn parse_core_mel_transaction(data: &[u8]) -> Result<TxEnvelope> {
             Ok(tx)
         }
         Err(e) => Err(anyhow!(
-            "Failed to decode Ethereum transaction after CORE_MEL prefix: {}",
+            "Failed to decode Ethereum transaction after CORE_LANE prefix: {}",
             e
         )),
     }
 }
 
-/// Encode Core MEL transaction for Bitcoin DA
-pub fn encode_core_mel_transaction(tx: &TxEnvelope) -> Result<Vec<u8>> {
+/// Encode Core Lane transaction for Bitcoin DA
+pub fn encode_core_lane_transaction(tx: &TxEnvelope) -> Result<Vec<u8>> {
     let mut data = Vec::new();
-    data.extend_from_slice(b"CORE_MEL");
+    data.extend_from_slice(b"CORE_LANE");
 
     // Encode the full Ethereum transaction as RLP
     let mut tx_bytes = Vec::new();
@@ -417,7 +417,7 @@ pub fn encode_core_mel_transaction(tx: &TxEnvelope) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-/// Validate Core MEL transaction
+/// Validate Core Lane transaction
 pub fn validate_transaction(tx: &TxEnvelope) -> Result<()> {
     // Basic validation - check that we have a valid transaction envelope
     // In a full implementation, this would validate the signed transaction fields
@@ -543,13 +543,13 @@ pub struct ExecutionResult {
     pub error: Option<String>,
 }
 
-/// Execute a Core MEL transaction
+/// Execute a Core Lane transaction
 pub fn execute_transaction(
     tx: &TxEnvelope,
     sender: Address,
     //account_manager: &mut crate::account::AccountManager,
     //intents: &mut HashMap<B256, (Bytes, u64)>,
-    state: &mut CoreMELState,
+    state: &mut CoreLaneState,
 ) -> Result<ExecutionResult> {
     // Basic execution framework
     let gas_limit = get_gas_limit(tx);
@@ -642,7 +642,7 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 fn execute_transfer(
     tx: &TxEnvelope,
     sender: Address,
-    state: &mut CoreMELState,
+    state: &mut CoreLaneState,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
@@ -900,7 +900,7 @@ fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
 }
 
 fn verify_intent_fill_on_bitcoin(
-    state: &crate::CoreMELState,
+    state: &crate::CoreLaneState,
     intent_id: B256,
     block_number: u64,
 ) -> Result<bool> {

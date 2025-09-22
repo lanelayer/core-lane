@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 # Configuration
 BITCOIN_CONTAINER="bitcoin-regtest"
 BITCOIN_DATA_DIR="$HOME/bitcoin-regtest"
-CORE_MEL_DIR="$(pwd)"
+CORE_LANE_DIR="$(pwd)"
 RPC_USER="bitcoin"
 RPC_PASSWORD="bitcoin123"
 RPC_URL="http://127.0.0.1:18443"
@@ -145,15 +145,15 @@ setup_wallet() {
 }
 
 # Function to build Core MEL
-build_core_mel() {
+build_core_lane() {
     print_status "Building Core MEL node..."
-    cd "$CORE_MEL_DIR"
+    cd "$CORE_LANE_DIR"
     cargo build
     print_success "Core MEL node built successfully!"
 }
 
 # Function to test Core MEL connection
-test_core_mel_connection() {
+test_core_lane_connection() {
     print_status "Testing Core MEL connection to Bitcoin..."
     
     if [ ! -f "target/debug/core-mel-node" ]; then
@@ -288,10 +288,10 @@ case "${1:-help}" in
         setup_wallet
         ;;
     build)
-        build_core_mel
+        build_core_lane
         ;;
     test)
-        test_core_mel_connection
+        test_core_lane_connection
         ;;
     create-burn)
         create_test_burn
