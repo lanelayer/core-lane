@@ -33,7 +33,7 @@ use alloy_rlp::Decodable;
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::{
-    create_anchor_bitcoin_fill_intent, decode_intent_calldata, execute_transaction, 
+    create_anchor_bitcoin_fill_intent, decode_intent_calldata, execute_transaction,
     get_transaction_input_bytes, recover_sender, validate_transaction,
 };
 
@@ -286,7 +286,7 @@ struct CoreLaneState {
     transaction_receipts: HashMap<String, TransactionReceipt>, // Store transaction receipts
     last_processed_block: u64,
     blocks: HashMap<u64, CoreLaneBlock>,  // Block number -> Block
-    block_hashes: HashMap<B256, u64>,    // Block hash -> Block number
+    block_hashes: HashMap<B256, u64>,     // Block hash -> Block number
     current_block: Option<CoreLaneBlock>, // Current block being built
     genesis_block: CoreLaneBlock,         // Genesis block
     intents: HashMap<B256, Intent>,
@@ -764,7 +764,7 @@ impl CoreLaneNode {
         // For Core Lane, check if the concatenated data starts with "CORE_LANE"
         if data.starts_with(b"CORE_LANE") {
             // Return just the transaction data (after CORE_LANE prefix)
-            let tx_data = &data[8..];
+            let tx_data = &data[9..];
 
             // Remove padding from the end (look for 0xf0 padding pattern)
             let mut clean_end = tx_data.len();
@@ -900,8 +900,8 @@ impl CoreLaneNode {
 
         // Look for CORE_LANE prefix in the data
         let core_lane_bytes = b"CORE_LANE";
-        for i in 2..bytes.len().saturating_sub(8) {
-            if &bytes[i..i + 8] == core_lane_bytes {
+        for i in 2..bytes.len().saturating_sub(9) {
+            if &bytes[i..i + core_lane_bytes.len()] == core_lane_bytes {
                 println!("       ✅ Found CORE_LANE prefix at offset {}", i);
                 return true;
             }
@@ -916,12 +916,12 @@ impl CoreLaneNode {
 
         // Look for CORE_LANE prefix
         let core_lane_bytes = b"CORE_LANE";
-        for i in 2..bytes.len().saturating_sub(8) {
-            if &bytes[i..i + 8] == core_lane_bytes {
+        for i in 2..bytes.len().saturating_sub(core_lane_bytes.len()) {
+            if &bytes[i..i + core_lane_bytes.len()] == core_lane_bytes {
                 println!("       Found CORE_LANE at offset {}", i);
 
                 // The Ethereum transaction starts right after "CORE_LANE"
-                let eth_tx_start = i + 8;
+                let eth_tx_start = i + core_lane_bytes.len();
 
                 // Find the end of the transaction data by looking for OP_ENDIF OP_TRUE
                 for j in (eth_tx_start + 20)..bytes.len().saturating_sub(2) {
@@ -1888,14 +1888,23 @@ async fn main() -> Result<()> {
             // Convert to CBOR (this is the serialized intent data)
             let intent_cbor = intent_data.to_cbor()?;
             let intent_data_hex = format!("0x{}", hex::encode(&intent_cbor));
-            
+
             info!("✅ Exit intent data constructed successfully!");
-            info!("📝 Intent Data (CBOR, {} bytes): {}", intent_cbor.len(), intent_data_hex);
+            info!(
+                "📝 Intent Data (CBOR, {} bytes): {}",
+                intent_cbor.len(),
+                intent_data_hex
+            );
             info!("");
             info!("💡 To use this exit intent:");
             info!("   1. Send a transaction to the IntentSystem contract");
-            info!("   2. Call intent({}, nonce) with the intent data above", intent_data_hex);
-            info!("   3. The intent will be submitted for bitcoin withdrawal (exit from Core Lane)");
+            info!(
+                "   2. Call intent({}, nonce) with the intent data above",
+                intent_data_hex
+            );
+            info!(
+                "   3. The intent will be submitted for bitcoin withdrawal (exit from Core Lane)"
+            );
         }
     }
 
