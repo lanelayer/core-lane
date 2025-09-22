@@ -6,8 +6,8 @@
 echo "🧪 Testing eth_sendRawTransaction"
 echo "================================="
 
-# Start the Core MEL node in the background
-echo "🚀 Starting Core MEL node..."
+# Start the Core Lane node in the background
+echo "🚀 Starting Core Lane node..."
 cargo run -- start --rpc-user bitcoin --rpc-password bitcoin123 --http-host 127.0.0.1 --http-port 8545 &
 NODE_PID=$!
 

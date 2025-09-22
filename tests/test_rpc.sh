@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Test script for Core MEL JSON-RPC endpoint
+# Test script for Core Lane JSON-RPC endpoint
 
-echo "🧪 Testing Core MEL JSON-RPC eth_getBalance endpoint..."
+echo "🧪 Testing Core Lane JSON-RPC eth_getBalance endpoint..."
 
 # Test address
 TEST_ADDRESS="0x1234567890123456789012345678901234567890"
