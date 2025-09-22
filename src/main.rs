@@ -33,8 +33,8 @@ use alloy_rlp::Decodable;
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::{
-    decode_intent_calldata, execute_transaction, get_transaction_input_bytes, recover_sender,
-    validate_transaction,
+    create_anchor_bitcoin_fill_intent, decode_intent_calldata, execute_transaction, 
+    get_transaction_input_bytes, recover_sender, validate_transaction,
 };
 
 #[derive(Parser)]
@@ -95,6 +95,16 @@ enum Commands {
         rpc_user: String,
         #[arg(long)]
         rpc_password: String,
+    },
+    ConstructExitIntent {
+        #[arg(long)]
+        bitcoin_address: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long, default_value = "1000")]
+        max_fee: u64,
+        #[arg(long)]
+        expire_by: u64,
     },
 }
 
@@ -1853,6 +1863,39 @@ async fn main() -> Result<()> {
             let node = CoreMELNode::new(client);
             node.send_transaction_to_da(raw_tx_hex, *fee_sats, wallet, network)
                 .await?;
+        }
+
+        Commands::ConstructExitIntent {
+            bitcoin_address,
+            amount,
+            max_fee,
+            expire_by,
+        } => {
+            info!("🔧 Constructing exit intent data for bitcoin withdrawal...");
+            info!("   Bitcoin Address: {}", bitcoin_address);
+            info!("   Amount: {} sats", amount);
+            info!("   Max Fee: {} sats", max_fee);
+            info!("   Expire By: {}", expire_by);
+
+            // Create the intent data
+            let intent_data = create_anchor_bitcoin_fill_intent(
+                bitcoin_address,
+                U256::from(*amount),
+                U256::from(*max_fee),
+                *expire_by,
+            )?;
+
+            // Convert to CBOR (this is the serialized intent data)
+            let intent_cbor = intent_data.to_cbor()?;
+            let intent_data_hex = format!("0x{}", hex::encode(&intent_cbor));
+            
+            info!("✅ Exit intent data constructed successfully!");
+            info!("📝 Intent Data (CBOR, {} bytes): {}", intent_cbor.len(), intent_data_hex);
+            info!("");
+            info!("💡 To use this exit intent:");
+            info!("   1. Send a transaction to the IntentSystem contract");
+            info!("   2. Call intent({}, nonce) with the intent data above", intent_data_hex);
+            info!("   3. The intent will be submitted for bitcoin withdrawal (exit from Core MEL)");
         }
     }
 
