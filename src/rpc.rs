@@ -1,6 +1,8 @@
+use crate::transaction::{decode_intent_calldata, IntentCall};
 use crate::CoreLaneState;
+use crate::IntentStatus;
 use alloy_consensus::transaction::SignerRecoverable;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, U256};
 use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
@@ -12,6 +14,7 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -1727,7 +1730,7 @@ impl RpcServer {
     // Call and execution methods
     async fn handle_call(
         request: JsonRpcRequest,
-        _state: &Arc<Self>,
+        state: &Arc<Self>,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
         if request.params.len() != 2 {
             return Ok(JsonResponse::from(JsonRpcResponse {
@@ -1741,14 +1744,101 @@ impl RpcServer {
             }));
         }
 
-        // For now, return an error indicating this method is not fully implemented
+        // Parse call object
+        let call_obj = match &request.params[0] {
+            Value::Object(map) => map,
+            _ => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: "Invalid params: expected call object".to_string(),
+                    }),
+                    id: request.id,
+                }));
+            }
+        };
+
+        let data_str = call_obj
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0x");
+
+        let calldata_hex = data_str.trim_start_matches("0x");
+        let calldata = match hex::decode(calldata_hex) {
+            Ok(b) => b,
+            Err(_) => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: "Invalid data hex".to_string(),
+                    }),
+                    id: request.id,
+                }));
+            }
+        };
+
+        let maybe_call = decode_intent_calldata(&calldata);
+        let mut ret_bytes: Vec<u8> = Vec::new();
+
+        match maybe_call {
+            Some(IntentCall::IsIntentSolved { intent_id }) => {
+                info!("IsIntentSolved: intent_id = {}", intent_id);
+                let state_guard = state.state.lock().await;
+                match state_guard.intents.get(&intent_id) {
+                    Some(intent) if matches!(intent.status, IntentStatus::Solved) => {
+                        ret_bytes.extend_from_slice(&{
+                            let mut res = [0u8; 32];
+                            res[31] = 1;
+                            res
+                        });
+                    }
+                    _ => {
+                        ret_bytes.extend_from_slice(&[0u8; 32]);
+                    }
+                }
+            }
+            Some(IntentCall::ValueStoredInIntent { intent_id }) => {
+                info!("ValueStoredInIntent: intent_id = {}", intent_id);
+                let state_guard = state.state.lock().await;
+                let value_u256: U256 = match state_guard.intents.get(&intent_id) {
+                    Some(intent) => U256::from(intent.value),
+                    None => U256::ZERO,
+                };
+                let be: [u8; 32] = value_u256.to_be_bytes();
+                ret_bytes.extend_from_slice(&be);
+            }
+            Some(IntentCall::IntentLocker { intent_id }) => {
+                info!("IntentLocker: intent_id = {}", intent_id);
+                let state_guard = state.state.lock().await;
+                let mut buf = [0u8; 32];
+                if let Some(intent) = state_guard.intents.get(&intent_id) {
+                    if let crate::IntentStatus::Locked(addr) = intent.status {
+                        let addr_bytes = addr.as_slice();
+                        buf[12..].copy_from_slice(addr_bytes);
+                    }
+                }
+                ret_bytes.extend_from_slice(&buf);
+            }
+            _ => {
+                // Unsupported/unknown function; return empty bytes per eth_call conventions
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: Some(json!("0x")),
+                    error: None,
+                    id: request.id,
+                }));
+            }
+        }
+
+        let result_hex = format!("0x{}", hex::encode(ret_bytes));
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: "eth_call not yet implemented".to_string(),
-            }),
+            result: Some(json!(result_hex)),
+            error: None,
             id: request.id,
         }))
     }
