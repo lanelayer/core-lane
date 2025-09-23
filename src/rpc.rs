@@ -1,4 +1,4 @@
-use crate::CoreLaneState;
+use crate::CoreMELState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256};
 use anyhow;
@@ -61,12 +61,12 @@ pub struct TransactionRequest {
 }
 
 pub struct RpcServer {
-    state: Arc<Mutex<CoreLaneState>>,
+    state: Arc<Mutex<CoreMELState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
 }
 
 impl RpcServer {
-    pub fn new(state: Arc<Mutex<CoreLaneState>>) -> Self {
+    pub fn new(state: Arc<Mutex<CoreMELState>>) -> Self {
         Self {
             state,
             bitcoin_client: None,
@@ -74,7 +74,7 @@ impl RpcServer {
     }
 
     pub fn with_bitcoin_client(
-        state: Arc<Mutex<CoreLaneState>>,
+        state: Arc<Mutex<CoreMELState>>,
         bitcoin_client: Arc<bitcoincore_rpc::Client>,
     ) -> Self {
         Self {

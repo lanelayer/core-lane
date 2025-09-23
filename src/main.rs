@@ -33,13 +33,13 @@ use alloy_rlp::Decodable;
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::{
-    create_anchor_bitcoin_fill_intent, decode_intent_calldata, execute_transaction,
-    get_transaction_input_bytes, recover_sender, validate_transaction,
+    decode_intent_calldata, execute_transaction, get_transaction_input_bytes, recover_sender,
+    validate_transaction,
 };
 
 #[derive(Parser)]
-#[command(name = "core-lane-node")]
-#[command(about = "Core Lane Node - Bitcoin-anchored execution environment")]
+#[command(name = "core-mel-node")]
+#[command(about = "Core MEL Node - Bitcoin-anchored execution environment")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -96,15 +96,11 @@ enum Commands {
         #[arg(long)]
         rpc_password: String,
     },
-    ConstructExitIntent {
+    Fund {
         #[arg(long)]
-        bitcoin_address: String,
+        address: String,
         #[arg(long)]
-        amount: u64,
-        #[arg(long, default_value = "1000")]
-        max_fee: u64,
-        #[arg(long)]
-        expire_by: u64,
+        amount: String,
     },
 }
 
@@ -145,7 +141,7 @@ struct Intent {
 }
 
 #[derive(Debug, Clone)]
-struct CoreLaneBlock {
+struct CoreMELBlock {
     number: u64,
     hash: B256,
     parent_hash: B256,
@@ -168,7 +164,7 @@ struct CoreLaneBlock {
     bitcoin_block_height: Option<u64>,
 }
 
-impl CoreLaneBlock {
+impl CoreMELBlock {
     fn new(
         number: u64,
         parent_hash: B256,
@@ -200,7 +196,7 @@ impl CoreLaneBlock {
             total_difficulty: U256::from(number),
             extra_data,
             nonce: 0,
-            miner: Address::ZERO, // No mining in Core Lane
+            miner: Address::ZERO, // No mining in Core MEL
             state_root: B256::default(),
             receipts_root: B256::default(),
             transactions_root: B256::default(),
@@ -247,6 +243,13 @@ impl CoreLaneBlock {
         B256::from_slice(hash_bytes.as_slice())
     }
 
+    fn add_transaction(&mut self, tx_hash: String) {
+        self.transactions.push(tx_hash);
+        self.transaction_count = self.transactions.len() as u64;
+        // Recalculate hash after adding transaction
+        self.hash = self.calculate_hash();
+    }
+
     fn to_json(&self, full: bool) -> serde_json::Value {
         let mut block_json = json!({
             "number": format!("0x{:x}", self.number),
@@ -280,44 +283,36 @@ impl CoreLaneBlock {
 }
 
 #[derive(Debug, Clone)]
-struct CoreLaneState {
+struct CoreMELState {
     account_manager: AccountManager,
     transactions: Vec<StoredTransaction>, // Store both envelope and raw data
     transaction_receipts: HashMap<String, TransactionReceipt>, // Store transaction receipts
     last_processed_block: u64,
-    blocks: HashMap<u64, CoreLaneBlock>,  // Block number -> Block
-    block_hashes: HashMap<B256, u64>,     // Block hash -> Block number
-    current_block: Option<CoreLaneBlock>, // Current block being built
-    genesis_block: CoreLaneBlock,         // Genesis block
+    blocks: HashMap<u64, CoreMELBlock>,  // Block number -> Block
+    block_hashes: HashMap<B256, u64>,    // Block hash -> Block number
+    current_block: Option<CoreMELBlock>, // Current block being built
+    genesis_block: CoreMELBlock,         // Genesis block
     intents: HashMap<B256, Intent>,
+}
+
+struct CoreMELNode {
     bitcoin_client: Arc<Client>,
+    state: Arc<Mutex<CoreMELState>>,
 }
 
-impl CoreLaneState {
-    pub fn bitcoin_client(&self) -> Arc<Client> {
-        self.bitcoin_client.clone()
-    }
-}
-
-struct CoreLaneNode {
-    bitcoin_client: Arc<Client>,
-    state: Arc<Mutex<CoreLaneState>>,
-}
-
-impl CoreLaneNode {
+impl CoreMELNode {
     fn new(bitcoin_client: Client) -> Self {
-        let genesis_block = CoreLaneBlock::genesis();
+        let genesis_block = CoreMELBlock::genesis();
         let genesis_hash = genesis_block.hash;
 
         let mut blocks = HashMap::new();
         let mut block_hashes = HashMap::new();
-        let bitcoin_client = Arc::new(bitcoin_client);
 
         // Store genesis block
         blocks.insert(0, genesis_block.clone());
         block_hashes.insert(genesis_hash, 0);
 
-        let state = Arc::new(Mutex::new(CoreLaneState {
+        let state = Arc::new(Mutex::new(CoreMELState {
             account_manager: AccountManager::new(),
             transactions: Vec::new(),
             transaction_receipts: HashMap::new(),
@@ -327,11 +322,10 @@ impl CoreLaneNode {
             current_block: None,
             genesis_block,
             intents: HashMap::new(),
-            bitcoin_client: bitcoin_client.clone(),
         }));
 
         Self {
-            bitcoin_client: bitcoin_client.clone(),
+            bitcoin_client: Arc::new(bitcoin_client),
             state,
         }
     }
@@ -347,7 +341,7 @@ impl CoreLaneNode {
     }
 
     // Helper function to get current state
-    async fn get_state(&self) -> CoreLaneState {
+    async fn get_state(&self) -> CoreMELState {
         self.state.lock().await.clone()
     }
 
@@ -364,12 +358,12 @@ impl CoreLaneNode {
     }
 
     // Block management methods
-    async fn get_block_by_number(&self, number: u64) -> Option<CoreLaneBlock> {
+    async fn get_block_by_number(&self, number: u64) -> Option<CoreMELBlock> {
         let state = self.state.lock().await;
         state.blocks.get(&number).cloned()
     }
 
-    async fn get_block_by_hash(&self, hash: B256) -> Option<CoreLaneBlock> {
+    async fn get_block_by_hash(&self, hash: B256) -> Option<CoreMELBlock> {
         let state = self.state.lock().await;
         if let Some(&number) = state.block_hashes.get(&hash) {
             state.blocks.get(&number).cloned()
@@ -378,7 +372,7 @@ impl CoreLaneNode {
         }
     }
 
-    async fn get_latest_block(&self) -> Option<CoreLaneBlock> {
+    async fn get_latest_block(&self) -> Option<CoreMELBlock> {
         let state = self.state.lock().await;
         let latest_number = state.blocks.keys().max().copied().unwrap_or(0);
         state.blocks.get(&latest_number).cloned()
@@ -389,7 +383,7 @@ impl CoreLaneNode {
         bitcoin_block_hash: String,
         bitcoin_block_height: u64,
         bitcoin_block_timestamp: u64,
-    ) -> Result<CoreLaneBlock> {
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
 
         // Get the latest block number
@@ -404,7 +398,7 @@ impl CoreLaneNode {
         };
 
         // Create new block with Bitcoin block timestamp
-        let mut new_block = CoreLaneBlock::new(
+        let mut new_block = CoreMELBlock::new(
             next_number,
             parent_hash,
             bitcoin_block_timestamp,
@@ -414,53 +408,69 @@ impl CoreLaneNode {
 
         // Calculate hash
         new_block.hash = new_block.calculate_hash();
+
+        // Store the block
+        state.blocks.insert(next_number, new_block.clone());
+        state.block_hashes.insert(new_block.hash, next_number);
+
         // Set as current block
+        state.current_block = Some(new_block);
+
         info!(
-            "🆕 Created Core Lane block {} (parent: {}) with timestamp {}",
+            "🆕 Created Core MEL block {} (parent: {}) with timestamp {}",
             next_number, latest_number, bitcoin_block_timestamp
         );
-        Ok(new_block)
+
+        Ok(())
     }
 
-    async fn finalize_current_block(
-        &self,
-        transactions: Vec<(StoredTransaction, TransactionReceipt, String)>,
-        mut new_block: CoreLaneBlock,
-    ) -> Result<()> {
+    async fn finalize_current_block(&self) -> Result<()> {
         let mut state = self.state.lock().await;
 
-        // Update state root, receipts root, etc.
-        new_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-        new_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-        new_block.transactions_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-        for (stored_tx, receipt, tx_hash) in transactions.clone() {
-            new_block.transactions.push(tx_hash.clone());
-            new_block.transaction_count = new_block.transactions.len() as u64;
+        if let Some(mut current_block) = state.current_block.take() {
+            // Update state root, receipts root, etc.
+            current_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+            current_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+            current_block.transactions_root = B256::from_slice(&[0u8; 32]); // Simplified for now
+
+            // Recalculate hash with updated roots
+            current_block.hash = current_block.calculate_hash();
+
+            // Update stored block
+            state
+                .blocks
+                .insert(current_block.number, current_block.clone());
+            state
+                .block_hashes
+                .insert(current_block.hash, current_block.number);
+
+            info!(
+                "✅ Finalized Core MEL block {} with {} transactions",
+                current_block.number, current_block.transaction_count
+            );
         }
-        // Recalculate hash with updated roots
-        new_block.hash = new_block.calculate_hash();
 
-        // Update stored block
-        state.blocks.insert(new_block.number, new_block.clone());
-        state.block_hashes.insert(new_block.hash, new_block.number);
+        Ok(())
+    }
 
-        for (stored_tx, receipt, tx_hash) in transactions {
-            state.transactions.push(stored_tx);
-            state.transaction_receipts.insert(tx_hash, receipt);
+    async fn add_transaction_to_current_block(&self, tx_hash: String) -> Result<()> {
+        let mut state = self.state.lock().await;
+
+        if let Some(ref mut current_block) = state.current_block {
+            let block_number = current_block.number;
+            current_block.add_transaction(tx_hash.clone());
+            debug!("📝 Added transaction {} to block {}", tx_hash, block_number);
+        } else {
+            return Err(anyhow!("No current block to add transaction to"));
         }
 
-        info!(
-            "✅ Finalized Core Lane block {} with {} transactions",
-            new_block.number, new_block.transaction_count
-        );
-        state.current_block = Some(new_block);
         Ok(())
     }
 
     async fn start_block_scanner(&self, start_block: Option<u64>) -> Result<()> {
-        info!("Starting Core Lane block scanner...");
+        info!("Starting Core MEL block scanner...");
         info!("Connected to Bitcoin node successfully");
-        info!("Core Lane state initialized");
+        info!("Core MEL state initialized");
 
         // Initialize starting block if provided
         if let Some(block) = start_block {
@@ -502,7 +512,7 @@ impl CoreLaneNode {
         }
 
         info!(
-            "Scanning blocks {} to {} for Core Lane transactions...",
+            "Scanning blocks {} to {} for Core MEL transactions...",
             start_block, tip
         );
 
@@ -512,7 +522,7 @@ impl CoreLaneNode {
                     // Update the last processed block
                     let mut state = self.state.lock().await;
                     state.last_processed_block = height;
-                    debug!("Processed block {} for Core Lane", height);
+                    debug!("Processed block {} for Core MEL", height);
                 }
                 Err(e) => {
                     error!("Error processing block {}: {}", height, e);
@@ -535,19 +545,19 @@ impl CoreLaneNode {
 
         let mut burn_transactions_found = 0;
         let mut da_transactions_found = 0;
-        let mut core_lane_transactions = Vec::new();
-        // Create a new Core Lane block for this Bitcoin block
+        let mut core_mel_transactions = Vec::new();
+
+        // Create a new Core MEL block for this Bitcoin block
         let bitcoin_block_hash = hash.to_string();
         let bitcoin_block_timestamp = block.header.time as u64;
         info!(
             "📅 Using Bitcoin block timestamp: {} (block {})",
             bitcoin_block_timestamp, height
         );
-        let new_block = self
-            .create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
+        self.create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
             .await?;
 
-        // Phase 1: Process ALL Bitcoin burns first to mint Core Lane tokens
+        // Phase 1: Process ALL Bitcoin burns first to mint Core MEL tokens
         debug!("🔥 Phase 1: Processing Bitcoin burns...");
         for (tx_index, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
@@ -560,33 +570,35 @@ impl CoreLaneNode {
                 );
                 self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
                     .await?;
+
+                // Add burn transaction to current block
+                self.add_transaction_to_current_block(format!("burn_{}", txid))
+                    .await?;
             }
         }
-        let mut tx_count = 0;
-        // Phase 2: Process ALL Core Lane DA transactions after all burns are complete
-        debug!("🔍 Phase 2: Processing Core Lane DA transactions...");
+
+        // Phase 2: Process ALL Core MEL DA transactions after all burns are complete
+        debug!("🔍 Phase 2: Processing Core MEL DA transactions...");
         for (tx_index, tx) in block.txdata.iter().enumerate() {
             let txid = tx.compute_txid();
 
-            if let Some(lane_tx) = self.extract_core_lane_transaction(tx) {
+            if let Some(mel_tx) = self.extract_core_mel_transaction(tx) {
                 da_transactions_found += 1;
                 info!(
-                    "   🔍 Found Core Lane DA transaction in tx {}: {}",
+                    "   🔍 Found Core MEL DA transaction in tx {}: {}",
                     tx_index, txid
                 );
-                let tx = self
-                    .process_core_lane_transaction(lane_tx, new_block.number, tx_count)
-                    .await;
-                if let Some((stored_tx, receipt, tx_hash)) = tx {
-                    core_lane_transactions.push((stored_tx, receipt, tx_hash));
-                    tx_count += 1;
-                }
+                self.process_core_mel_transaction(mel_tx).await?;
+
+                // Add DA transaction to current block
+                self.add_transaction_to_current_block(format!("da_{}", txid))
+                    .await?;
+                core_mel_transactions.push(txid.to_string());
             }
         }
 
-        // Finalize the Core Lane block
-        self.finalize_current_block(core_lane_transactions, new_block)
-            .await?;
+        // Finalize the Core MEL block
+        self.finalize_current_block().await?;
 
         if burn_transactions_found > 0 {
             info!(
@@ -596,16 +608,16 @@ impl CoreLaneNode {
         }
         if da_transactions_found > 0 {
             info!(
-                "   ✅ Found {} Core Lane DA transactions in block {}",
+                "   ✅ Found {} Core MEL DA transactions in block {}",
                 da_transactions_found, height
             );
         }
         if burn_transactions_found == 0 && da_transactions_found == 0 {
-            debug!("   ℹ️  No Core Lane activity found in block {}", height);
+            debug!("   ℹ️  No Core MEL activity found in block {}", height);
         }
 
         info!(
-            "🏁 Finalized Core Lane block for Bitcoin block {} with {} total transactions",
+            "🏁 Finalized Core MEL block for Bitcoin block {} with {} total transactions",
             height,
             burn_transactions_found + da_transactions_found
         );
@@ -613,8 +625,8 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    fn extract_core_lane_transaction(&self, tx: &Transaction) -> Option<Vec<u8>> {
-        // Look for Core Lane transactions in Bitcoin DA envelopes
+    fn extract_core_mel_transaction(&self, tx: &Transaction) -> Option<Vec<u8>> {
+        // Look for Core MEL transactions in Bitcoin DA envelopes
         // Check inputs for witness data (revealed Taproot envelopes)
         for (input_idx, input) in tx.input.iter().enumerate() {
             if input.witness.len() >= 2 {
@@ -630,7 +642,7 @@ impl CoreLaneNode {
                     if witness_elem.len() < 100 {
                         trace!("     Witness[{}] hex: {}", i, hex::encode(witness_elem));
                     } else if witness_elem.len() >= 50 {
-                        // This might be our Core Lane envelope script
+                        // This might be our Core MEL envelope script
                         trace!(
                             "     Witness[{}] (first 50 bytes): {}",
                             i,
@@ -651,9 +663,9 @@ impl CoreLaneNode {
 
                     // Use the bitcoin-data-layer extraction logic
                     if let Some(data) = self.extract_envelope_data_bitcoin_da_style(&script) {
-                        // If we got data back, it means we found a Core Lane transaction
+                        // If we got data back, it means we found a Core MEL transaction
                         if !data.is_empty() {
-                            info!("   🎯 Found Core Lane transaction in Taproot envelope!");
+                            info!("   🎯 Found Core MEL transaction in Taproot envelope!");
                             return Some(data);
                         }
                     }
@@ -672,7 +684,7 @@ impl CoreLaneNode {
                 // This is a P2TR output, but we can't directly extract the data
                 // because it's committed in the Taproot tree
                 // We'll need to look for the actual spend transaction later
-                debug!("   🔍 Found P2TR output (potential Core Lane envelope)");
+                debug!("   🔍 Found P2TR output (potential Core MEL envelope)");
             }
         }
 
@@ -761,10 +773,10 @@ impl CoreLaneNode {
             );
         }
 
-        // For Core Lane, check if the concatenated data starts with "CORE_LANE"
-        if data.starts_with(b"CORE_LANE") {
-            // Return just the transaction data (after CORE_LANE prefix)
-            let tx_data = &data[9..];
+        // For Core MEL, check if the concatenated data starts with "CORE_MEL"
+        if data.starts_with(b"CORE_MEL") {
+            // Return just the transaction data (after CORE_MEL prefix)
+            let tx_data = &data[8..];
 
             // Remove padding from the end (look for 0xf0 padding pattern)
             let mut clean_end = tx_data.len();
@@ -801,8 +813,8 @@ impl CoreLaneNode {
         Some(data)
     }
 
-    fn is_core_lane_envelope(&self, script: &Script) -> bool {
-        println!("       🔍 Checking if script is Core Lane envelope...");
+    fn is_core_mel_envelope(&self, script: &Script) -> bool {
+        println!("       🔍 Checking if script is Core MEL envelope...");
         let mut instr = script.instructions();
 
         let first = instr.next().and_then(|r| r.ok());
@@ -850,9 +862,9 @@ impl CoreLaneNode {
         }
 
         println!(
-            "       Data length: {}, starts with CORE_LANE: {}",
+            "       Data length: {}, starts with CORE_MEL: {}",
             data.len(),
-            data.starts_with(b"CORE_LANE")
+            data.starts_with(b"CORE_MEL")
         );
         if data.len() >= 8 {
             println!(
@@ -861,14 +873,14 @@ impl CoreLaneNode {
             );
         }
 
-        // Check if this looks like a Core Lane transaction
-        let is_core_lane = data.len() >= 32 && data.starts_with(b"CORE_LANE");
-        println!("       ✅ Is Core Lane envelope: {}", is_core_lane);
-        is_core_lane
+        // Check if this looks like a Core MEL transaction
+        let is_core_mel = data.len() >= 32 && data.starts_with(b"CORE_MEL");
+        println!("       ✅ Is Core MEL envelope: {}", is_core_mel);
+        is_core_mel
     }
 
-    fn is_core_lane_envelope_bytes(&self, bytes: &[u8]) -> bool {
-        println!("       🔍 Checking if bytes are Core Lane envelope...");
+    fn is_core_mel_envelope_bytes(&self, bytes: &[u8]) -> bool {
+        println!("       🔍 Checking if bytes are Core MEL envelope...");
         println!("       Bytes length: {}", bytes.len());
         if bytes.len() >= 10 {
             println!("       First 10 bytes: {}", hex::encode(&bytes[..10]));
@@ -898,30 +910,30 @@ impl CoreLaneNode {
             return false;
         }
 
-        // Look for CORE_LANE prefix in the data
-        let core_lane_bytes = b"CORE_LANE";
-        for i in 2..bytes.len().saturating_sub(9) {
-            if &bytes[i..i + core_lane_bytes.len()] == core_lane_bytes {
-                println!("       ✅ Found CORE_LANE prefix at offset {}", i);
+        // Look for CORE_MEL prefix in the data
+        let core_mel_bytes = b"CORE_MEL";
+        for i in 2..bytes.len().saturating_sub(8) {
+            if &bytes[i..i + 8] == core_mel_bytes {
+                println!("       ✅ Found CORE_MEL prefix at offset {}", i);
                 return true;
             }
         }
 
-        println!("       ❌ CORE_LANE prefix not found");
+        println!("       ❌ CORE_MEL prefix not found");
         false
     }
 
     fn extract_envelope_data_from_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         println!("       🔍 Extracting envelope data from bytes...");
 
-        // Look for CORE_LANE prefix
-        let core_lane_bytes = b"CORE_LANE";
-        for i in 2..bytes.len().saturating_sub(core_lane_bytes.len()) {
-            if &bytes[i..i + core_lane_bytes.len()] == core_lane_bytes {
-                println!("       Found CORE_LANE at offset {}", i);
+        // Look for CORE_MEL prefix
+        let core_mel_bytes = b"CORE_MEL";
+        for i in 2..bytes.len().saturating_sub(8) {
+            if &bytes[i..i + 8] == core_mel_bytes {
+                println!("       Found CORE_MEL at offset {}", i);
 
-                // The Ethereum transaction starts right after "CORE_LANE"
-                let eth_tx_start = i + core_lane_bytes.len();
+                // The Ethereum transaction starts right after "CORE_MEL"
+                let eth_tx_start = i + 8;
 
                 // Find the end of the transaction data by looking for OP_ENDIF OP_TRUE
                 for j in (eth_tx_start + 20)..bytes.len().saturating_sub(2) {
@@ -969,7 +981,7 @@ impl CoreLaneNode {
             }
         }
 
-        println!("       ❌ Could not extract Core Lane data");
+        println!("       ❌ Could not extract Core MEL data");
         None
     }
 
@@ -1207,7 +1219,7 @@ impl CoreLaneNode {
         }
     }
 
-    /// Process Bitcoin burn transaction and mint Core Lane tokens
+    /// Process Bitcoin burn transaction and mint Core MEL tokens
     async fn process_bitcoin_burn(
         &self,
         payload: Vec<u8>,
@@ -1227,11 +1239,11 @@ impl CoreLaneNode {
             info!("   Chain ID: {}", chain_id);
             info!("   ETH Address: {}", eth_address);
 
-            // Check if this is for Core Lane (chain ID 1 for example)
+            // Check if this is for Core MEL (chain ID 1 for example)
             if chain_id == 1 {
-                // Convert Bitcoin sats to Core Lane tokens with proper decimal scaling
+                // Convert Bitcoin sats to Core MEL tokens with proper decimal scaling
                 // Bitcoin: 1 BTC = 100,000,000 sats (8 decimals)
-                // Core Lane: 1 CMEL = 10^18 wei (18 decimals)
+                // Core MEL: 1 CMEL = 10^18 wei (18 decimals)
                 // Conversion: 1 sat = 10^10 wei (to maintain reasonable exchange rate)
                 let conversion_factor = U256::from(10_000_000_000u64); // 10^10
                 let mint_amount = U256::from(burn_value) * conversion_factor;
@@ -1248,7 +1260,7 @@ impl CoreLaneNode {
                 match state.account_manager.add_balance(eth_address, mint_amount) {
                     Ok(_) => {
                         info!(
-                            "   ✅ Minted {} Core Lane tokens to {}",
+                            "   ✅ Minted {} Core MEL tokens to {}",
                             mint_amount, eth_address
                         );
                         let new_balance = state.account_manager.get_balance(eth_address);
@@ -1275,13 +1287,8 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    async fn process_core_lane_transaction(
-        &self,
-        tx_data: Vec<u8>,
-        block_number: u64,
-        tx_number: u64,
-    ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
-        // The tx_data now contains the raw Ethereum transaction bytes (without CORE_LANE prefix)
+    async fn process_core_mel_transaction(&self, tx_data: Vec<u8>) -> Result<()> {
+        // The tx_data now contains the raw Ethereum transaction bytes (without CORE_MEL prefix)
         debug!(
             "   📝 Processing {} bytes of Ethereum transaction data",
             tx_data.len()
@@ -1291,7 +1298,7 @@ impl CoreLaneNode {
         // Try to parse as Ethereum transaction directly
         match TxEnvelope::decode(&mut tx_data.as_slice()) {
             Ok(tx) => {
-                info!("✅ Successfully parsed Core Lane transaction!");
+                info!("✅ Successfully parsed Core MEL transaction!");
 
                 // Print transaction details
                 match &tx {
@@ -1305,7 +1312,7 @@ impl CoreLaneNode {
                 // Validate the transaction
                 if let Err(e) = validate_transaction(&tx) {
                     error!("   ❌ Transaction validation failed: {}", e);
-                    return None;
+                    return Ok(());
                 }
                 debug!("   ✅ Transaction validation passed");
 
@@ -1317,7 +1324,7 @@ impl CoreLaneNode {
                     }
                     Err(e) => {
                         error!("   ❌ Failed to recover sender: {}", e);
-                        return None;
+                        return Ok(());
                     }
                 };
 
@@ -1329,7 +1336,7 @@ impl CoreLaneNode {
                 }
                 let execution_result = {
                     let mut state = self.state.lock().await;
-                    execute_transaction(&tx, sender, &mut state)
+                    execute_transaction(&tx, sender, &mut state, &self.bitcoin_client)
                 };
 
                 match execution_result {
@@ -1370,19 +1377,21 @@ impl CoreLaneNode {
                 }
 
                 // Store the transaction with both envelope and raw data
-                let state = self.state.lock().await;
+                let mut state = self.state.lock().await;
                 let stored_tx = StoredTransaction {
                     envelope: tx.clone(),
                     raw_data: tx_data.clone(),
-                    block_number: block_number,
+                    block_number: state.last_processed_block,
                 };
+                state.transactions.push(stored_tx);
+
                 // Create and store transaction receipt
                 let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx_data)));
 
                 let receipt = TransactionReceipt {
                     transaction_hash: tx_hash.clone(),
-                    block_number: block_number,
-                    transaction_index: tx_number,
+                    block_number: state.last_processed_block,
+                    transaction_index: state.transactions.len() as u64 - 1,
                     from: format!("0x{}", hex::encode(sender.as_slice())),
                     to: None, // Will be set based on transaction type
                     cumulative_gas_used: "0x0".to_string(),
@@ -1392,19 +1401,20 @@ impl CoreLaneNode {
                     status: "0x1".to_string(), // Success
                     effective_gas_price: "0x3b9aca00".to_string(), // 1 gwei
                 };
+                state.transaction_receipts.insert(tx_hash, receipt);
 
                 // Print account balances after execution
                 debug!(
                     "   💰 Account balance after execution: {}",
                     state.account_manager.get_balance(sender)
                 );
-                Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
             }
             Err(e) => {
                 error!("❌ Failed to parse Ethereum transaction: {}", e);
-                None
             }
         }
+
+        Ok(())
     }
 
     /// Create a Bitcoin burn transaction using RPC wallet
@@ -1646,7 +1656,7 @@ impl CoreLaneNode {
                 info!("🔥 Burned: {} sats", burn_amount);
                 info!("🎯 Chain ID: {}", chain_id);
                 info!("📫 ETH Address: 0x{}", eth_address);
-                info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_address);
+                info!("🪙 Core MEL will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_address);
                 info!("🔍 Monitor with: ./target/debug/core-mel-node start --start-block {} --rpc-password {}", "latest", "bitcoin123");
             }
             Err(e) => {
@@ -1667,7 +1677,7 @@ impl CoreLaneNode {
         wallet: &str,
         network: &str,
     ) -> Result<()> {
-        info!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
+        info!("🚀 Creating Core MEL transaction in Bitcoin DA (commit + reveal in one tx)...");
         info!(
             "📝 Ethereum transaction: {}...",
             &raw_tx_hex[..64.min(raw_tx_hex.len())]
@@ -1686,10 +1696,8 @@ impl CoreLaneNode {
         );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // Create Core Lane payload: CORE_LANE prefix + Ethereum transaction
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"CORE_LANE");
-        payload.extend_from_slice(&tx_bytes);
+        // The raw_tx_hex already contains the CORE_LANE prefix, so use it directly
+        let payload = tx_bytes;
 
         println!("📦 Core Lane payload size: {} bytes", payload.len());
         println!("📦 Core Lane payload hex: {}", hex::encode(&payload));
@@ -1763,6 +1771,135 @@ impl CoreLaneNode {
             .await?;
         Ok(())
     }
+
+    /// Confirm burns by scanning blocks from a specific starting height
+    /// This allows users to verify burns and optionally process DA transactions
+    async fn confirm_burns_from_height(&self, start_height: u64, include_da: bool) -> Result<()> {
+        info!(
+            "🔥 Starting burn confirmation scan from height {}",
+            start_height
+        );
+
+        let tip = self.bitcoin_client.get_block_count()?;
+
+        if start_height > tip {
+            return Err(anyhow!(
+                "Start height {} is greater than current tip {}",
+                start_height,
+                tip
+            ));
+        }
+
+        info!(
+            "📊 Scanning blocks {} to {} for burn confirmations",
+            start_height, tip
+        );
+
+        let mut total_burns_found = 0;
+        let mut total_da_found = 0;
+        let mut total_burn_value = 0u64;
+
+        for height in start_height..=tip {
+            match self
+                .process_block_for_confirmation(height, include_da)
+                .await
+            {
+                Ok((burns, da_count, burn_value)) => {
+                    total_burns_found += burns;
+                    total_da_found += da_count;
+                    total_burn_value += burn_value;
+
+                    if burns > 0 {
+                        info!(
+                            "✅ Block {}: Found {} burns ({} sats total)",
+                            height, burns, burn_value
+                        );
+                    }
+                    if include_da && da_count > 0 {
+                        info!("📦 Block {}: Found {} DA transactions", height, da_count);
+                    }
+                }
+                Err(e) => {
+                    error!("❌ Error processing block {}: {}", height, e);
+                }
+            }
+        }
+
+        info!("🏁 Burn confirmation scan completed!");
+        info!("📊 Summary:");
+        info!(
+            "   🔥 Total burns found: {} ({} sats)",
+            total_burns_found, total_burn_value
+        );
+        if include_da {
+            info!("   📦 Total DA transactions found: {}", total_da_found);
+        }
+        info!("   📏 Blocks scanned: {}", tip - start_height + 1);
+
+        Ok(())
+    }
+
+    /// Process a single block for burn confirmation (similar to process_block but focused on confirmation)
+    async fn process_block_for_confirmation(
+        &self,
+        height: u64,
+        include_da: bool,
+    ) -> Result<(usize, usize, u64)> {
+        let hash = self.bitcoin_client.get_block_hash(height)?;
+        let block = self.bitcoin_client.get_block(&hash)?;
+
+        let mut burn_count = 0;
+        let mut da_count = 0;
+        let mut total_burn_value = 0u64;
+
+        // Process burns
+        for (tx_index, tx) in block.txdata.iter().enumerate() {
+            let txid = tx.compute_txid();
+
+            if let Some((payload, burn_value)) = self.extract_burn_payload_from_tx(&tx) {
+                burn_count += 1;
+                total_burn_value += burn_value;
+
+                info!(
+                    "   🔥 Confirmed burn in tx {}: {} ({} sats) - Block {}",
+                    tx_index, txid, burn_value, height
+                );
+
+                // Process the burn (mint tokens)
+                self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
+                    .await?;
+            }
+        }
+
+        // Process DA transactions if requested
+        if include_da {
+            for (tx_index, tx) in block.txdata.iter().enumerate() {
+                let txid = tx.compute_txid();
+
+                if let Some(mel_tx) = self.extract_core_mel_transaction(tx) {
+                    da_count += 1;
+
+                    info!(
+                        "   📦 Confirmed DA transaction in tx {}: {} - Block {}",
+                        tx_index, txid, height
+                    );
+
+                    // Process the DA transaction
+                    self.process_core_mel_transaction(mel_tx).await?;
+                }
+            }
+        }
+
+        Ok((burn_count, da_count, total_burn_value))
+    }
+
+    /// Fund an account with laneBTC (for testing purposes)
+    async fn fund_account(&self, address: Address, amount: U256) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.account_manager.set_balance(address, amount)?;
+        info!("💰 Funded account {} with {} wei", address, amount);
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -1771,12 +1908,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "core_lane_node=info,tower_http=debug".into()),
+                .unwrap_or_else(|_| "core_mel_node=info,tower_http=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Starting Core Lane Node");
+    info!("Starting Core MEL Node");
 
     let cli = Cli::parse();
 
@@ -1794,7 +1931,7 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(client);
+            let node = CoreMELNode::new(client);
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
@@ -1835,7 +1972,7 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(client);
+            let node = CoreMELNode::new(client);
             node.create_burn_transaction_from_wallet(
                 *burn_amount,
                 *chain_id,
@@ -1860,51 +1997,22 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(client);
+            let node = CoreMELNode::new(client);
             node.send_transaction_to_da(raw_tx_hex, *fee_sats, wallet, network)
                 .await?;
         }
 
-        Commands::ConstructExitIntent {
-            bitcoin_address,
-            amount,
-            max_fee,
-            expire_by,
-        } => {
-            info!("🔧 Constructing exit intent data for bitcoin withdrawal...");
-            info!("   Bitcoin Address: {}", bitcoin_address);
-            info!("   Amount: {} sats", amount);
-            info!("   Max Fee: {} sats", max_fee);
-            info!("   Expire By: {}", expire_by);
+        Commands::Fund { address, amount } => {
+            let node = CoreMELNode::new(bitcoincore_rpc::Client::new(
+                "http://127.0.0.1:18443",
+                Auth::UserPass("bitcoin".to_string(), "password".to_string()),
+            )?);
 
-            // Create the intent data
-            let intent_data = create_anchor_bitcoin_fill_intent(
-                bitcoin_address,
-                U256::from(*amount),
-                U256::from(*max_fee),
-                *expire_by,
-            )?;
+            let addr = Address::from_str(address)?;
+            let amount_wei = U256::from_str_radix(amount.trim_start_matches("0x"), 16)?;
 
-            // Convert to CBOR (this is the serialized intent data)
-            let intent_cbor = intent_data.to_cbor()?;
-            let intent_data_hex = format!("0x{}", hex::encode(&intent_cbor));
-
-            info!("✅ Exit intent data constructed successfully!");
-            info!(
-                "📝 Intent Data (CBOR, {} bytes): {}",
-                intent_cbor.len(),
-                intent_data_hex
-            );
-            info!("");
-            info!("💡 To use this exit intent:");
-            info!("   1. Send a transaction to the IntentSystem contract");
-            info!(
-                "   2. Call intent({}, nonce) with the intent data above",
-                intent_data_hex
-            );
-            info!(
-                "   3. The intent will be submitted for bitcoin withdrawal (exit from Core Lane)"
-            );
+            node.fund_account(addr, amount_wei).await?;
+            info!("✅ Funded account {} with {} wei", address, amount_wei);
         }
     }
 
