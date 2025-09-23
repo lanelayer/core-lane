@@ -1336,7 +1336,7 @@ impl CoreMELNode {
                 }
                 let execution_result = {
                     let mut state = self.state.lock().await;
-                    execute_transaction(&tx, sender, &mut state)
+                    execute_transaction(&tx, sender, &mut state, &self.bitcoin_client)
                 };
 
                 match execution_result {

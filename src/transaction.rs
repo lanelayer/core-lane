@@ -1,9 +1,10 @@
-use crate::{CoreLaneState, Intent, IntentStatus};
+use crate::{CoreMELState, Intent, IntentStatus};
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{SignableTransaction, Signed, TxEnvelope};
 use alloy_primitives::B256;
 use alloy_primitives::{keccak256, Address, Bytes, U256};
 use alloy_rlp::{Decodable, Encodable};
+use std::sync::Arc;
 use alloy_sol_types::{sol, SolCall};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
@@ -549,7 +550,8 @@ pub fn execute_transaction(
     sender: Address,
     //account_manager: &mut crate::account::AccountManager,
     //intents: &mut HashMap<B256, (Bytes, u64)>,
-    state: &mut CoreLaneState,
+    state: &mut CoreMELState,
+    btc_client: &Arc<bitcoincore_rpc::Client>,
 ) -> Result<ExecutionResult> {
     // Basic execution framework
     let gas_limit = get_gas_limit(tx);
@@ -575,7 +577,7 @@ pub fn execute_transaction(
         });
     }
 
-    execute_transfer(tx, sender, state)
+    execute_transfer(tx, sender, state, btc_client)
 }
 
 /// Get gas limit from transaction
@@ -642,7 +644,8 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 fn execute_transfer(
     tx: &TxEnvelope,
     sender: Address,
-    state: &mut CoreLaneState,
+    state: &mut CoreMELState,
+    btc_client: &Arc<bitcoincore_rpc::Client>,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
@@ -802,7 +805,7 @@ fn execute_transfer(
                     });
                 }
 
-                match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
+                match verify_intent_fill_on_bitcoin(state, btc_client, intent_id, block_number) {
                     Ok(true) => {
                         if let Some(intent) = state.intents.get_mut(&intent_id) {
                             state
@@ -815,7 +818,7 @@ fn execute_transfer(
                                 gas_used,
                                 gas_refund: U256::ZERO,
                                 output: Bytes::new(),
-                                logs: vec!["Intent solved (Bitcoin L1 proof verified)".to_string()],
+                                logs: vec!["solveIntent: intent solved (Bitcoin L1 proof verified)".to_string()],
                                 error: None,
                             });
                         }
@@ -834,8 +837,8 @@ fn execute_transfer(
                             gas_used,
                             gas_refund: U256::ZERO,
                             output: Bytes::new(),
-                            logs: vec!["solveIntent: L1 fill not found in block".to_string()],
-                            error: Some("L1 fill not found".to_string()),
+                            logs: vec!["solveIntent: Bitcoin verification failed".to_string()],
+                            error: Some("Bitcoin verification failed".to_string()),
                         });
                     }
                     Err(e) => {
@@ -900,11 +903,12 @@ fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
 }
 
 fn verify_intent_fill_on_bitcoin(
-    state: &crate::CoreLaneState,
+    state: &crate::CoreMELState,
+    btc_client: &Arc<bitcoincore_rpc::Client>,
     intent_id: B256,
     block_number: u64,
 ) -> Result<bool> {
-    let client = state.bitcoin_client();
+    let client = btc_client;
 
     let network = bitcoin::Network::Regtest;
     let intent = state
