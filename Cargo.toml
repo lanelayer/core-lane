@@ -1,5 +1,5 @@
 [package]
-name = "core-mel-node"
+name = "core-lane-node"
 version = "0.1.0"
 edition = "2021"
 
@@ -27,3 +27,5 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ciborium = "0.2"
+bs58 = "0.5"

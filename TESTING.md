@@ -134,7 +134,7 @@ Test Core MEL transaction execution by creating DA envelopes:
 
 ```bash
 # 1. Create Core MEL transaction data
-echo "CORE_MEL_TEST_DATA" > test-transaction.bin
+echo "CORE_LANE_TEST_DATA" > test-transaction.bin
 
 # 2. Create DA envelope using bitcoin-data-layer
 cd ../bitcoin-data-layer

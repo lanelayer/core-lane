@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Core MEL Test Environment Setup
-# This script sets up a local Bitcoin regtest network for Core MEL development
+# Core Lane Test Environment Setup
+# This script sets up a local Bitcoin regtest network for Core Lane development
 
 set -e
 
@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 # Configuration
 BITCOIN_CONTAINER="bitcoin-regtest"
 BITCOIN_DATA_DIR="$HOME/bitcoin-regtest"
-CORE_MEL_DIR="$(pwd)"
+CORE_LANE_DIR="$(pwd)"
 RPC_USER="bitcoin"
 RPC_PASSWORD="bitcoin123"
 RPC_URL="http://127.0.0.1:18443"
@@ -144,31 +144,31 @@ setup_wallet() {
     print_status "Test address saved to .test-address"
 }
 
-# Function to build Core MEL
-build_core_mel() {
-    print_status "Building Core MEL node..."
-    cd "$CORE_MEL_DIR"
+# Function to build Core Lane
+build_core_lane() {
+    print_status "Building Core Lane node..."
+    cd "$CORE_LANE_DIR"
     cargo build
-    print_success "Core MEL node built successfully!"
+    print_success "Core Lane node built successfully!"
 }
 
-# Function to test Core MEL connection
-test_core_mel_connection() {
-    print_status "Testing Core MEL connection to Bitcoin..."
+# Function to test Core Lane connection
+test_core_lane_connection() {
+    print_status "Testing Core Lane connection to Bitcoin..."
     
-    if [ ! -f "target/debug/core-mel-node" ]; then
-        print_error "Core MEL node not built. Run 'build' first."
+    if [ ! -f "target/debug/core-lane-node" ]; then
+        print_error "Core Lane node not built. Run 'build' first."
         return 1
     fi
     
     # Test connection by scanning a few blocks
-    ./target/debug/core-mel-node scan-blocks \
+    ./target/debug/core-lane-node scan-blocks \
         --rpc-url "$RPC_URL" \
         --rpc-user "$RPC_USER" \
         --rpc-password "$RPC_PASSWORD" \
         --blocks 5
     
-    print_success "Core MEL connection test completed!"
+    print_success "Core Lane connection test completed!"
 }
 
 # Function to create test burn transaction
@@ -182,9 +182,9 @@ create_test_burn() {
     
     ADDRESS=$(cat .test-address)
     
-    # Check if Core MEL is built
-    if [ ! -f "target/debug/core-mel-node" ]; then
-        print_error "Core MEL node not built. Run 'build' first."
+    # Check if Core Lane is built
+    if [ ! -f "target/debug/core-lane-node" ]; then
+        print_error "Core Lane node not built. Run 'build' first."
         return 1
     fi
     
@@ -192,7 +192,7 @@ create_test_burn() {
     print_status "To create a burn transaction, you just need an Ethereum address!"
     echo
     print_status "Example burn command (burns 500,000 sats):"
-    echo "./target/debug/core-mel-node burn \\"
+    echo "./target/debug/core-lane-node burn \\"
     echo "  --burn-amount 500000 \\"
     echo "  --chain-id 1 \\"
     echo "  --eth-address \"0x1234567890123456789012345678901234567890\" \\"
@@ -201,13 +201,13 @@ create_test_burn() {
     print_status "This will:"
     echo "1. Use your Bitcoin wallet (default: 'mine') to fund the transaction"
     echo "2. Create an OP_RETURN transaction burning 500,000 sats"
-    echo "3. Automatically mint 500,000 Core MEL tokens to the ETH address"
+    echo "3. Automatically mint 500,000 Core Lane tokens to the ETH address"
     echo "4. Handle all transaction creation, signing, and broadcasting"
 }
 
 # Function to show status
 show_status() {
-    print_status "=== Core MEL Test Environment Status ==="
+    print_status "=== Core Lane Test Environment Status ==="
     
     echo
     print_status "Bitcoin Container:"
@@ -227,8 +227,8 @@ show_status() {
     fi
     
     echo
-    print_status "Core MEL:"
-    if [ -f "target/debug/core-mel-node" ]; then
+    print_status "Core Lane:"
+    if [ -f "target/debug/core-lane-node" ]; then
         print_success "✓ Built"
     else
         print_error "✗ Not built"
@@ -246,7 +246,7 @@ show_status() {
 
 # Function to show help
 show_help() {
-    echo "Core MEL Test Environment"
+    echo "Core Lane Test Environment"
     echo
     echo "Usage: $0 <command>"
     echo
@@ -255,8 +255,8 @@ show_help() {
     echo "  stop            Stop Bitcoin regtest network"
     echo "  reset           Reset Bitcoin regtest network (clean slate)"
     echo "  setup-wallet    Setup wallet and mine initial blocks"
-    echo "  build           Build Core MEL node"
-    echo "  test            Test Core MEL connection to Bitcoin"
+    echo "  build           Build Core Lane node"
+    echo "  test            Test Core Lane connection to Bitcoin"
     echo "  create-burn     Create test burn transaction"
     echo "  status          Show current status"
     echo "  help            Show this help"
@@ -288,10 +288,10 @@ case "${1:-help}" in
         setup_wallet
         ;;
     build)
-        build_core_mel
+        build_core_lane
         ;;
     test)
-        test_core_mel_connection
+        test_core_lane_connection
         ;;
     create-burn)
         create_test_burn

@@ -1,4 +1,4 @@
-use crate::CoreMELState;
+use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256};
 use anyhow;
@@ -17,6 +17,7 @@ use tokio::sync::Mutex;
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub method: String,
+    #[serde(default)]
     pub params: Vec<Value>,
     pub id: Value,
 }
@@ -60,12 +61,12 @@ pub struct TransactionRequest {
 }
 
 pub struct RpcServer {
-    state: Arc<Mutex<CoreMELState>>,
+    state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
 }
 
 impl RpcServer {
-    pub fn new(state: Arc<Mutex<CoreMELState>>) -> Self {
+    pub fn new(state: Arc<Mutex<CoreLaneState>>) -> Self {
         Self {
             state,
             bitcoin_client: None,
@@ -73,7 +74,7 @@ impl RpcServer {
     }
 
     pub fn with_bitcoin_client(
-        state: Arc<Mutex<CoreMELState>>,
+        state: Arc<Mutex<CoreLaneState>>,
         bitcoin_client: Arc<bitcoincore_rpc::Client>,
     ) -> Self {
         Self {
@@ -367,7 +368,7 @@ impl RpcServer {
         // Send transaction to Bitcoin DA
         match Self::send_to_bitcoin_da(raw_tx_hex, bitcoin_client).await {
             Ok(bitcoin_txid) => {
-                // Calculate the Core MEL transaction hash for the response
+                // Calculate the Core Lane transaction hash for the response
                 use alloy_primitives::keccak256;
                 let tx_bytes = hex::decode(raw_tx_hex).unwrap(); // Already validated above
                 let tx_hash = keccak256(&tx_bytes);
@@ -375,7 +376,7 @@ impl RpcServer {
 
                 println!("✅ Transaction sent to Bitcoin DA");
                 println!("   Bitcoin TXID: {}", bitcoin_txid);
-                println!("   Core MEL TX Hash: {}", tx_hash_hex);
+                println!("   Core Lane TX Hash: {}", tx_hash_hex);
 
                 Ok(JsonResponse::from(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
@@ -613,15 +614,27 @@ impl RpcServer {
                         );
                     }
                 }
-
-                // Add block information
-                result.insert(
-                    "blockHash".to_string(),
-                    json!(format!(
-                        "0x{:x}",
-                        state.blocks.get(&stored_tx.block_number).unwrap().hash
-                    )),
-                );
+                if let Some(block) = state.blocks.get(&stored_tx.block_number) {
+                    // Add block information
+                    result.insert(
+                        "blockHash".to_string(),
+                        json!(format!("0x{:x}", block.hash)),
+                    );
+                } else {
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!(
+                                "Internal error: block {} not found (blocks={})",
+                                stored_tx.block_number,
+                                state.blocks.len()
+                            ),
+                        }),
+                        id: request.id,
+                    }));
+                }
                 result.insert(
                     "blockNumber".to_string(),
                     json!(format!("0x{:x}", stored_tx.block_number)),
@@ -1055,7 +1068,7 @@ impl RpcServer {
         } else if block_id == "earliest" {
             0 // Genesis block
         } else if block_id == "pending" {
-            // Return null for pending (no pending blocks in Core MEL)
+            // Return null for pending (no pending blocks in Core Lane)
             return Ok(JsonResponse::from(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: Some(json!(null)),
@@ -1327,7 +1340,7 @@ impl RpcServer {
         request: JsonRpcRequest,
         state: &Arc<Self>,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        // Return the latest Core MEL block number
+        // Return the latest Core Lane block number
         let state = state.state.lock().await;
         let block_number = state.blocks.keys().max().copied().unwrap_or(0);
         let block_number_hex = format!("0x{:x}", block_number);
@@ -1367,7 +1380,7 @@ impl RpcServer {
         } else if block_id == "earliest" {
             0 // Genesis block
         } else if block_id == "pending" {
-            // Return null for pending (no pending blocks in Core MEL)
+            // Return null for pending (no pending blocks in Core Lane)
             return Ok(JsonResponse::from(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: Some(json!(null)),
@@ -1492,7 +1505,7 @@ impl RpcServer {
         } else if block_id == "earliest" {
             0 // Genesis block
         } else if block_id == "pending" {
-            // Return 0 for pending (no pending blocks in Core MEL)
+            // Return 0 for pending (no pending blocks in Core Lane)
             return Ok(JsonResponse::from(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: Some(json!("0x0")),
@@ -1529,7 +1542,7 @@ impl RpcServer {
     async fn handle_chain_id(
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        // Core MEL chain ID = 1 (for testing)
+        // Core Lane chain ID = 1 (for testing)
         let chain_id = "0x1";
 
         Ok(JsonResponse::from(JsonRpcResponse {

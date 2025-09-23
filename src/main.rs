@@ -1696,11 +1696,11 @@ impl CoreMELNode {
         );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // The raw_tx_hex already contains the CORE_MEL prefix, so use it directly
+        // The raw_tx_hex already contains the CORE_LANE prefix, so use it directly
         let payload = tx_bytes;
 
-        println!("📦 Core MEL payload size: {} bytes", payload.len());
-        println!("📦 Core MEL payload hex: {}", hex::encode(&payload));
+        println!("📦 Core Lane payload size: {} bytes", payload.len());
+        println!("📦 Core Lane payload hex: {}", hex::encode(&payload));
 
         // Check wallet balance - use the same approach as in burn transaction
         let balance_result: Result<serde_json::Value, _> =

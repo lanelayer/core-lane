@@ -17,7 +17,7 @@ RPC_PASSWORD="bitcoin123"
 RPC_URL="http://127.0.0.1:18443"
 JSON_RPC_PORT=8546
 JSON_RPC_URL="http://127.0.0.1:$JSON_RPC_PORT"
-CORE_MEL_NODE_PID=0
+CORE_LANE_NODE_PID=0
 MINING_PID=0
 
 ANVIL_ADDRESSES=(
@@ -122,7 +122,7 @@ burn_btc_to_address() {
 
     print_status "Burning $amount sats to $address..."
 
-    local burn_output=$(./target/debug/core-mel-node burn \
+    local burn_output=$(./target/debug/core-lane-node burn \
         --burn-amount $amount \
         --chain-id $chain_id \
         --eth-address $address \
@@ -138,24 +138,24 @@ burn_btc_to_address() {
     fi
 }
 
-start_core_mel_node() {
-    print_status "Starting Core MEL node..."
+start_core_lane_node() {
+    print_status "Starting Core Lane node..."
 
-    if [ ! -f "target/debug/core-mel-node" ]; then
-        print_error "Core MEL node is not built. Run 'cargo build' first."
+    if [ ! -f "target/debug/core-lane-node" ]; then
+        print_error "Core Lane node is not built. Run 'cargo build' first."
         exit 1
     fi
 
-    RUST_LOG=info ./target/debug/core-mel-node start \
+    RUST_LOG=info,debug ./target/debug/core-lane-node start \
         --start-block 0 \
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
-        --http-port $JSON_RPC_PORT > /tmp/core_mel_dev_output 2>&1 &
+        --http-port $JSON_RPC_PORT &
 
-    CORE_MEL_NODE_PID=$!
+    CORE_LANE_NODE_PID=$!
 
-    print_status "Waiting for Core MEL node to start..."
+    print_status "Waiting for Core Lane node to start..."
     sleep 3
 
     while ! curl -s "$JSON_RPC_URL" > /dev/null 2>&1; do
@@ -163,7 +163,7 @@ start_core_mel_node() {
         sleep 2
     done
 
-    print_success "Core MEL node started with PID: $CORE_MEL_NODE_PID"
+    print_success "Core Lane node started with PID: $CORE_LANE_NODE_PID"
     print_status "JSON-RPC available at: $JSON_RPC_URL"
 }
 
@@ -190,7 +190,7 @@ start_mining_loop() {
 }
 
 check_balances() {
-    print_status "Checking Core MEL balances..."
+    print_status "Checking Core Lane balances..."
 
     for i in "${!ANVIL_ADDRESSES[@]}"; do
         local address="${ANVIL_ADDRESSES[$i]}"
@@ -217,9 +217,9 @@ cleanup() {
         kill $MINING_PID 2>/dev/null || true
     fi
 
-    if [ $CORE_MEL_NODE_PID -ne 0 ]; then
-        print_status "Stopping Core MEL node (PID: $CORE_MEL_NODE_PID)..."
-        kill $CORE_MEL_NODE_PID 2>/dev/null || true
+    if [ $CORE_LANE_NODE_PID -ne 0 ]; then
+        print_status "Stopping Core Lane node (PID: $CORE_LANE_NODE_PID)..."
+        kill $CORE_LANE_NODE_PID 2>/dev/null || true
     fi
 
     if is_bitcoin_running; then
@@ -237,7 +237,7 @@ show_usage() {
     echo "  start     Start the complete development environment"
     echo "  stop      Stop the development environment"
     echo "  status    Show status of running services"
-    echo "  balances  Check Core MEL balances for test addresses"
+    echo "  balances  Check Core Lane balances for test addresses"
     echo "  help      Show this help message"
     echo ""
     echo "Examples:"
@@ -247,7 +247,7 @@ show_usage() {
 }
 
 show_status() {
-    echo "=== Core MEL Development Environment Status ==="
+    echo "=== Core Lane Development Environment Status ==="
 
     if is_bitcoin_running; then
         echo "✅ Bitcoin: Running"
@@ -257,11 +257,11 @@ show_status() {
         echo "❌ Bitcoin: Not running"
     fi
 
-    if [ $CORE_MEL_NODE_PID -ne 0 ] && kill -0 $CORE_MEL_NODE_PID 2>/dev/null; then
-        echo "✅ Core MEL Node: Running (PID: $CORE_MEL_NODE_PID)"
+    if [ $CORE_LANE_NODE_PID -ne 0 ] && kill -0 $CORE_LANE_NODE_PID 2>/dev/null; then
+        echo "✅ Core Lane Node: Running (PID: $CORE_LANE_NODE_PID)"
         echo "   JSON-RPC: $JSON_RPC_URL"
     else
-        echo "❌ Core MEL Node: Not running"
+        echo "❌ Core Lane Node: Not running"
     fi
 
     if [ $MINING_PID -ne 0 ] && kill -0 $MINING_PID 2>/dev/null; then
@@ -278,7 +278,7 @@ show_status() {
 }
 
 start_dev_environment() {
-    print_status "Starting Core MEL Development Environment..."
+    print_status "Starting Core Lane Development Environment..."
 
     check_docker
 
@@ -289,7 +289,7 @@ start_dev_environment() {
     fi
 
     setup_bitcoin_wallet
-    start_core_mel_node
+    start_core_lane_node
 
     print_status "Burning BTC to test addresses..."
     for address in "${ANVIL_ADDRESSES[@]}"; do
@@ -305,7 +305,7 @@ start_dev_environment() {
     echo ""
     echo "🌐 JSON-RPC Endpoint: $JSON_RPC_URL"
     echo "🔗 Connect with MetaMask, Cast, or other wallets using:"
-    echo "   Network Name: Core MEL Dev"
+    echo "   Network Name: Core Lane Dev"
     echo "   RPC URL: $JSON_RPC_URL"
     echo "   Chain ID: 1"
     echo "   Currency Symbol: MEL"
