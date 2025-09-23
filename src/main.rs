@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use hex;
 use serde_json::{self, json};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -133,7 +134,7 @@ struct StoredTransaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntentStatus {
     Submitted,
-    Locked,
+    Locked(Address),
     Solved,
 }
 
@@ -291,6 +292,7 @@ struct CoreLaneState {
     genesis_block: CoreLaneBlock,         // Genesis block
     intents: HashMap<B256, Intent>,
     bitcoin_client: Arc<Client>,
+    stored_blobs: HashSet<B256>,
 }
 
 impl CoreLaneState {
@@ -328,6 +330,7 @@ impl CoreLaneNode {
             genesis_block,
             intents: HashMap::new(),
             bitcoin_client: bitcoin_client.clone(),
+            stored_blobs: HashSet::new(),
         }));
 
         Self {

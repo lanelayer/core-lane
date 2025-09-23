@@ -732,7 +732,7 @@ fn execute_transfer(
                 if let Some(intent) = state.intents.get_mut(&intent_id) {
                     match intent.status {
                         IntentStatus::Submitted => {
-                            intent.status = IntentStatus::Locked;
+                            intent.status = IntentStatus::Locked(sender);
                             let _ = state.account_manager.increment_nonce(sender);
                             return Ok(ExecutionResult {
                                 success: true,
@@ -743,7 +743,7 @@ fn execute_transfer(
                                 error: None,
                             });
                         }
-                        IntentStatus::Locked => {
+                        IntentStatus::Locked(_) => {
                             return Ok(ExecutionResult {
                                 success: false,
                                 gas_used,
@@ -781,7 +781,7 @@ fn execute_transfer(
                 );
 
                 if let Some(intent) = state.intents.get(&intent_id) {
-                    if !matches!(intent.status, IntentStatus::Locked) {
+                    if !matches!(intent.status, IntentStatus::Locked(_)) {
                         return Ok(ExecutionResult {
                             success: false,
                             gas_used,
