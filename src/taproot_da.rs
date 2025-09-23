@@ -44,10 +44,8 @@ impl TaprootDA {
         );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // Create Core MEL payload: CORE_MEL prefix + Ethereum transaction
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"CORE_MEL");
-        payload.extend_from_slice(&tx_bytes);
+        // The raw_tx_hex already contains the CORE_MEL prefix, so use it directly
+        let payload = tx_bytes;
 
         println!("📦 Core MEL payload size: {} bytes", payload.len());
         println!("📦 Core MEL payload hex: {}", hex::encode(&payload));

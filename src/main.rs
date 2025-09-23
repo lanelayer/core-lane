@@ -96,6 +96,12 @@ enum Commands {
         #[arg(long)]
         rpc_password: String,
     },
+    Fund {
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        amount: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1690,10 +1696,8 @@ impl CoreMELNode {
         );
         println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // Create Core MEL payload: CORE_MEL prefix + Ethereum transaction
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"CORE_MEL");
-        payload.extend_from_slice(&tx_bytes);
+        // The raw_tx_hex already contains the CORE_MEL prefix, so use it directly
+        let payload = tx_bytes;
 
         println!("📦 Core MEL payload size: {} bytes", payload.len());
         println!("📦 Core MEL payload hex: {}", hex::encode(&payload));
@@ -1888,6 +1892,14 @@ impl CoreMELNode {
 
         Ok((burn_count, da_count, total_burn_value))
     }
+
+    /// Fund an account with laneBTC (for testing purposes)
+    async fn fund_account(&self, address: Address, amount: U256) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.account_manager.set_balance(address, amount)?;
+        info!("💰 Funded account {} with {} wei", address, amount);
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -1988,6 +2000,19 @@ async fn main() -> Result<()> {
             let node = CoreMELNode::new(client);
             node.send_transaction_to_da(raw_tx_hex, *fee_sats, wallet, network)
                 .await?;
+        }
+
+        Commands::Fund { address, amount } => {
+            let node = CoreMELNode::new(bitcoincore_rpc::Client::new(
+                "http://127.0.0.1:18443",
+                Auth::UserPass("bitcoin".to_string(), "password".to_string()),
+            )?);
+
+            let addr = Address::from_str(address)?;
+            let amount_wei = U256::from_str_radix(amount.trim_start_matches("0x"), 16)?;
+
+            node.fund_account(addr, amount_wei).await?;
+            info!("✅ Funded account {} with {} wei", address, amount_wei);
         }
     }
 
