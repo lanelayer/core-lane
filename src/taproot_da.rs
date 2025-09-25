@@ -23,7 +23,7 @@ impl TaprootDA {
         raw_tx_hex: &str,
         fee_sats: u64,
         wallet: &str,
-        network: &str,
+        network: bitcoin::Network,
     ) -> Result<String> {
         println!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
         println!(
@@ -303,7 +303,7 @@ impl TaprootDA {
     fn create_taproot_address_with_info(
         &self,
         data: &[u8],
-        network: &str,
+        network: bitcoin::Network,
     ) -> Result<(BitcoinAddress, String, Vec<u8>)> {
         use bitcoin::secp256k1::{Keypair, Secp256k1};
         use bitcoin::taproot::{LeafVersion, TaprootBuilder};
@@ -312,14 +312,6 @@ impl TaprootDA {
         let secp = Secp256k1::new();
         let keypair = Keypair::new(&secp, &mut OsRng);
         let (xonly, _parity) = bitcoin::secp256k1::XOnlyPublicKey::from_keypair(&keypair);
-
-        let network_enum = match network.to_lowercase().as_str() {
-            "mainnet" => Network::Bitcoin,
-            "testnet" => Network::Testnet,
-            "signet" => Network::Signet,
-            "regtest" => Network::Regtest,
-            _ => return Err(anyhow!("unknown network: {}", network)),
-        };
 
         // Create envelope script for the data
         let envelope_script = self.create_taproot_envelope_script(data)?;
@@ -331,7 +323,7 @@ impl TaprootDA {
             .map_err(|e| anyhow!("Failed to finalize Taproot spend info: {:?}", e))?;
 
         let output_key = spend_info.output_key();
-        let address = BitcoinAddress::p2tr_tweaked(output_key, network_enum);
+        let address = BitcoinAddress::p2tr_tweaked(output_key, network);
 
         let control_block = spend_info
             .control_block(&(envelope_script.clone().into(), LeafVersion::TapScript))

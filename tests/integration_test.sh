@@ -21,6 +21,7 @@ TEST_CHAIN_ID=1
 TEST_BURN_AMOUNT=1000000  # 1 million sats (0.01 BTC)
 RPC_USER="bitcoin"
 RPC_PASSWORD="bitcoin123"
+RPC_WALLET="mine"
 RPC_URL="http://127.0.0.1:18443"
 JSON_RPC_PORT=8546  # Use different port to avoid conflicts
 JSON_RPC_URL="http://127.0.0.1:$JSON_RPC_PORT"
@@ -221,7 +222,7 @@ test_send_ethereum_transaction() {
     local send_output=$(./target/debug/core-lane-node send-transaction \
         --raw-tx-hex "$sample_eth_tx" \
         --fee-sats 15000 \
-        --wallet "mine" \
+        --rpc-wallet "mine" \
         --rpc-password $RPC_PASSWORD 2>&1)
     
     if echo "$send_output" | grep -q "✅ Core Lane transaction.*created successfully"; then
@@ -286,6 +287,7 @@ test_send_ethereum_transaction() {
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
+        --rpc-wallet $RPC_WALLET \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_rpc_output 2>&1 &
     
     local rpc_node_pid=$!
@@ -547,6 +549,7 @@ test_start_core_lane_node() {
         --start-block $scan_from_block \
         --rpc-user $RPC_USER \
         --rpc-password $RPC_PASSWORD \
+        --rpc-wallet $RPC_WALLET \
         --http-host 127.0.0.1 \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_output 2>&1 &
     
@@ -1402,6 +1405,18 @@ cleanup() {
     rm -f .test-da-txid
     rm -f .test-rpc-da-txid
     rm -f .test-address
+    echo "Core Lane node output:"
+    if [ -f "/tmp/core_lane_node_output" ]; then
+        cat /tmp/core_lane_node_output
+    fi
+    echo "Core Lane node RPC output:"
+    if [ -f "/tmp/core_lane_node_rpc_output" ]; then
+        cat /tmp/core_lane_node_rpc_output
+    fi
+    echo "Core Lane test output:"
+    if [ -f "/tmp/core_lane_test_output" ]; then
+        cat /tmp/core_lane_test_output
+    fi
     rm -f /tmp/core_lane_node_output
     rm -f /tmp/core_lane_node_rpc_output
     rm -f /tmp/core_lane_test_output
