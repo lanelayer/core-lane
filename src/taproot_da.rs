@@ -5,7 +5,10 @@ use bitcoin::{
     blockdata::script::Builder,
     Address as BitcoinAddress, Network, ScriptBuf, Transaction, Witness,
 };
+use bitcoin::secp256k1::{Keypair, Secp256k1};
+use bitcoin::taproot::{LeafVersion, TaprootBuilder};
 use bitcoincore_rpc::{Client, RpcApi};
+use secp256k1::rand::rngs::OsRng;
 use serde_json;
 use std::sync::Arc;
 
@@ -315,9 +318,6 @@ impl TaprootDA {
         data: &[u8],
         network: bitcoin::Network,
     ) -> Result<(BitcoinAddress, String, Vec<u8>)> {
-        use bitcoin::secp256k1::{Keypair, Secp256k1};
-        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
-        use secp256k1::rand::rngs::OsRng;
 
         let secp = Secp256k1::new();
         let keypair = Keypair::new(&secp, &mut OsRng);
