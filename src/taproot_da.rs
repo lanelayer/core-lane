@@ -225,9 +225,15 @@ impl TaprootDA {
         // Create reveal transaction outputs
         let mut reveal_outputs = serde_json::Map::new();
         let reveal_amount = fee_sats.saturating_sub(1000); // Small fee for reveal tx
+        let output_amount = if reveal_amount >= 546 {
+            reveal_amount
+        } else {
+            546
+        };
+
         reveal_outputs.insert(
             reveal_addr,
-            serde_json::json!(reveal_amount as f64 / 100_000_000.0),
+            serde_json::json!(output_amount as f64 / 100_000_000.0),
         );
 
         // Create raw reveal transaction
@@ -243,6 +249,10 @@ impl TaprootDA {
             Ok(tx) => tx.as_str().unwrap().to_string(),
             Err(e) => return Err(anyhow!("Failed to create reveal transaction: {}", e)),
         };
+
+        if reveal_outputs.is_empty() {
+            println!("⚠️  Reveal amount below dust threshold, creating zero-fee transaction");
+        }
 
         // Sign the reveal transaction with the internal key
         let mut reveal_tx: Transaction =

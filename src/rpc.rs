@@ -7,7 +7,7 @@ use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
-use bitcoincore_rpc;
+use bitcoincore_rpc::{RpcApi};
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -412,8 +412,23 @@ impl RpcServer {
         // Use the shared TaprootDA module with proper Taproot envelope method
         let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
 
-        // Default fee for DA transactions (this could be made configurable)
-        let fee_sats = 10000u64;
+        let fee_estimate: Result<serde_json::Value, _> = bitcoin_client.call(
+            "estimatesmartfee",
+            &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
+        );
+
+        let fee_sats = match fee_estimate {
+            Ok(result) => {
+                if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
+                    let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
+                    let estimated_fee = (fee_per_kb_sats * 2) / 10;
+                    estimated_fee.max(1000)
+                } else {
+                    1000
+                }
+            }
+            Err(_) => 1000,
+        };
 
         taproot_da
             .send_transaction_to_da(raw_tx_hex, fee_sats, rpc_wallet, network)
