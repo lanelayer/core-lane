@@ -66,6 +66,8 @@ pub struct TransactionRequest {
 pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
+    network: Option<bitcoin::Network>,
+    wallet: Option<String>,
 }
 
 impl RpcServer {
@@ -73,16 +75,17 @@ impl RpcServer {
         Self {
             state,
             bitcoin_client: None,
+            network: None,
+            wallet: None,
         }
     }
 
-    pub fn with_bitcoin_client(
-        state: Arc<Mutex<CoreLaneState>>,
-        bitcoin_client: Arc<bitcoincore_rpc::Client>,
-    ) -> Self {
+    pub fn with_bitcoin_client(state: Arc<Mutex<CoreLaneState>>, bitcoin_client: Arc<bitcoincore_rpc::Client>, network: bitcoin::Network, wallet: String) -> Self {
         Self {
             state,
             bitcoin_client: Some(bitcoin_client),
+            network: Some(network),
+            wallet: Some(wallet),
         }
     }
 
@@ -369,7 +372,7 @@ impl RpcServer {
         };
 
         // Send transaction to Bitcoin DA
-        match Self::send_to_bitcoin_da(raw_tx_hex, bitcoin_client).await {
+        match Self::send_to_bitcoin_da(raw_tx_hex, bitcoin_client, server.network.unwrap(), &server.wallet.clone().unwrap()).await {
             Ok(bitcoin_txid) => {
                 // Calculate the Core Lane transaction hash for the response
                 use alloy_primitives::keccak256;
@@ -403,17 +406,17 @@ impl RpcServer {
     async fn send_to_bitcoin_da(
         raw_tx_hex: &str,
         bitcoin_client: &Arc<bitcoincore_rpc::Client>,
+        network: bitcoin::Network,
+        rpc_wallet: &str
     ) -> Result<String, anyhow::Error> {
         // Use the shared TaprootDA module with proper Taproot envelope method
         let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
 
         // Default fee for DA transactions (this could be made configurable)
         let fee_sats = 10000u64;
-        let wallet = "mine";
-        let network = "regtest";
 
         taproot_da
-            .send_transaction_to_da(raw_tx_hex, fee_sats, wallet, network)
+            .send_transaction_to_da(raw_tx_hex, fee_sats, rpc_wallet, network)
             .await
     }
 

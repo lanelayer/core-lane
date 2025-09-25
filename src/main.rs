@@ -61,6 +61,8 @@ enum Commands {
         http_host: String,
         #[arg(long, default_value = "8545")]
         http_port: u16,
+        #[arg(long, default_value = "mine")]
+        rpc_wallet: String,
     },
 
     Burn {
@@ -71,9 +73,7 @@ enum Commands {
         #[arg(long)]
         eth_address: String,
         #[arg(long, default_value = "mine")]
-        wallet: String,
-        #[arg(long, default_value = "regtest")]
-        network: String,
+        rpc_wallet: String,
         #[arg(long, default_value = "http://127.0.0.1:18443")]
         rpc_url: String,
         #[arg(long, default_value = "bitcoin")]
@@ -87,9 +87,7 @@ enum Commands {
         #[arg(long, default_value = "10000")]
         fee_sats: u64,
         #[arg(long, default_value = "mine")]
-        wallet: String,
-        #[arg(long, default_value = "regtest")]
-        network: String,
+        rpc_wallet: String,
         #[arg(long, default_value = "http://127.0.0.1:18443")]
         rpc_url: String,
         #[arg(long, default_value = "bitcoin")]
@@ -1417,7 +1415,7 @@ impl CoreLaneNode {
         chain_id: u32,
         eth_address: &str,
         wallet: &str,
-        network: &str,
+        network: bitcoin::Network,
     ) -> Result<()> {
         info!(
             "🔥 Creating Bitcoin burn transaction using wallet '{}'...",
@@ -1445,11 +1443,10 @@ impl CoreLaneNode {
         }
 
         // Convert network string to Bitcoin Network enum
-        let bitcoin_network = Self::parse_network(network).map_err(|e| anyhow!(e))?;
 
         info!("📋 Burn Details:");
         info!("   Wallet: {}", wallet);
-        info!("   Network: {} ({:?})", network, bitcoin_network);
+        info!("   Network: {}", network.to_string());
         info!("   Burn amount: {} sats", burn_amount);
         info!("   Chain ID: {}", chain_id);
         info!("   ETH address: {}", eth_address);
@@ -1461,7 +1458,7 @@ impl CoreLaneNode {
 
         match balance_result {
             Ok(balances) => {
-                if let Some(trusted) = balances.get("mine").and_then(|m| m.get("trusted")) {
+                if let Some(trusted) = balances.get(wallet).and_then(|m| m.get("trusted")) {
                     let balance_btc = trusted.as_f64().unwrap_or(0.0);
                     let balance_sats = (balance_btc * 100_000_000.0) as u64;
                     info!(
@@ -1555,7 +1552,7 @@ impl CoreLaneNode {
         let wscript_hash =
             bitcoin::blockdata::script::WScriptHash::from_slice(&script_hash.to_byte_array())?;
         let p2wsh_address =
-            bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), bitcoin_network);
+            bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), network);
 
         info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
         debug!("📝 Burn script: {}", burn_script);
@@ -1590,7 +1587,7 @@ impl CoreLaneNode {
             if let Ok(change_addr) = change_addr_result {
                 let change_addr_str = change_addr.as_str().unwrap();
                 let change_address = bitcoin::Address::from_str(change_addr_str)?
-                    .require_network(bitcoin_network)?;
+                    .require_network(network)?;
                 tx_outputs.push(TxOut {
                     value: Amount::from_sat(change_amount),
                     script_pubkey: change_address.script_pubkey(),
@@ -1668,98 +1665,9 @@ impl CoreLaneNode {
         raw_tx_hex: &str,
         fee_sats: u64,
         wallet: &str,
-        network: &str,
+        network: bitcoin::Network,
     ) -> Result<()> {
-        info!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
-        info!(
-            "📝 Ethereum transaction: {}...",
-            &raw_tx_hex[..64.min(raw_tx_hex.len())]
-        );
-        info!("💰 Fee: {} sats", fee_sats);
-
-        // Validate the Ethereum transaction hex
-        let tx_bytes = hex::decode(raw_tx_hex).map_err(|e| anyhow!("Invalid hex format: {}", e))?;
-
-        println!("🔍 Raw Ethereum transaction:");
-        println!("   📝 Input hex: {}", raw_tx_hex);
-        println!(
-            "   📏 Input length: {} chars ({} bytes)",
-            raw_tx_hex.len(),
-            tx_bytes.len()
-        );
-        println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
-
-        // Create Core Lane payload: CORE_LANE prefix + Ethereum transaction
-        let mut payload = Vec::new();
-        payload.extend_from_slice(b"CORE_LANE");
-        payload.extend_from_slice(&tx_bytes);
-
-        println!("📦 Core Lane payload size: {} bytes", payload.len());
-        println!("📦 Core Lane payload hex: {}", hex::encode(&payload));
-
-        // Check wallet balance - use the same approach as in burn transaction
-        let balance_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getbalances", &[]);
-
-        let available_balance = match balance_result {
-            Ok(balances) => {
-                if let Some(mine_wallet) = balances.get("mine") {
-                    if let Some(trusted) = mine_wallet.get("trusted") {
-                        let balance_btc = trusted.as_f64().unwrap_or(0.0);
-                        (balance_btc * 100_000_000.0) as u64
-                    } else {
-                        0u64
-                    }
-                } else {
-                    0u64
-                }
-            }
-            Err(e) => return Err(anyhow!("Failed to get wallet balance: {}", e)),
-        };
-
-        println!("💰 Available balance: {} sats", available_balance);
-
-        if available_balance < fee_sats {
-            return Err(anyhow!(
-                "Insufficient balance: {} sats available, {} sats needed",
-                available_balance,
-                fee_sats
-            ));
-        }
-
-        // Get unspent outputs - use the same approach as in burn transaction
-        let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "listunspent",
-            &[
-                serde_json::json!(0),
-                serde_json::json!(9999999),
-                serde_json::json!([]),
-                serde_json::json!(true),
-                serde_json::json!({"minimumAmount": (fee_sats as f64 + 1000.0) / 100_000_000.0}),
-            ],
-        );
-
-        let unspent = match unspent_result {
-            Ok(utxos) => utxos,
-            Err(e) => return Err(anyhow!("Failed to get unspent outputs: {}", e)),
-        };
-
-        if !unspent.is_array() || unspent.as_array().unwrap().is_empty() {
-            return Err(anyhow!("No suitable unspent outputs found"));
-        }
-
-        // Use the first suitable UTXO
-        let utxo = &unspent.as_array().unwrap()[0];
-        let prev_txid = utxo["txid"].as_str().unwrap();
-        let prev_vout = utxo["vout"].as_u64().unwrap() as u32;
-        let prev_amount = (utxo["amount"].as_f64().unwrap() * 100_000_000.0) as u64;
-
-        info!(
-            "📍 Using UTXO: {}:{} ({} sats)",
-            prev_txid, prev_vout, prev_amount
-        );
-
-        // Use the shared TaprootDA module
+        // Delegate to the TaprootDA implementation which handles all validation and logic
         let taproot_da = TaprootDA::new(self.bitcoin_client.clone());
         let _bitcoin_txid = taproot_da
             .send_transaction_to_da(raw_tx_hex, fee_sats, wallet, network)
@@ -1791,19 +1699,35 @@ async fn main() -> Result<()> {
             start_block,
             http_host,
             http_port,
+            rpc_wallet,
         } => {
+            let wallet = rpc_wallet.to_string();
             let client = bitcoincore_rpc::Client::new(
                 rpc_url,
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
+            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+
+            let network = if let Some(chain) = blockchain_info.get("chain") {
+                match chain.as_str() {
+                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
+                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
+                    Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
+                    None => return Err(anyhow::anyhow!("Chain field is not a string")),
+                }
+            } else {
+                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+            };
             let node = CoreLaneNode::new(client);
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
             let rpc_server =
-                RpcServer::with_bitcoin_client(shared_state, node.bitcoin_client.clone());
-            let app = rpc_server.router();
+                RpcServer::with_bitcoin_client(shared_state, node.bitcoin_client.clone(), network, wallet);
+
+                let app = rpc_server.router();
 
             let addr = format!("{}:{}", http_host, http_port);
             info!("🚀 Starting JSON-RPC server on http://{}", addr);
@@ -1827,8 +1751,7 @@ async fn main() -> Result<()> {
             burn_amount,
             chain_id,
             eth_address,
-            wallet,
-            network,
+            rpc_wallet,
             rpc_url,
             rpc_user,
             rpc_password,
@@ -1838,12 +1761,25 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
+            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+
+            let network = if let Some(chain) = blockchain_info.get("chain") {
+                match chain.as_str() {
+                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
+                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
+                    Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
+                    None => return Err(anyhow::anyhow!("Chain field is not a string")),
+                }
+            } else {
+                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+            };
             let node = CoreLaneNode::new(client);
             node.create_burn_transaction_from_wallet(
                 *burn_amount,
                 *chain_id,
                 eth_address,
-                wallet,
+                rpc_wallet,
                 network,
             )
             .await?;
@@ -1852,8 +1788,7 @@ async fn main() -> Result<()> {
         Commands::SendTransaction {
             raw_tx_hex,
             fee_sats,
-            wallet,
-            network,
+            rpc_wallet,
             rpc_url,
             rpc_user,
             rpc_password,
@@ -1863,8 +1798,22 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
+            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+
+            let network = if let Some(chain) = blockchain_info.get("chain") {
+                match chain.as_str() {
+                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
+                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
+                    Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
+                    None => return Err(anyhow::anyhow!("Chain field is not a string")),
+                }
+            } else {
+                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+            };
+
             let node = CoreLaneNode::new(client);
-            node.send_transaction_to_da(raw_tx_hex, *fee_sats, wallet, network)
+            node.send_transaction_to_da(raw_tx_hex, *fee_sats, rpc_wallet, network)
                 .await?;
         }
 
