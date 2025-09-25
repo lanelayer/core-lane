@@ -84,8 +84,8 @@ enum Commands {
     SendTransaction {
         #[arg(long)]
         raw_tx_hex: String,
-        #[arg(long, default_value = "10000")]
-        fee_sats: u64,
+        #[arg(long)]
+        fee_sats: Option<u64>,
         #[arg(long, default_value = "mine")]
         rpc_wallet: String,
         #[arg(long, default_value = "http://127.0.0.1:18443")]
@@ -1713,6 +1713,7 @@ async fn main() -> Result<()> {
                 match chain.as_str() {
                     Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
                     Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
                     Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
                     Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
@@ -1767,6 +1768,7 @@ async fn main() -> Result<()> {
                 match chain.as_str() {
                     Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
                     Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
                     Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
                     Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
@@ -1804,6 +1806,7 @@ async fn main() -> Result<()> {
                 match chain.as_str() {
                     Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
                     Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
                     Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
                     Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
@@ -1812,8 +1815,30 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
             };
 
+            let final_fee_sats = if let Some(fee) = fee_sats {
+                *fee
+            } else {
+                let fee_estimate: Result<serde_json::Value, _> = client.call(
+                    "estimatesmartfee",
+                    &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
+                );
+
+                match fee_estimate {
+                    Ok(result) => {
+                        if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
+                            let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
+                            let estimated_fee = (fee_per_kb_sats * 2) / 10;
+                            estimated_fee.max(1000)
+                        } else {
+                            1000
+                        }
+                    }
+                    Err(_) => 1000,
+                }
+            };
+
             let node = CoreLaneNode::new(client);
-            node.send_transaction_to_da(raw_tx_hex, *fee_sats, rpc_wallet, network)
+            node.send_transaction_to_da(raw_tx_hex, final_fee_sats, rpc_wallet, network)
                 .await?;
         }
 
