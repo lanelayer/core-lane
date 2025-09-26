@@ -221,7 +221,6 @@ test_send_ethereum_transaction() {
     # Send the transaction using CLI for verification purposes
     local send_output=$(./target/debug/core-lane-node send-transaction \
         --raw-tx-hex "$sample_eth_tx" \
-        --fee-sats 15000 \
         --rpc-wallet "mine" \
         --rpc-password $RPC_PASSWORD 2>&1)
     

@@ -1663,14 +1663,13 @@ impl CoreLaneNode {
     async fn send_transaction_to_da(
         &self,
         raw_tx_hex: &str,
-        fee_sats: u64,
         wallet: &str,
         network: bitcoin::Network,
     ) -> Result<()> {
         // Delegate to the TaprootDA implementation which handles all validation and logic
         let taproot_da = TaprootDA::new(self.bitcoin_client.clone());
         let _bitcoin_txid = taproot_da
-            .send_transaction_to_da(raw_tx_hex, fee_sats, wallet, network)
+            .send_transaction_to_da(raw_tx_hex, wallet, network)
             .await?;
         Ok(())
     }
@@ -1703,10 +1702,9 @@ async fn main() -> Result<()> {
         } => {
             let wallet = rpc_wallet.to_string();
             let client = bitcoincore_rpc::Client::new(
-                rpc_url,
+                &format!("{}/wallet/{}", rpc_url, rpc_wallet),
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
-
             let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
@@ -1757,8 +1755,10 @@ async fn main() -> Result<()> {
             rpc_user,
             rpc_password,
         } => {
+            // add /wallet/<rpc_wallet> to the rpc_url
+            let rpc_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
             let client = bitcoincore_rpc::Client::new(
-                rpc_url,
+                &rpc_url,
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
@@ -1815,30 +1815,8 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
             };
 
-            let final_fee_sats = if let Some(fee) = fee_sats {
-                *fee
-            } else {
-                let fee_estimate: Result<serde_json::Value, _> = client.call(
-                    "estimatesmartfee",
-                    &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
-                );
-
-                match fee_estimate {
-                    Ok(result) => {
-                        if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
-                            let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
-                            let estimated_fee = (fee_per_kb_sats * 2) / 10;
-                            estimated_fee.max(1000)
-                        } else {
-                            1000
-                        }
-                    }
-                    Err(_) => 1000,
-                }
-            };
-
             let node = CoreLaneNode::new(client);
-            node.send_transaction_to_da(raw_tx_hex, final_fee_sats, rpc_wallet, network)
+            node.send_transaction_to_da(raw_tx_hex, rpc_wallet, network)
                 .await?;
         }
 
