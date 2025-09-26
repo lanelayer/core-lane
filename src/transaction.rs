@@ -331,9 +331,9 @@ fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
 
 /// Core Lane specific addresses for special operations
 #[derive(Debug, Clone)]
-pub struct CoreMELAddresses;
+pub struct CoreLaneAddresses;
 
-impl CoreMELAddresses {
+impl CoreLaneAddresses {
     /// Burn address: 0x000000000000000000000000000000000000dead
     pub fn burn() -> Address {
         Address::from([
@@ -661,7 +661,7 @@ fn execute_transfer(
         }
     };
 
-    if to == CoreMELAddresses::exit_marketplace() {
+    if to == CoreLaneAddresses::exit_marketplace() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
         let nonce = get_transaction_nonce(tx);
         if input.len() < 4 {
