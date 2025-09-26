@@ -4,14 +4,14 @@ use std::collections::HashMap;
 
 /// Core Lane account structure
 #[derive(Debug, Clone)]
-pub struct CoreMELAccount {
+pub struct CoreLaneAccount {
     pub balance: U256,
     pub nonce: U256,
     pub code: Bytes,
     pub storage: HashMap<B256, B256>,
 }
 
-impl CoreMELAccount {
+impl CoreLaneAccount {
     pub fn new() -> Self {
         Self {
             balance: U256::ZERO,
@@ -73,7 +73,7 @@ impl CoreMELAccount {
 /// Account manager for Core Lane
 #[derive(Debug, Clone)]
 pub struct AccountManager {
-    accounts: HashMap<Address, CoreMELAccount>,
+    accounts: HashMap<Address, CoreLaneAccount>,
 }
 
 impl AccountManager {
@@ -83,14 +83,14 @@ impl AccountManager {
         }
     }
 
-    pub fn get_account(&self, address: Address) -> Option<&CoreMELAccount> {
+    pub fn get_account(&self, address: Address) -> Option<&CoreLaneAccount> {
         self.accounts.get(&address)
     }
 
-    pub fn get_account_mut(&mut self, address: Address) -> &mut CoreMELAccount {
+    pub fn get_account_mut(&mut self, address: Address) -> &mut CoreLaneAccount {
         self.accounts
             .entry(address)
-            .or_insert_with(CoreMELAccount::new)
+            .or_insert_with(CoreLaneAccount::new)
     }
 
     pub fn get_balance(&self, address: Address) -> U256 {
@@ -158,7 +158,7 @@ impl AccountManager {
             .unwrap_or(false)
     }
 
-    pub fn get_all_accounts(&self) -> &HashMap<Address, CoreMELAccount> {
+    pub fn get_all_accounts(&self) -> &HashMap<Address, CoreLaneAccount> {
         &self.accounts
     }
 
