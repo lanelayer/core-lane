@@ -3,7 +3,7 @@ use bitcoin::{
     blockdata::opcodes::all::{OP_ENDIF, OP_IF},
     blockdata::opcodes::{OP_FALSE, OP_TRUE},
     blockdata::script::Builder,
-    Address as BitcoinAddress, Network, ScriptBuf, Transaction, Witness,
+    Address as BitcoinAddress, ScriptBuf, Transaction, Witness,
 };
 use bitcoin::secp256k1::{Keypair, Secp256k1};
 use bitcoin::taproot::{LeafVersion, TaprootBuilder};
@@ -21,172 +21,288 @@ impl TaprootDA {
         Self { bitcoin_client }
     }
 
+    /// Calculate actual transaction size in virtual bytes (vB) from raw transaction hex
+    fn calculate_actual_tx_size_vb(&self, raw_tx_hex: &str) -> Result<u64> {
+        // Decode the raw transaction hex
+        let tx_bytes = hex::decode(raw_tx_hex).map_err(|e| anyhow!("Invalid hex format: {}", e))?;
+        
+        // Parse the transaction to get its structure
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+            .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))?;
+        
+        // Calculate vB for Taproot transactions
+        // For Taproot: vB = base_size + witness_size
+        let base_size = tx_bytes.len() as u64;
+        
+        // Calculate witness size
+        let mut witness_size = 0u64;
+        for input in &tx.input {
+            witness_size += 2; // witness stack length (varint)
+            for witness_item in &input.witness {
+                witness_size += 2; // witness item length (varint)
+                witness_size += witness_item.len() as u64;
+            }
+        }
+        
+        // For Taproot: vB = base_size + witness_size
+        let v_b = base_size + witness_size;
+        
+        tracing::info!("📏 Actual transaction size: {} bytes (base: {}, witness: {})", v_b, base_size, witness_size);
+        Ok(v_b)
+    }
+
+    async fn calculate_optimal_fee_rate(&self) -> Result<u64> {
+        // Get the minimum relay fee from the Bitcoin node
+        let minrelayfee_result: Result<serde_json::Value, _> = self.bitcoin_client.call("getnetworkinfo", &[]);
+        let min_relay_fee_sat_vb = match minrelayfee_result {
+            Ok(network_info) => {
+                if let Some(minrelayfee) = network_info.get("relayfee").and_then(|v| v.as_f64()) {
+                        // Convert from BTC/kB to sat/vB
+                    let minrelayfee_sats = (minrelayfee * 100_000_000.0) as u64;
+                    let min_relay_fee_sat_vb = minrelayfee_sats / 1000; // Convert kB to vB
+                    tracing::info!("🔍 Bitcoin node minrelayfee: {} sat/vB", min_relay_fee_sat_vb);
+                    min_relay_fee_sat_vb
+                } else {
+                    tracing::warn!("🔍 No relayfee in network info, using fallback");
+                    2 // Fallback to 2 sat/vB
+                }
+            }
+            Err(e) => {
+                tracing::warn!("🔍 Failed to get network info: {}, using fallback", e);
+                2 // Fallback to 2 sat/vB
+            }
+        };
+
+        // Get fee rate from estimatesmartfee
+        let fee_estimate: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "estimatesmartfee",
+            &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
+        );
+
+        let sat_per_vb = match fee_estimate {
+            Ok(result) => {
+                tracing::debug!("🔍 Fee estimate result: {:?}", result);
+                if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
+                    tracing::info!("🔍 Raw fee rate from estimatesmartfee: {} BTC/kB", fee_rate);
+                        // Convert from BTC/kB to sat/vB
+                    let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
+                    let sat_per_vb = fee_per_kb_sats / 1000; // Convert kB to vB
+                    tracing::info!("🔍 Before capping: {} sat/vB", sat_per_vb);
+                    let capped_sat_per_vb = sat_per_vb.max(min_relay_fee_sat_vb).min(50); // Cap at 50 sat/vB max, min relay fee
+                    tracing::info!("🔍 After capping: {} sat/vB (was {})", capped_sat_per_vb, sat_per_vb);
+                    capped_sat_per_vb
+                } else {
+                    tracing::warn!("🔍 No feerate in result, using min relay fee");
+                    min_relay_fee_sat_vb // Use min relay fee as fallback
+                }
+            }
+            Err(e) => {
+                tracing::warn!("🔍 Fee estimate error: {}, using min relay fee", e);
+                min_relay_fee_sat_vb // Use min relay fee as fallback
+            }
+        };
+
+        // Cap the maximum fee rate to prevent excessive fees
+        let final_sat_per_vb = sat_per_vb.min(10); // Force max 10 sat/vB for testing
+        tracing::info!("🔧 FORCED fee rate: {} sat/vB (was {})", final_sat_per_vb, sat_per_vb);
+        tracing::info!("💰 Final fee rate: {} sat/vB", final_sat_per_vb);
+
+        Ok(final_sat_per_vb)
+    }
+
     pub async fn send_transaction_to_da(
         &self,
         raw_tx_hex: &str,
-        fee_sats: u64,
         wallet: &str,
         network: bitcoin::Network,
     ) -> Result<String> {
-        println!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
-        println!(
+        tracing::info!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
+        tracing::info!(
             "📝 Ethereum transaction: {}...",
             &raw_tx_hex[..64.min(raw_tx_hex.len())]
         );
-        println!("💰 Fee: {} sats", fee_sats);
+
+        // Calculate optimal fee rate
+        let sat_per_vb = self.calculate_optimal_fee_rate().await?;
+        tracing::info!("💰 Fee rate: {} sat/vB", sat_per_vb);
 
         // Validate the Ethereum transaction hex
         let tx_bytes = hex::decode(raw_tx_hex).map_err(|e| anyhow!("Invalid hex format: {}", e))?;
 
-        println!("🔍 Raw Ethereum transaction:");
-        println!("   📝 Input hex: {}", raw_tx_hex);
-        println!(
+        tracing::debug!("🔍 Raw Ethereum transaction:");
+        tracing::debug!("   📝 Input hex: {}", raw_tx_hex);
+        tracing::debug!(
             "   📏 Input length: {} chars ({} bytes)",
             raw_tx_hex.len(),
             tx_bytes.len()
         );
-        println!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
+        tracing::debug!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
         // Create Core Lane payload: CORE_LANE prefix + Ethereum transaction
         let mut payload = Vec::new();
         payload.extend_from_slice(b"CORE_LANE");
         payload.extend_from_slice(&tx_bytes);
 
-        println!("📦 Core Lane payload size: {} bytes", payload.len());
-        println!("📦 Core Lane payload hex: {}", hex::encode(&payload));
+        tracing::info!("📦 Core Lane payload size: {} bytes", payload.len());
+        tracing::debug!("📦 Core Lane payload hex: {}", hex::encode(&payload));
 
         // Check wallet balance
-        let balance_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getbalances", &[]);
-
-        let available_balance = match balance_result {
-            Ok(balances) => {
-                if let Some(mine_wallet) = balances.get("mine") {
-                    if let Some(trusted) = mine_wallet.get("trusted") {
-                        let balance_btc = trusted.as_f64().unwrap_or(0.0);
-                        (balance_btc * 100_000_000.0) as u64
-                    } else {
-                        0u64
-                    }
-                } else {
-                    0u64
-                }
-            }
-            Err(e) => return Err(anyhow!("Failed to get wallet balance: {}", e)),
-        };
-
-        println!("💰 Available balance: {} sats", available_balance);
-
-        if available_balance < fee_sats {
-            return Err(anyhow!(
-                "Insufficient balance: {} sats available, {} sats needed",
-                available_balance,
-                fee_sats
-            ));
-        }
-
-        // Get unspent outputs
-        let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "listunspent",
-            &[
-                serde_json::json!(0),
-                serde_json::json!(9999999),
-                serde_json::json!([]),
-                serde_json::json!(true),
-                serde_json::json!({"minimumAmount": (fee_sats as f64 + 1000.0) / 100_000_000.0}),
-            ],
-        );
-
-        let unspent = match unspent_result {
-            Ok(utxos) => utxos,
-            Err(e) => return Err(anyhow!("Failed to get unspent outputs: {}", e)),
-        };
-
-        if !unspent.is_array() || unspent.as_array().unwrap().is_empty() {
-            return Err(anyhow!("No suitable unspent outputs found"));
-        }
-
-        // Use the first suitable UTXO
-        let utxo = &unspent.as_array().unwrap()[0];
-        let prev_txid = utxo["txid"].as_str().unwrap();
-        let prev_vout = utxo["vout"].as_u64().unwrap() as u32;
-        let prev_amount = (utxo["amount"].as_f64().unwrap() * 100_000_000.0) as u64;
-
-        println!(
-            "📍 Using UTXO: {}:{} ({} sats)",
-            prev_txid, prev_vout, prev_amount
-        );
+       
+        // fundrawtransaction will handle UTXO selection automatically
 
         // Create a Taproot output with Core Lane data embedded
         let envelope_script = self.create_taproot_envelope_script(&payload)?;
         let (taproot_address, internal_key, control_block) =
             self.create_taproot_address_with_info(&payload, network)?;
 
-        println!("🎯 Created Taproot address: {}", taproot_address);
-        println!("🔑 Internal key: {}", internal_key);
+        tracing::info!("🎯 Created Taproot address: {}", taproot_address);
+        tracing::debug!("🔑 Internal key: {}", internal_key);
 
-        // Create inputs using RPC
-        let inputs = vec![serde_json::json!({
-            "txid": prev_txid,
-            "vout": prev_vout
-        })];
-
-        // Create outputs with Core Lane data in Taproot envelope
+        // Calculate the Taproot output amount needed for the reveal transaction
+        // We need to estimate the reveal transaction fee first
+        let reveal_tx_size = 100; // Estimate ~100 vB for reveal tx
+        let mut reveal_fee = sat_per_vb * reveal_tx_size;
+        
+        // Ensure reveal transaction meets minimum relay fee requirement
+        let min_relay_fee_sats = 122;
+        if reveal_fee < min_relay_fee_sats {
+            let adjusted_sat_per_vb = (min_relay_fee_sats + reveal_tx_size - 1) / reveal_tx_size;
+            reveal_fee = adjusted_sat_per_vb * reveal_tx_size;
+        }
+        
+        // Calculate minimum Taproot output needed (reveal fee + dust threshold)
+        let dust_threshold = 546; // Bitcoin dust threshold
+        let min_taproot_output = reveal_fee + dust_threshold;
+        let taproot_output_btc = min_taproot_output as f64 / 100_000_000.0; // Convert to BTC
+        
+        tracing::info!("🔍 Calculated Taproot output: {} sats ({} BTC) for reveal tx needs", min_taproot_output, taproot_output_btc);
+        
+        // Create outputs with the Taproot address
+        // Use modern PSBT approach instead of createrawtransaction + fundrawtransaction
         let mut outputs = serde_json::Map::new();
-
-        // Add the Taproot output with the Core Lane data
         outputs.insert(
             taproot_address.to_string(),
-            serde_json::json!(fee_sats as f64 / 100_000_000.0),
+            serde_json::json!(taproot_output_btc), // Calculated amount for reveal tx needs
         );
 
-        // Add change output if substantial enough
-        let estimated_tx_fee = 2000u64; // Higher fee for complex transaction
-        let change_amount = prev_amount
-            .saturating_sub(fee_sats)
-            .saturating_sub(estimated_tx_fee);
-        if change_amount > 546 {
-            // dust threshold
-            let change_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+        // Get a wallet address for change (not the Taproot address)
+        let change_address_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
                 "getnewaddress",
-                &[serde_json::json!(wallet), serde_json::json!("bech32")],
-            );
+            &[],
+        );
 
-            if let Ok(change_addr) = change_addr_result {
-                let change_addr_str = change_addr.as_str().unwrap();
-                outputs.insert(
-                    change_addr_str.to_string(),
-                    serde_json::json!(change_amount as f64 / 100_000_000.0),
-                );
-                println!("💰 Change: {} sats -> {}", change_amount, change_addr_str);
+        let change_address = match change_address_result {
+            Ok(addr) => addr.as_str().unwrap().to_string(),
+            Err(e) => return Err(anyhow!("Failed to get change address: {}", e)),
+        };
+
+        tracing::info!("📍 Using wallet address for change: {}", change_address);
+
+        // Get wallet balance to show total input value
+        let balance_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "getbalance",
+            &[],
+        );
+
+        let total_balance = match balance_result {
+            Ok(balance) => {
+                let btc_balance = balance.as_f64().unwrap();
+                let sats_balance = (btc_balance * 100_000_000.0) as u64;
+                tracing::info!("💰 Total wallet balance: {} BTC ({} sats)", btc_balance, sats_balance);
+                sats_balance
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get wallet balance: {}", e);
+                0
+            }
+        };
+
+        // Create and fund PSBT in one step using walletcreatefundedpsbt
+        let fund_options = serde_json::json!({
+            "feeRate": sat_per_vb as f64 / 100_000.0, // Convert sat/vB to BTC/kB
+            "changeAddress": change_address
+        });
+
+        tracing::info!("💰 Using walletcreatefundedpsbt for commit with fee rate: {} sat/vB", sat_per_vb);
+        tracing::info!("🔍 Fund options: {}", serde_json::to_string_pretty(&fund_options).unwrap_or_default());
+        
+        let funded_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "walletcreatefundedpsbt",
+            &[serde_json::json!([]), serde_json::json!(outputs), serde_json::json!(0), serde_json::json!(fund_options)], // inputs, outputs, locktime, options
+        );
+
+        let funded_psbt = match funded_result {
+            Ok(result) => {
+                let psbt = result["psbt"].as_str().unwrap().to_string();
+                let fee = result["fee"].as_f64().unwrap() * 100_000_000.0; // Convert to sats
+                tracing::info!("💰 Wallet created funded PSBT, fee: {} sats", fee as u64);
+                tracing::debug!("🔍 Funded PSBT: {}", psbt);
+                psbt
+            }
+            Err(e) => return Err(anyhow!("Failed to create funded PSBT: {}", e)),
+        };
+
+        // Get the actual transaction to show input values
+        let tx_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "decodepsbt",
+            &[serde_json::json!(funded_psbt)],
+        );
+
+        if let Ok(tx_data) = tx_result {
+            if let Some(inputs) = tx_data["inputs"].as_array() {
+                let mut total_input_value = 0u64;
+                for input in inputs {
+                    if let Some(prevout) = input["prevout"].as_object() {
+                        if let Some(value) = prevout["value"].as_f64() {
+                            total_input_value += (value * 100_000_000.0) as u64;
+                        }
+                    }
+                }
+                tracing::info!("📊 Total input value used in commit transaction: {} sats", total_input_value);
             }
         }
 
-        // Create and sign the commit transaction using RPC
-        let rawtx_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "createrawtransaction",
-            &[serde_json::json!(inputs), serde_json::json!(outputs)],
+        // Now process the funded PSBT to sign it
+        tracing::info!("🔍 Processing funded PSBT for signing");
+        
+        let processed_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "walletprocesspsbt",
+            &[serde_json::json!(funded_psbt), serde_json::json!(true)], // psbt, sign=true
         );
 
-        let raw_tx = match rawtx_result {
-            Ok(tx) => tx.as_str().unwrap().to_string(),
-            Err(e) => return Err(anyhow!("Failed to create raw transaction: {}", e)),
-        };
-
-        let signed_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
-            .call("signrawtransactionwithwallet", &[serde_json::json!(raw_tx)]);
-
-        let signed_tx = match signed_result {
+        let processed_psbt = match processed_result {
             Ok(result) => {
-                if result["complete"].as_bool().unwrap_or(false) {
-                    result["hex"].as_str().unwrap().to_string()
-                } else {
-                    return Err(anyhow!("Failed to sign transaction: {}", result["errors"]));
-                }
+                let psbt = result["psbt"].as_str().unwrap().to_string();
+                let complete = result["complete"].as_bool().unwrap_or(false);
+                tracing::info!("💰 Wallet processed PSBT successfully, complete: {}", complete);
+                tracing::debug!("🔍 Processed PSBT result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+                psbt
             }
-            Err(e) => return Err(anyhow!("Failed to sign transaction: {}", e)),
+            Err(e) => return Err(anyhow!("Failed to process PSBT: {}", e)),
         };
+
+        // Finalize the PSBT into a raw transaction
+        let finalize_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "finalizepsbt",
+            &[serde_json::json!(processed_psbt)],
+        );
+
+        let funded_tx = match finalize_result {
+            Ok(result) => {
+                let hex = result["hex"].as_str().unwrap().to_string();
+                let complete = result["complete"].as_bool().unwrap();
+                tracing::info!("💰 PSBT finalized successfully, complete: {}", complete);
+                tracing::debug!("🔍 Finalized transaction: {}", hex);
+                if !complete {
+                    return Err(anyhow!("PSBT finalization incomplete"));
+                }
+                hex
+            }
+            Err(e) => return Err(anyhow!("Failed to finalize PSBT: {}", e)),
+        };
+
+        // No need to sign - walletprocesspsbt already signed the transaction
+        let signed_tx = funded_tx;
 
         // Broadcast the commit transaction
         let commit_tx_result: Result<bitcoin::Txid, _> = self
@@ -195,47 +311,95 @@ impl TaprootDA {
 
         let commit_txid = match commit_tx_result {
             Ok(txid) => {
-                println!("✅ Commit transaction broadcast: {}", txid);
-                println!("📦 Core Lane data embedded in Taproot envelope");
+                tracing::info!("✅ Commit transaction broadcast: {}", txid);
+                tracing::info!("📦 Core Lane data embedded in Taproot envelope");
                 txid
             }
             Err(e) => {
-                println!("❌ Failed to broadcast commit transaction: {}", e);
+                tracing::error!("❌ Failed to broadcast commit transaction: {}", e);
                 return Err(anyhow!("Failed to broadcast commit transaction: {}", e));
             }
         };
 
         // Now immediately create a reveal transaction that spends the Taproot output
-        println!("🔍 Creating reveal transaction to immediately expose Core Lane data...");
+        tracing::info!("🔍 Creating reveal transaction to immediately expose Core Lane data...");
 
-        // Get a new address for the reveal output
-        let reveal_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "getnewaddress",
-            &[serde_json::json!(wallet), serde_json::json!("bech32")],
-        );
+        // Use the same wallet address for the reveal output (change address from commit)
+        // This ensures the reveal output goes back to our wallet
+        tracing::info!("📍 Using wallet address for reveal output: {}", change_address);
 
-        let reveal_addr = match reveal_addr_result {
-            Ok(addr) => addr.as_str().unwrap().to_string(),
-            Err(e) => return Err(anyhow!("Failed to get reveal address: {}", e)),
-        };
-
-        // Create reveal transaction inputs (spending the Taproot output we just created)
-        let reveal_inputs = vec![serde_json::json!({
-            "txid": commit_txid.to_string(),
-            "vout": 0  // The Taproot output is at index 0
-        })];
+        // Reveal transaction inputs will be created after we find the correct vout index
 
         // Create reveal transaction outputs
         let mut reveal_outputs = serde_json::Map::new();
-        let reveal_amount = fee_sats.saturating_sub(1000); // Small fee for reveal tx
+        
+        // Get the Taproot output amount from the commit transaction
+        let commit_tx_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            "getrawtransaction",
+            &[serde_json::json!(commit_txid.to_string()), serde_json::json!(true)],
+        );
+        
+        let commit_tx = match commit_tx_result {
+            Ok(tx) => {
+                tracing::info!("🔍 Commit transaction structure: {}", serde_json::to_string_pretty(&tx).unwrap_or_default());
+                tx
+            }
+            Err(e) => return Err(anyhow!("Failed to get commit transaction: {}", e)),
+        };
+        
+        // Find the Taproot output (it should be the one going to our Taproot address)
+        let mut taproot_output_amount = 0u64;
+        let mut taproot_vout_index = 0;
+        for (vout_index, vout) in commit_tx["vout"].as_array().unwrap().iter().enumerate() {
+            // Check if this output has an address and if it matches our Taproot address
+            if let Some(address) = vout["scriptPubKey"]["address"].as_str() {
+                if address == taproot_address.to_string() {
+                    taproot_output_amount = (vout["value"].as_f64().unwrap() * 100_000_000.0) as u64;
+                    taproot_vout_index = vout_index;
+                    tracing::info!("🔍 Found Taproot output at vout {}: {} sats", vout_index, taproot_output_amount);
+                    tracing::info!("📊 Total input value for reveal transaction: {} sats (from Taproot output)", taproot_output_amount);
+                    break;
+                }
+            }
+        }
+        
+        if taproot_output_amount == 0 {
+            return Err(anyhow!("Could not find Taproot output in commit transaction"));
+        }
+        
+        // Update the reveal inputs with the correct vout index
+        let reveal_inputs = vec![serde_json::json!({
+            "txid": commit_txid.to_string(),
+            "vout": taproot_vout_index
+        })];
+        
+        // Calculate reveal transaction fee
+        let reveal_tx_size = 100; // Estimate ~100 vB for reveal tx
+        let mut reveal_fee = sat_per_vb * reveal_tx_size; // Use same rate as commit
+        
+        // Ensure reveal transaction meets minimum relay fee requirement (122 sats)
+        let min_relay_fee_sats = 122;
+        if reveal_fee < min_relay_fee_sats {
+            tracing::warn!("💰 Reveal fee {} sats below minimum relay fee {} sats, adjusting", reveal_fee, min_relay_fee_sats);
+            let adjusted_sat_per_vb = (min_relay_fee_sats + reveal_tx_size - 1) / reveal_tx_size; // Round up
+            reveal_fee = adjusted_sat_per_vb * reveal_tx_size;
+            tracing::info!("🔧 Adjusted reveal fee rate: {} sat/vB (was {} sat/vB)", adjusted_sat_per_vb, sat_per_vb);
+            tracing::info!("💰 Adjusted reveal fee: {} sats (was {} sats)", reveal_fee, sat_per_vb * reveal_tx_size);
+        }
+        
+        // Calculate output amount (Taproot output - reveal fee)
+        let reveal_amount = taproot_output_amount.saturating_sub(reveal_fee);
         let output_amount = if reveal_amount >= 546 {
             reveal_amount
         } else {
             546
         };
 
+        tracing::info!("🔍 Reveal transaction fee: {} sats ({} sat/vB × {} vB)", reveal_fee, reveal_fee / reveal_tx_size, reveal_tx_size);
+        tracing::info!("🔍 Reveal output amount: {} sats", output_amount);
+
         reveal_outputs.insert(
-            reveal_addr,
+            change_address.clone(),
             serde_json::json!(output_amount as f64 / 100_000_000.0),
         );
 
@@ -254,7 +418,7 @@ impl TaprootDA {
         };
 
         if reveal_outputs.is_empty() {
-            println!("⚠️  Reveal amount below dust threshold, creating zero-fee transaction");
+            tracing::warn!("⚠️  Reveal amount below dust threshold, creating zero-fee transaction");
         }
 
         // Sign the reveal transaction with the internal key
@@ -276,22 +440,22 @@ impl TaprootDA {
 
         match reveal_tx_result {
             Ok(reveal_txid) => {
-                println!(
+                tracing::info!(
                     "✅ Core Lane transaction (commit + reveal in same block) created successfully!"
                 );
-                println!("📍 Commit transaction ID: {}", commit_txid);
-                println!("📍 Reveal transaction ID: {}", reveal_txid);
-                println!("📦 Core Lane data embedded AND revealed in the same block");
-                println!("🎯 Taproot address: {}", taproot_address);
-                println!("💰 Fee paid: {} sats", fee_sats);
-                println!(
+                tracing::info!("📍 Commit transaction ID: {}", commit_txid);
+                tracing::info!("📍 Reveal transaction ID: {}", reveal_txid);
+                tracing::info!("📦 Core Lane data embedded AND revealed in the same block");
+                tracing::info!("🎯 Taproot address: {}", taproot_address);
+                tracing::info!("💰 Commit transaction broadcast successfully");
+                tracing::info!(
                     "\n🔍 Core Lane node will detect the reveal transaction when scanning blocks!"
                 );
 
                 Ok(commit_txid.to_string())
             }
             Err(e) => {
-                println!("❌ Failed to broadcast reveal transaction: {}", e);
+                tracing::error!("❌ Failed to broadcast reveal transaction: {}", e);
                 Err(anyhow!("Failed to broadcast reveal transaction: {}", e))
             }
         }

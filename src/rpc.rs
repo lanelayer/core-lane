@@ -412,26 +412,8 @@ impl RpcServer {
         // Use the shared TaprootDA module with proper Taproot envelope method
         let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
 
-        let fee_estimate: Result<serde_json::Value, _> = bitcoin_client.call(
-            "estimatesmartfee",
-            &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
-        );
-
-        let fee_sats = match fee_estimate {
-            Ok(result) => {
-                if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
-                    let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
-                    let estimated_fee = (fee_per_kb_sats * 2) / 10;
-                    estimated_fee.max(1000)
-                } else {
-                    1000
-                }
-            }
-            Err(_) => 1000,
-        };
-
         taproot_da
-            .send_transaction_to_da(raw_tx_hex, fee_sats, rpc_wallet, network)
+            .send_transaction_to_da(raw_tx_hex, rpc_wallet, network)
             .await
     }
 
@@ -1884,3 +1866,4 @@ pub fn from_str(s: &str) -> Result<Address, String> {
 
 // Re-export for use in main.rs
 pub use from_str as address_from_str;
+
