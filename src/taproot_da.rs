@@ -21,6 +21,84 @@ impl TaprootDA {
         Self { bitcoin_client }
     }
 
+    /// Calculate exact reveal transaction fee based on payload size
+    fn calculate_exact_reveal_fee(
+        &self,
+        envelope_script: &ScriptBuf,
+        control_block: &[u8],
+        sat_per_vb: u64,
+        available_amount: u64,
+    ) -> Result<u64> {
+        // Create a temporary reveal transaction to calculate its exact size
+        let temp_reveal_tx = self.create_temp_reveal_transaction(envelope_script, control_block)?;
+        let temp_reveal_hex = hex::encode(bitcoin::consensus::serialize(&temp_reveal_tx));
+        
+        // Calculate exact transaction size in vB
+        let exact_tx_size_vb = self.calculate_actual_tx_size_vb(&temp_reveal_hex)?;
+        
+        // Calculate fee based on exact size
+        let mut reveal_fee = sat_per_vb * exact_tx_size_vb;
+        
+        // Ensure reveal transaction meets minimum relay fee requirement (122 sats)
+        let min_relay_fee_sats = 122;
+        if reveal_fee < min_relay_fee_sats {
+            tracing::warn!("💰 Reveal fee {} sats below minimum relay fee {} sats, adjusting", reveal_fee, min_relay_fee_sats);
+            let adjusted_sat_per_vb = (min_relay_fee_sats + exact_tx_size_vb - 1) / exact_tx_size_vb; // Round up
+            reveal_fee = adjusted_sat_per_vb * exact_tx_size_vb;
+            tracing::info!("🔧 Adjusted reveal fee rate: {} sat/vB (was {} sat/vB)", adjusted_sat_per_vb, sat_per_vb);
+            tracing::info!("💰 Adjusted reveal fee: {} sats (was {} sats)", reveal_fee, sat_per_vb * exact_tx_size_vb);
+        }
+        
+        // Cap the fee to the available Taproot output amount
+        if reveal_fee > available_amount {
+            reveal_fee = available_amount;
+            tracing::warn!("💰 Capping reveal fee to available amount: {} sats", reveal_fee);
+        }
+
+        tracing::info!("🔍 Exact reveal transaction fee: {} sats ({} sat/vB × {} vB)", reveal_fee, reveal_fee / exact_tx_size_vb, exact_tx_size_vb);
+        tracing::info!("📏 Exact reveal transaction size: {} vB", exact_tx_size_vb);
+        
+        Ok(reveal_fee)
+    }
+
+    /// Create a temporary reveal transaction for size calculation
+    fn create_temp_reveal_transaction(
+        &self,
+        envelope_script: &ScriptBuf,
+        control_block: &[u8],
+    ) -> Result<Transaction> {
+        // Create OP_RETURN output with Core Lane reveal data
+        let op_return_data = b"CORELANE";
+        let op_return_script = Builder::new()
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_RETURN)
+            .push_slice(op_return_data)
+            .into_script();
+
+        // Create the transaction structure with minimal input
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(), // Use null outpoint
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(), // Will be filled below
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(0), // Zero value for OP_RETURN
+                script_pubkey: op_return_script,
+            }],
+        };
+
+        // Add the witness data (this is what we're measuring)
+        let mut witness = Witness::new();
+        witness.push(&envelope_script.as_bytes());
+        witness.push(control_block);
+        tx.input[0].witness = witness;
+
+        Ok(tx)
+    }
+
     /// Calculate actual transaction size in virtual bytes (vB) from raw transaction hex
     fn calculate_actual_tx_size_vb(&self, raw_tx_hex: &str) -> Result<u64> {
         // Decode the raw transaction hex
@@ -30,25 +108,12 @@ impl TaprootDA {
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
             .map_err(|e| anyhow!("Failed to deserialize transaction: {}", e))?;
         
-        // Calculate vB for Taproot transactions
-        // For Taproot: vB = base_size + witness_size
-        let base_size = tx_bytes.len() as u64;
+        // Use the battle-tested weight calculation from rust-bitcoin (BIP-141 exact)
+        let weight = tx.weight();
+        let vsize = (weight.to_wu() + 3) / 4;
         
-        // Calculate witness size
-        let mut witness_size = 0u64;
-        for input in &tx.input {
-            witness_size += 2; // witness stack length (varint)
-            for witness_item in &input.witness {
-                witness_size += 2; // witness item length (varint)
-                witness_size += witness_item.len() as u64;
-            }
-        }
-        
-        // For Taproot: vB = base_size + witness_size
-        let v_b = base_size + witness_size;
-        
-        tracing::info!("📏 Actual transaction size: {} bytes (base: {}, witness: {})", v_b, base_size, witness_size);
-        Ok(v_b)
+        tracing::info!("📏 Actual transaction size: {} vB (weight: {} WU)", vsize, weight.to_wu());
+        Ok(vsize)
     }
 
     async fn calculate_optimal_fee_rate(&self) -> Result<u64> {
@@ -76,7 +141,7 @@ impl TaprootDA {
         // Get fee rate from estimatesmartfee
         let fee_estimate: Result<serde_json::Value, _> = self.bitcoin_client.call(
             "estimatesmartfee",
-            &[serde_json::json!(12), serde_json::json!("ECONOMICAL")],
+            &[serde_json::json!(6), serde_json::json!("ECONOMICAL")],
         );
 
         let sat_per_vb = match fee_estimate {
@@ -113,7 +178,7 @@ impl TaprootDA {
     pub async fn send_transaction_to_da(
         &self,
         raw_tx_hex: &str,
-        wallet: &str,
+        _wallet: &str,
         network: bitcoin::Network,
     ) -> Result<String> {
         tracing::info!("🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)...");
@@ -138,7 +203,6 @@ impl TaprootDA {
         );
         tracing::debug!("   📝 Decoded bytes: {}", hex::encode(&tx_bytes));
 
-        // Create Core Lane payload: CORE_LANE prefix + Ethereum transaction
         let mut payload = Vec::new();
         payload.extend_from_slice(b"CORE_LANE");
         payload.extend_from_slice(&tx_bytes);
@@ -158,24 +222,22 @@ impl TaprootDA {
         tracing::info!("🎯 Created Taproot address: {}", taproot_address);
         tracing::debug!("🔑 Internal key: {}", internal_key);
 
-        // Calculate the Taproot output amount needed for the reveal transaction
-        // We need to estimate the reveal transaction fee first
-        let reveal_tx_size = 100; // Estimate ~100 vB for reveal tx
-        let mut reveal_fee = sat_per_vb * reveal_tx_size;
+        // Calculate exact Taproot output amount needed for the reveal transaction
+        let exact_reveal_fee = self.calculate_exact_reveal_fee(
+            &envelope_script,
+            &control_block,
+            sat_per_vb,
+            u64::MAX, // No limit for calculation
+        )?;
         
-        // Ensure reveal transaction meets minimum relay fee requirement
-        let min_relay_fee_sats = 122;
-        if reveal_fee < min_relay_fee_sats {
-            let adjusted_sat_per_vb = (min_relay_fee_sats + reveal_tx_size - 1) / reveal_tx_size;
-            reveal_fee = adjusted_sat_per_vb * reveal_tx_size;
-        }
-        
-        // Calculate minimum Taproot output needed (reveal fee + dust threshold)
-        let dust_threshold = 546; // Bitcoin dust threshold
-        let min_taproot_output = reveal_fee + dust_threshold;
+        // Ensure Taproot output meets minimum requirements
+        // Bitcoin dust threshold for Taproot outputs is 330 sats
+        let dust_threshold = 330;
+        // Use the exact reveal fee, but ensure it meets dust threshold
+        let min_taproot_output = exact_reveal_fee.max(dust_threshold);
         let taproot_output_btc = min_taproot_output as f64 / 100_000_000.0; // Convert to BTC
         
-        tracing::info!("🔍 Calculated Taproot output: {} sats ({} BTC) for reveal tx needs", min_taproot_output, taproot_output_btc);
+        tracing::info!("🔍 Calculated exact Taproot output: {} sats ({} BTC) for reveal tx needs (dust threshold: {} sats)", min_taproot_output, taproot_output_btc, dust_threshold);
         
         // Create outputs with the Taproot address
         // Use modern PSBT approach instead of createrawtransaction + fundrawtransaction
@@ -204,7 +266,7 @@ impl TaprootDA {
             &[],
         );
 
-        let total_balance = match balance_result {
+        let _total_balance = match balance_result {
             Ok(balance) => {
                 let btc_balance = balance.as_f64().unwrap();
                 let sats_balance = (btc_balance * 100_000_000.0) as u64;
@@ -302,24 +364,7 @@ impl TaprootDA {
         };
 
         // No need to sign - walletprocesspsbt already signed the transaction
-        let signed_tx = funded_tx;
-
-        // Broadcast the commit transaction
-        let commit_tx_result: Result<bitcoin::Txid, _> = self
-            .bitcoin_client
-            .call("sendrawtransaction", &[serde_json::json!(signed_tx)]);
-
-        let commit_txid = match commit_tx_result {
-            Ok(txid) => {
-                tracing::info!("✅ Commit transaction broadcast: {}", txid);
-                tracing::info!("📦 Core Lane data embedded in Taproot envelope");
-                txid
-            }
-            Err(e) => {
-                tracing::error!("❌ Failed to broadcast commit transaction: {}", e);
-                return Err(anyhow!("Failed to broadcast commit transaction: {}", e));
-            }
-        };
+        let commit_tx_hex = funded_tx;
 
         // Now immediately create a reveal transaction that spends the Taproot output
         tracing::info!("🔍 Creating reveal transaction to immediately expose Core Lane data...");
@@ -333,33 +378,21 @@ impl TaprootDA {
         // Create reveal transaction outputs
         let mut reveal_outputs = serde_json::Map::new();
         
-        // Get the Taproot output amount from the commit transaction
-        let commit_tx_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "getrawtransaction",
-            &[serde_json::json!(commit_txid.to_string()), serde_json::json!(true)],
-        );
-        
-        let commit_tx = match commit_tx_result {
-            Ok(tx) => {
-                tracing::info!("🔍 Commit transaction structure: {}", serde_json::to_string_pretty(&tx).unwrap_or_default());
-                tx
-            }
-            Err(e) => return Err(anyhow!("Failed to get commit transaction: {}", e)),
-        };
+        // Get the Taproot output amount from the commit transaction (parse it directly)
+        let commit_tx_bytes = hex::decode(&commit_tx_hex)?;
+        let commit_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&commit_tx_bytes)?;
         
         // Find the Taproot output (it should be the one going to our Taproot address)
         let mut taproot_output_amount = 0u64;
         let mut taproot_vout_index = 0;
-        for (vout_index, vout) in commit_tx["vout"].as_array().unwrap().iter().enumerate() {
-            // Check if this output has an address and if it matches our Taproot address
-            if let Some(address) = vout["scriptPubKey"]["address"].as_str() {
-                if address == taproot_address.to_string() {
-                    taproot_output_amount = (vout["value"].as_f64().unwrap() * 100_000_000.0) as u64;
+        for (vout_index, vout) in commit_tx.output.iter().enumerate() {
+            // Check if this output matches our Taproot address
+            if vout.script_pubkey == taproot_address.script_pubkey() {
+                taproot_output_amount = vout.value.to_sat();
                     taproot_vout_index = vout_index;
                     tracing::info!("🔍 Found Taproot output at vout {}: {} sats", vout_index, taproot_output_amount);
                     tracing::info!("📊 Total input value for reveal transaction: {} sats (from Taproot output)", taproot_output_amount);
                     break;
-                }
             }
         }
         
@@ -367,40 +400,36 @@ impl TaprootDA {
             return Err(anyhow!("Could not find Taproot output in commit transaction"));
         }
         
+        // Get the commit transaction ID from the transaction hash
+        let commit_txid = commit_tx.compute_txid();
+        
         // Update the reveal inputs with the correct vout index
         let reveal_inputs = vec![serde_json::json!({
             "txid": commit_txid.to_string(),
             "vout": taproot_vout_index
         })];
         
-        // Calculate reveal transaction fee
-        let reveal_tx_size = 100; // Estimate ~100 vB for reveal tx
-        let mut reveal_fee = sat_per_vb * reveal_tx_size; // Use same rate as commit
+        // Calculate exact reveal transaction fee based on payload size (capped to available amount)
+        let exact_reveal_fee = self.calculate_exact_reveal_fee(
+            &envelope_script,
+            &control_block,
+            sat_per_vb,
+            taproot_output_amount,
+        )?;
         
-        // Ensure reveal transaction meets minimum relay fee requirement (122 sats)
-        let min_relay_fee_sats = 122;
-        if reveal_fee < min_relay_fee_sats {
-            tracing::warn!("💰 Reveal fee {} sats below minimum relay fee {} sats, adjusting", reveal_fee, min_relay_fee_sats);
-            let adjusted_sat_per_vb = (min_relay_fee_sats + reveal_tx_size - 1) / reveal_tx_size; // Round up
-            reveal_fee = adjusted_sat_per_vb * reveal_tx_size;
-            tracing::info!("🔧 Adjusted reveal fee rate: {} sat/vB (was {} sat/vB)", adjusted_sat_per_vb, sat_per_vb);
-            tracing::info!("💰 Adjusted reveal fee: {} sats (was {} sats)", reveal_fee, sat_per_vb * reveal_tx_size);
-        }
-        
-        // Calculate output amount (Taproot output - reveal fee)
-        let reveal_amount = taproot_output_amount.saturating_sub(reveal_fee);
-        let output_amount = if reveal_amount >= 546 {
-            reveal_amount
-        } else {
-            546
-        };
+        // Use the exact fee calculated, not the entire Taproot output amount
+        // This ensures we don't overpay fees
+        tracing::info!("🔍 Using exact reveal fee: {} sats (Taproot output: {} sats)", exact_reveal_fee, taproot_output_amount);
 
-        tracing::info!("🔍 Reveal transaction fee: {} sats ({} sat/vB × {} vB)", reveal_fee, reveal_fee / reveal_tx_size, reveal_tx_size);
-        tracing::info!("🔍 Reveal output amount: {} sats", output_amount);
+        tracing::info!("🔍 Using OP_RETURN output with zero value");
 
+        // Create OP_RETURN output with zero value
+        // For Bitcoin Core RPC, we need to use "data" as the key for OP_RETURN outputs
+        // Add meaningful data to meet minimum transaction size requirements
+        let op_return_data = hex::encode(b"CORELANE");
         reveal_outputs.insert(
-            change_address.clone(),
-            serde_json::json!(output_amount as f64 / 100_000_000.0),
+            "data".to_string(),
+            serde_json::json!(op_return_data), // Core Lane reveal data
         );
 
         // Create raw reveal transaction
@@ -418,7 +447,7 @@ impl TaprootDA {
         };
 
         if reveal_outputs.is_empty() {
-            tracing::warn!("⚠️  Reveal amount below dust threshold, creating zero-fee transaction");
+            tracing::warn!("⚠️  No reveal outputs created");
         }
 
         // Sign the reveal transaction with the internal key
@@ -433,21 +462,43 @@ impl TaprootDA {
 
         let reveal_final_hex = hex::encode(bitcoin::consensus::serialize(&reveal_tx));
 
-        // Broadcast the reveal transaction
-        let reveal_tx_result: Result<bitcoin::Txid, _> = self
+        // Submit both transactions as a package using submitpackage
+        let package_txs = vec![
+            serde_json::json!(commit_tx_hex),
+            serde_json::json!(reveal_final_hex)
+        ];
+        
+        tracing::info!("📦 Submitting commit + reveal transactions as package...");
+        let package_result: Result<serde_json::Value, _> = self
             .bitcoin_client
-            .call("sendrawtransaction", &[serde_json::json!(reveal_final_hex)]);
+            .call("submitpackage", &[serde_json::json!(package_txs)]);
 
-        match reveal_tx_result {
-            Ok(reveal_txid) => {
+        match package_result {
+            Ok(result) => {
+                tracing::info!("🔍 Package result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+                
+                // Extract transaction IDs from the package result
+                let tx_results = result["tx-results"].as_object()
+                    .ok_or_else(|| anyhow!("Package result missing 'tx-results' object"))?;
+                
+                if tx_results.len() < 2 {
+                    return Err(anyhow!("Package result has insufficient transactions: {}", tx_results.len()));
+                }
+                
+                // Get the transaction IDs from the tx-results object keys
+                let mut tx_ids: Vec<&str> = tx_results.keys().map(|k| k.as_str()).collect();
+                tx_ids.sort(); // Sort for consistent ordering
+                
+                let commit_txid = tx_ids[0];
+                let reveal_txid = tx_ids[1];
+                
                 tracing::info!(
-                    "✅ Core Lane transaction (commit + reveal in same block) created successfully!"
+                    "✅ Core Lane transaction package submitted successfully!"
                 );
                 tracing::info!("📍 Commit transaction ID: {}", commit_txid);
                 tracing::info!("📍 Reveal transaction ID: {}", reveal_txid);
-                tracing::info!("📦 Core Lane data embedded AND revealed in the same block");
+                tracing::info!("📦 Core Lane data embedded AND revealed atomically in the same block");
                 tracing::info!("🎯 Taproot address: {}", taproot_address);
-                tracing::info!("💰 Commit transaction broadcast successfully");
                 tracing::info!(
                     "\n🔍 Core Lane node will detect the reveal transaction when scanning blocks!"
                 );
@@ -455,8 +506,8 @@ impl TaprootDA {
                 Ok(commit_txid.to_string())
             }
             Err(e) => {
-                tracing::error!("❌ Failed to broadcast reveal transaction: {}", e);
-                Err(anyhow!("Failed to broadcast reveal transaction: {}", e))
+                tracing::error!("❌ Failed to submit transaction package: {}", e);
+                Err(anyhow!("Failed to submit transaction package: {}", e))
             }
         }
     }

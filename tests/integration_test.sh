@@ -224,7 +224,7 @@ test_send_ethereum_transaction() {
         --rpc-wallet "mine" \
         --rpc-password $RPC_PASSWORD 2>&1)
     
-    if echo "$send_output" | grep -q "✅ Core Lane transaction.*created successfully"; then
+    if echo "$send_output" | grep -q "✅ Core Lane transaction package submitted successfully"; then
         # Extract transaction IDs
         local commit_txid=$(echo "$send_output" | grep "📍 Commit transaction ID:" | grep -o '[a-f0-9]\{64\}')
         local reveal_txid=$(echo "$send_output" | grep "📍 Reveal transaction ID:" | grep -o '[a-f0-9]\{64\}')
