@@ -380,6 +380,84 @@ fn execute_transfer(
         }
 
         match decode_intent_calldata(&input) {
+            Some(IntentCall::StoreBlob { data, .. }) => {
+                let blob_hash = keccak256(&data);
+                if state.stored_blobs.contains(&blob_hash) {
+                    return Ok(ExecutionResult {
+                        success: true,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec![format!("Blob already stored: blob_hash = {}", blob_hash)],
+                        error: None,
+                    });
+                }
+                state.stored_blobs.insert(blob_hash);
+                let _ = state.account_manager.increment_nonce(sender);
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec![format!("Blob stored: blob_hash = {}", blob_hash)],
+                    error: None,
+                });
+            }
+            Some(IntentCall::IntentFromBlob {
+                blob_hash,
+                extra_data,
+                ..
+            }) => {
+                if !state.stored_blobs.contains(&blob_hash) {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["intentFromBlob: blob not stored".to_string()],
+                        error: Some("Blob not stored".to_string()),
+                    });
+                }
+
+                if state.account_manager.get_balance(sender) < value {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Insufficient balance for intent lock".to_string()],
+                        error: Some("Insufficient balance".to_string()),
+                    });
+                }
+
+                let mut preimage = Vec::new();
+                preimage.extend_from_slice(blob_hash.as_slice());
+                preimage.extend_from_slice(&extra_data);
+
+                state.account_manager.sub_balance(sender, value)?;
+                state.account_manager.increment_nonce(sender)?;
+                let value_u64: u64 = value.try_into().unwrap();
+                let intent_id = calculate_intent_id(sender, nonce, Bytes::from(preimage));
+                state.intents.insert(
+                    intent_id,
+                    Intent {
+                        data: Bytes::from(extra_data),
+                        value: value_u64,
+                        status: IntentStatus::Submitted,
+                    },
+                );
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec![format!(
+                        "Intent from blob submitted: intent_id = {}",
+                        intent_id
+                    )],
+                    error: None,
+                });
+            }
             Some(IntentCall::Intent { intent_data, .. }) => {
                 // Explicit intent submission via ABI: use the intent payload for ID
                 if state.account_manager.get_balance(sender) < value {

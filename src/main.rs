@@ -121,6 +121,8 @@ struct TransactionReceipt {
     logs: Vec<String>,
     status: String,
     effective_gas_price: String,
+    tx_type: String,
+    logs_bloom: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1178,6 +1180,14 @@ impl CoreLaneNode {
                     logs: Vec::new(),
                     status: "0x1".to_string(), // Success
                     effective_gas_price: "0x3b9aca00".to_string(), // 1 gwei
+                    tx_type: match &tx {
+                        TxEnvelope::Legacy(_) => "0x0".to_string(),
+                        TxEnvelope::Eip2930(_) => "0x1".to_string(),
+                        TxEnvelope::Eip1559(_) => "0x2".to_string(),
+                        TxEnvelope::Eip4844(_) => "0x3".to_string(),
+                        _ => "0x0".to_string(),
+                    },
+                    logs_bloom: format!("0x{}", hex::encode(vec![0u8; 256])),
                 };
 
                 // Print account balances after execution

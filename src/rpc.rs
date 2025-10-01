@@ -479,6 +479,7 @@ impl RpcServer {
                             "gas".to_string(),
                             json!(format!("0x{:x}", tx.tx().gas_limit)),
                         );
+                        result.insert("type".to_string(), json!("0x0"));
 
                         // Handle 'to' field - it's a TxKind enum
                         let to_address = match tx.tx().to {
@@ -711,6 +712,8 @@ impl RpcServer {
                 "blockNumber".to_string(),
                 json!(format!("0x{:x}", receipt.block_number)),
             );
+            result.insert("type".to_string(), json!(receipt.tx_type));
+
             if let Some(block) = state.blocks.get(&receipt.block_number) {
                 let block_hash = block.hash;
                 result.insert(
@@ -744,6 +747,7 @@ impl RpcServer {
                 json!(receipt.contract_address),
             );
             result.insert("logs".to_string(), json!(receipt.logs));
+            result.insert("logsBloom".to_string(), json!(receipt.logs_bloom));
             result.insert("status".to_string(), json!(receipt.status));
             result.insert(
                 "effectiveGasPrice".to_string(),
