@@ -1,13 +1,12 @@
-use crate::transaction::{decode_intent_calldata, IntentCall};
+use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
 use crate::CoreLaneState;
-use crate::IntentStatus;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, U256};
 use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
-use bitcoincore_rpc::{RpcApi};
+use bitcoincore_rpc::RpcApi;
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -80,7 +79,12 @@ impl RpcServer {
         }
     }
 
-    pub fn with_bitcoin_client(state: Arc<Mutex<CoreLaneState>>, bitcoin_client: Arc<bitcoincore_rpc::Client>, network: bitcoin::Network, wallet: String) -> Self {
+    pub fn with_bitcoin_client(
+        state: Arc<Mutex<CoreLaneState>>,
+        bitcoin_client: Arc<bitcoincore_rpc::Client>,
+        network: bitcoin::Network,
+        wallet: String,
+    ) -> Self {
         Self {
             state,
             bitcoin_client: Some(bitcoin_client),
@@ -372,7 +376,14 @@ impl RpcServer {
         };
 
         // Send transaction to Bitcoin DA
-        match Self::send_to_bitcoin_da(raw_tx_hex, bitcoin_client, server.network.unwrap(), &server.wallet.clone().unwrap()).await {
+        match Self::send_to_bitcoin_da(
+            raw_tx_hex,
+            bitcoin_client,
+            server.network.unwrap(),
+            &server.wallet.clone().unwrap(),
+        )
+        .await
+        {
             Ok(bitcoin_txid) => {
                 // Calculate the Core Lane transaction hash for the response
                 use alloy_primitives::keccak256;
@@ -407,7 +418,7 @@ impl RpcServer {
         raw_tx_hex: &str,
         bitcoin_client: &Arc<bitcoincore_rpc::Client>,
         network: bitcoin::Network,
-        rpc_wallet: &str
+        rpc_wallet: &str,
     ) -> Result<String, anyhow::Error> {
         // Use the shared TaprootDA module with proper Taproot envelope method
         let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
@@ -1816,7 +1827,7 @@ impl RpcServer {
                 let state_guard = state.state.lock().await;
                 let mut buf = [0u8; 32];
                 if let Some(intent) = state_guard.intents.get(&intent_id) {
-                    if let crate::IntentStatus::Locked(addr) = intent.status {
+                    if let IntentStatus::Locked(addr) = intent.status {
                         let addr_bytes = addr.as_slice();
                         buf[12..].copy_from_slice(addr_bytes);
                     }
@@ -1866,4 +1877,3 @@ pub fn from_str(s: &str) -> Result<Address, String> {
 
 // Re-export for use in main.rs
 pub use from_str as address_from_str;
-

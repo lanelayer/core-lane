@@ -20,6 +20,7 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod account;
+mod intents;
 mod rpc;
 mod taproot_da;
 mod transaction;
@@ -31,11 +32,11 @@ use account::AccountManager;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
+use intents::{create_anchor_bitcoin_fill_intent, decode_intent_calldata, Intent};
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::{
-    create_anchor_bitcoin_fill_intent, decode_intent_calldata, execute_transaction,
-    get_transaction_input_bytes, recover_sender, validate_transaction,
+    execute_transaction, get_transaction_input_bytes, recover_sender, validate_transaction,
 };
 
 #[derive(Parser)]
@@ -127,20 +128,6 @@ struct StoredTransaction {
     envelope: TxEnvelope,
     raw_data: Vec<u8>, // Raw transaction data for hash calculation
     block_number: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IntentStatus {
-    Submitted,
-    Locked(Address),
-    Solved,
-}
-
-#[derive(Debug, Clone)]
-struct Intent {
-    data: Bytes,
-    value: u64,
-    status: IntentStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -802,7 +789,6 @@ impl CoreLaneNode {
         Some(data)
     }
 
-
     /// Extract burn payload from Bitcoin transaction (BRN1 format)
     fn extract_burn_payload_from_tx(&self, tx: &Transaction) -> Option<(Vec<u8>, u64)> {
         // Look for hybrid P2WSH + OP_RETURN burn pattern
@@ -1351,8 +1337,7 @@ impl CoreLaneNode {
         let script_hash = sha256::Hash::hash(burn_script.as_bytes());
         let wscript_hash =
             bitcoin::blockdata::script::WScriptHash::from_slice(&script_hash.to_byte_array())?;
-        let p2wsh_address =
-            bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), network);
+        let p2wsh_address = bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), network);
 
         info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
         debug!("📝 Burn script: {}", burn_script);
@@ -1386,8 +1371,8 @@ impl CoreLaneNode {
 
             if let Ok(change_addr) = change_addr_result {
                 let change_addr_str = change_addr.as_str().unwrap();
-                let change_address = bitcoin::Address::from_str(change_addr_str)?
-                    .require_network(network)?;
+                let change_address =
+                    bitcoin::Address::from_str(change_addr_str)?.require_network(network)?;
                 tx_outputs.push(TxOut {
                     value: Amount::from_sat(change_amount),
                     script_pubkey: change_address.script_pubkey(),
@@ -1517,16 +1502,22 @@ async fn main() -> Result<()> {
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
                 }
             } else {
-                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+                return Err(anyhow::anyhow!(
+                    "No 'chain' field found in getblockchaininfo response"
+                ));
             };
             let node = CoreLaneNode::new(client);
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
-            let rpc_server =
-                RpcServer::with_bitcoin_client(shared_state, node.bitcoin_client.clone(), network, wallet);
+            let rpc_server = RpcServer::with_bitcoin_client(
+                shared_state,
+                node.bitcoin_client.clone(),
+                network,
+                wallet,
+            );
 
-                let app = rpc_server.router();
+            let app = rpc_server.router();
 
             let addr = format!("{}:{}", http_host, http_port);
             info!("🚀 Starting JSON-RPC server on http://{}", addr);
@@ -1574,7 +1565,9 @@ async fn main() -> Result<()> {
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
                 }
             } else {
-                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+                return Err(anyhow::anyhow!(
+                    "No 'chain' field found in getblockchaininfo response"
+                ));
             };
             let node = CoreLaneNode::new(client);
             node.create_burn_transaction_from_wallet(
@@ -1612,7 +1605,9 @@ async fn main() -> Result<()> {
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
                 }
             } else {
-                return Err(anyhow::anyhow!("No 'chain' field found in getblockchaininfo response"));
+                return Err(anyhow::anyhow!(
+                    "No 'chain' field found in getblockchaininfo response"
+                ));
             };
 
             let node = CoreLaneNode::new(client);
