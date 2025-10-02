@@ -6,7 +6,6 @@ use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
-use bitcoincore_rpc::RpcApi;
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

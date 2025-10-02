@@ -403,6 +403,17 @@ fn execute_transfer(
                     error: None,
                 });
             }
+            Some(IntentCall::StoreBlobHash { blob_hash }) => {
+                state.stored_blobs.insert(blob_hash);
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec![format!("Blob hash stored: blob_hash = {}", blob_hash)],
+                    error: None,
+                });
+            }
             Some(IntentCall::IntentFromBlob {
                 blob_hash,
                 extra_data,

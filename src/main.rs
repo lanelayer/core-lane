@@ -1,4 +1,3 @@
-use alloy_primitives::Bytes;
 use anyhow::{anyhow, Result};
 use bitcoin::{
     blockdata::opcodes::all::{OP_ENDIF, OP_IF, OP_RETURN},

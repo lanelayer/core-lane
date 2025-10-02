@@ -9,6 +9,8 @@ sol! {
     #[allow(missing_docs)]
     interface IntentSystem {
         function storeBlob(bytes data, uint256 expiryTime) payable;
+
+        function storeBlobHash(bytes32 blobHash) payable;
         function prolongBlob(bytes32 blobHash) payable;
         function blobStored(bytes32 blobHash) view returns (bool);
         function intent(bytes intentData, uint256 nonce) payable returns (bytes32 intentId);
@@ -140,6 +142,9 @@ pub enum IntentCall {
         data: Vec<u8>,
         expiry_time: U256,
     },
+    StoreBlobHash {
+        blob_hash: B256,
+    },
     ProlongBlob {
         blob_hash: B256,
     },
@@ -201,6 +206,14 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
             Some(IntentCall::StoreBlob {
                 data: call.data.to_vec(),
                 expiry_time: call.expiryTime,
+            })
+        }
+        IntentSystem::storeBlobHashCall::SELECTOR => {
+            let Ok(call) = IntentSystem::storeBlobHashCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::StoreBlobHash {
+                blob_hash: B256::from_slice(call.blobHash.as_slice()),
             })
         }
         IntentSystem::prolongBlobCall::SELECTOR => {
