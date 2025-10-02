@@ -20,6 +20,7 @@ sol! {
         function isIntentSolved(bytes32 intentId) view returns (bool);
         function intentLocker(bytes32 intentId) view returns (address);
         function valueStoredInIntent(bytes32 intentId) view returns (uint256);
+        function intentCommandType(bytes32 intentId) view returns (uint8);
     }
 }
 
@@ -180,6 +181,9 @@ pub enum IntentCall {
     ValueStoredInIntent {
         intent_id: B256,
     },
+    IntentCommandType {
+        intent_id: B256,
+    },
 }
 
 fn extract_selector(calldata: &[u8]) -> Option<[u8; 4]> {
@@ -298,6 +302,14 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
                 intent_id: B256::from_slice(call.intentId.as_slice()),
             })
         }
+        IntentSystem::intentCommandTypeCall::SELECTOR => {
+            let Ok(call) = IntentSystem::intentCommandTypeCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::IntentCommandType {
+                intent_id: B256::from_slice(call.intentId.as_slice()),
+            })
+        }
         _ => None,
     }
 }
@@ -307,6 +319,17 @@ pub enum IntentStatus {
     Submitted,
     Locked(Address),
     Solved,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum IntentCommandType {
+    Created = 1,
+    CancelIntent = 2,
+    LockIntentForSolving = 3,
+    SolveIntent = 4,
+    CancelIntentLock = 5,
 }
 
 #[derive(Debug, Clone)]
@@ -314,4 +337,6 @@ pub struct Intent {
     pub data: Bytes,
     pub value: u64,
     pub status: IntentStatus,
+    pub last_command: IntentCommandType,
+    pub creator: Address,
 }

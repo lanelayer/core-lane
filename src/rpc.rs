@@ -1,4 +1,4 @@
-use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
+use crate::intents::{decode_intent_calldata, IntentCall, IntentCommandType, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, U256};
@@ -1836,6 +1836,24 @@ impl RpcServer {
                         buf[12..].copy_from_slice(addr_bytes);
                     }
                 }
+                ret_bytes.extend_from_slice(&buf);
+            }
+            Some(IntentCall::IntentCommandType { intent_id }) => {
+                info!("IntentCommandType: intent_id = {}", intent_id);
+                let state_guard = state.state.lock().await;
+                let command: u8 = state_guard
+                    .intents
+                    .get(&intent_id)
+                    .map(|i| match i.last_command {
+                        IntentCommandType::Created => 1u8,
+                        IntentCommandType::CancelIntent => 2u8,
+                        IntentCommandType::LockIntentForSolving => 3u8,
+                        IntentCommandType::SolveIntent => 4u8,
+                        IntentCommandType::CancelIntentLock => 5u8,
+                    })
+                    .unwrap_or(0u8);
+                let mut buf = [0u8; 32];
+                buf[31] = command;
                 ret_bytes.extend_from_slice(&buf);
             }
             _ => {
