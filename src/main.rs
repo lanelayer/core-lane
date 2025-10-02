@@ -1,4 +1,3 @@
-use alloy_primitives::Bytes;
 use anyhow::{anyhow, Result};
 use bitcoin::{
     blockdata::opcodes::all::{OP_ENDIF, OP_IF, OP_RETURN},
@@ -23,6 +22,7 @@ mod account;
 mod bitcoin_block;
 mod bitcoin_cache_rpc;
 mod block;
+mod cmio;
 mod intents;
 mod rpc;
 mod taproot_da;
@@ -34,14 +34,27 @@ mod tests;
 use account::AccountManager;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
-use alloy_rlp::Decodable;
 use bitcoin_cache_rpc::BitcoinCacheRpcServer;
+use cmio::CmioMessage;
 use intents::{create_anchor_bitcoin_fill_intent, Intent};
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
 use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
+
+fn parse_b256(hex_input: &str) -> Option<B256> {
+    let raw = hex_input.trim_start_matches("0x");
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    if hex::decode_to_slice(raw, &mut buf).is_ok() {
+        Some(B256::from_slice(&buf))
+    } else {
+        None
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "core-lane-node")]
@@ -270,6 +283,10 @@ impl CoreLaneBlock {
             "timestamp": format!("0x{:x}", self.timestamp),
             "gasUsed": format!("0x{:x}", self.gas_used),
             "gasLimit": format!("0x{:x}", self.gas_limit),
+            "baseFeePerGas": match self.base_fee_per_gas {
+                Some(fee) => serde_json::Value::String(format!("0x{:x}", fee)),
+                None => serde_json::Value::Null,
+            },
             "difficulty": format!("0x{:x}", self.difficulty),
             "totalDifficulty": format!("0x{:x}", self.total_difficulty),
             "extraData": format!("0x{}", hex::encode(&self.extra_data)),
@@ -307,7 +324,7 @@ struct CoreLaneState {
     intents: HashMap<B256, Intent>,
     bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
     bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
-    stored_blobs: HashSet<B256>,
+    stored_blobs: HashMap<B256, Vec<u8>>,
 }
 
 impl CoreLaneState {
@@ -317,6 +334,114 @@ impl CoreLaneState {
 
     pub fn bitcoin_client_write(&self) -> Arc<Client> {
         self.bitcoin_client_write.clone()
+    }
+
+    pub fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage> {
+        match message {
+            CmioMessage::QueryCommandType { intent_id } => {
+                let intent_id_b256 = match parse_b256(&intent_id) {
+                    Some(id) => id,
+                    None => {
+                        warn!(
+                            "Invalid intent_id for QueryCommandType (expect 32-byte hex): {:?}",
+                            intent_id
+                        );
+                        return None;
+                    }
+                };
+                self.intents
+                    .get(&intent_id_b256)
+                    .map(|intent| CmioMessage::CommandTypeResponse {
+                        command_type: intent.last_command,
+                        success: true,
+                    })
+            }
+            CmioMessage::ReadIntentData { intent_id } => {
+                let intent_id_b256 = match parse_b256(&intent_id) {
+                    Some(id) => id,
+                    None => {
+                        warn!(
+                            "Invalid intent_id for ReadIntentData (expect 32-byte hex): {:?}",
+                            intent_id
+                        );
+                        return Some(CmioMessage::IntentDataResponse {
+                            data_hex: "0x".to_string(),
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(intent) = self.intents.get(&intent_id_b256) {
+                    Some(CmioMessage::IntentDataResponse {
+                        data_hex: format!("0x{}", hex::encode(&intent.data)),
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::IntentDataResponse {
+                        data_hex: "0x".to_string(),
+                        success: false,
+                    })
+                }
+            }
+            CmioMessage::ReadBlobInfo { blob_hash_hex } => {
+                let blob_hash = match parse_b256(&blob_hash_hex) {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            "Invalid blob_hash_hex for ReadBlobInfo (expect 32-byte hex): {:?}",
+                            blob_hash_hex
+                        );
+                        return Some(CmioMessage::BlobInfoResponse {
+                            length: 0,
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(data) = self.stored_blobs.get(&blob_hash) {
+                    Some(CmioMessage::BlobInfoResponse {
+                        length: data.len() as u64,
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::BlobInfoResponse {
+                        length: 0,
+                        success: false,
+                    })
+                }
+            }
+
+            CmioMessage::ReadBlob { blob_hash_hex } => {
+                let blob_hash = match parse_b256(&blob_hash_hex) {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            "Invalid blob_hash_hex for ReadBlob (expect 32-byte hex): {:?}",
+                            blob_hash_hex
+                        );
+                        return Some(CmioMessage::BlobResponse {
+                            data_hex: "0x".to_string(),
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(data) = self.stored_blobs.get(&blob_hash) {
+                    Some(CmioMessage::BlobResponse {
+                        data_hex: format!("0x{}", hex::encode(data)),
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::BlobResponse {
+                        data_hex: "0x".to_string(),
+                        success: false,
+                    })
+                }
+            }
+            CmioMessage::Log { message } => {
+                tracing::info!(target = "cmio", "CM LOG: {}", message);
+                None
+            }
+            CmioMessage::Exit { .. } => None,
+            _ => None,
+        }
     }
 }
 
@@ -352,7 +477,7 @@ impl CoreLaneNode {
             intents: HashMap::new(),
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
-            stored_blobs: HashSet::new(),
+            stored_blobs: HashMap::new(),
         }));
 
         Self {
@@ -379,6 +504,11 @@ impl CoreLaneNode {
             state.genesis_block.hash
         };
 
+        let anchor_block_timestamp = if let Some(ref block_origin) = block_origin {
+            block_origin.anchor_block_timestamp
+        } else {
+            0
+        };
         let anchor_block_timestamp = if let Some(ref block_origin) = block_origin {
             block_origin.anchor_block_timestamp
         } else {
@@ -562,18 +692,15 @@ impl CoreLaneNode {
             // Conversion rate: 1 sat = 10¹⁰ wei
             // Gas cost for comparable tx: 21,000 gas = 150 bytes
             //
-            if tx.0.is_eip1559() {
-                if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
-                    warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
-                    return None;
-                }
-            } else if tx.0.is_legacy() {
-                if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
-                    warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
-                    return None;
-                }
-            } else {
-                warn!("      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}", tx.0);
+            if !tx.0.is_eip1559() {
+                warn!(
+                    "      ⚠️  Non-EIP 1559 transactions are not supported, skipping: {:?}",
+                    tx.0
+                );
+                return None;
+            }
+            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
+                warn!("      ⚠️  Gas fee is greater than the transaction max fee per gas, skipping: {:?}", tx.0);
                 return None;
             }
             let gas_fee =

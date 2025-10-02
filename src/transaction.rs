@@ -1,15 +1,27 @@
-use crate::intents::{decode_intent_calldata, Intent, IntentCall, IntentData, IntentStatus};
+use crate::cmio::CmioMessage;
+use crate::intents::{
+    decode_intent_calldata, Intent, IntentCall, IntentCommandType, IntentData, IntentStatus,
+};
 use crate::CoreLaneState;
-use alloy_consensus::transaction::SignerRecoverable;
+use anyhow::Result;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
+use cartesi_machine::machine::Machine;
+use cartesi_machine::types::cmio::CmioResponseReason;
+
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::B256;
 use alloy_primitives::{keccak256, Address, Bytes, U256};
-use alloy_rlp::Decodable;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::RpcApi;
+use cartesi_machine::types::cmio::AutomaticReason;
+use cartesi_machine::types::cmio::CmioRequest;
+use cartesi_machine::types::cmio::ManualReason;
+use std::io::Write;
+use std::path::PathBuf;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
 pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
@@ -176,7 +188,7 @@ fn execute_transfer(
         match decode_intent_calldata(&input) {
             Some(IntentCall::StoreBlob { data, .. }) => {
                 let blob_hash = keccak256(&data);
-                if state.stored_blobs.contains(&blob_hash) {
+                if state.stored_blobs.contains_key(&blob_hash) {
                     return Ok(ExecutionResult {
                         success: true,
                         gas_used,
@@ -186,8 +198,9 @@ fn execute_transfer(
                         error: None,
                     });
                 }
-                state.stored_blobs.insert(blob_hash);
+                state.stored_blobs.insert(blob_hash, data.clone());
                 let _ = state.account_manager.increment_nonce(sender);
+                info!("Blob stored: blob_hash = {}", blob_hash);
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -202,7 +215,7 @@ fn execute_transfer(
                 extra_data,
                 ..
             }) => {
-                if !state.stored_blobs.contains(&blob_hash) {
+                if !state.stored_blobs.contains_key(&blob_hash) {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -238,8 +251,11 @@ fn execute_transfer(
                         data: Bytes::from(extra_data),
                         value: value_u64,
                         status: IntentStatus::Submitted,
+                        last_command: IntentCommandType::Created,
+                        creator: sender,
                     },
                 );
+                run_intent_for(state, intent_id)?;
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -275,8 +291,11 @@ fn execute_transfer(
                         data: Bytes::from(intent_data),
                         value: value_u64,
                         status: IntentStatus::Submitted,
+                        last_command: IntentCommandType::Created,
+                        creator: sender,
                     },
                 );
+                run_intent_for(state, intent_id)?;
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -309,7 +328,11 @@ fn execute_transfer(
                     match intent.status {
                         IntentStatus::Submitted => {
                             intent.status = IntentStatus::Locked(sender);
+                            intent.last_command = IntentCommandType::LockIntentForSolving;
                             let _ = state.account_manager.increment_nonce(sender);
+
+                            run_intent_for(state, intent_id)?;
+
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
@@ -337,6 +360,16 @@ fn execute_transfer(
                                 output: Bytes::new(),
                                 logs: vec!["lockIntentForSolving: already solved".to_string()],
                                 error: Some("Already solved".to_string()),
+                            });
+                        }
+                        IntentStatus::Cancelled => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["lockIntentForSolving: cancelled".to_string()],
+                                error: Some("Cancelled".to_string()),
                             });
                         }
                     }
@@ -385,7 +418,11 @@ fn execute_transfer(
                                 .account_manager
                                 .add_balance(sender, U256::from(intent.value))?;
                             intent.status = IntentStatus::Solved;
+                            intent.last_command = IntentCommandType::SolveIntent;
                             let _ = state.account_manager.increment_nonce(sender);
+
+                            let _ = run_intent_for(state, intent_id)?;
+
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
@@ -425,6 +462,108 @@ fn execute_transfer(
                         });
                     }
                 }
+            }
+            Some(IntentCall::CancelIntent { intent_id, .. }) => {
+                if let Some(intent) = state.intents.get_mut(&intent_id) {
+                    // Only the creator can cancel an intent that is not solved
+                    if matches!(intent.status, IntentStatus::Solved) {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["cancelIntent: already solved".to_string()],
+                            error: Some("Already solved".to_string()),
+                        });
+                    }
+                    if intent.creator != sender {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["cancelIntent: not creator".to_string()],
+                            error: Some("Not creator".to_string()),
+                        });
+                    }
+                    // Passed checks; update in place
+                    intent.status = IntentStatus::Cancelled;
+                    intent.last_command = IntentCommandType::CancelIntent;
+                    state
+                        .account_manager
+                        .add_balance(sender, U256::from(intent.value))?;
+                    state.account_manager.increment_nonce(sender)?;
+
+                    run_intent_for(state, intent_id)?;
+
+                    return Ok(ExecutionResult {
+                        success: true,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Intent canceled".to_string()],
+                        error: None,
+                    });
+                } else {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["cancelIntent: intent not found".to_string()],
+                        error: Some("Intent not found".to_string()),
+                    });
+                }
+            }
+            Some(IntentCall::CancelIntentLock { intent_id, .. }) => {
+                if let Some(intent) = state.intents.get_mut(&intent_id) {
+                    match intent.status {
+                        IntentStatus::Locked(locker) => {
+                            if locker != sender {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec!["cancelIntentLock: not current locker".to_string()],
+                                    error: Some("Not locker".to_string()),
+                                });
+                            }
+                            intent.status = IntentStatus::Submitted;
+                            intent.last_command = IntentCommandType::CancelIntentLock;
+                            let _ = state.account_manager.increment_nonce(sender);
+
+                            run_intent_for(state, intent_id)?;
+
+                            return Ok(ExecutionResult {
+                                success: true,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["Intent lock canceled".to_string()],
+                                error: None,
+                            });
+                        }
+                        _ => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["cancelIntentLock: not locked".to_string()],
+                                error: Some("Not locked".to_string()),
+                            });
+                        }
+                    }
+                }
+                return Ok(ExecutionResult {
+                    success: false,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec!["cancelIntentLock: intent not found".to_string()],
+                    error: Some("Intent not found".to_string()),
+                });
             }
             _ => {
                 return Ok(ExecutionResult {
@@ -535,4 +674,86 @@ fn verify_intent_fill_on_bitcoin(
         }
     }
     Ok(false)
+}
+
+fn run_intent_with_image(state: &mut CoreLaneState, program_blob: Option<Vec<u8>>) -> Result<()> {
+    let mut machine = Machine::create(
+        &MachineConfig::new_with_ram(RAMConfig {
+            length: 134217728,
+            image_filename: "".into(),
+        }),
+        &RuntimeConfig::default(),
+    )
+    .unwrap();
+
+    let program_blob = include_bytes!("../ram-image.bin-very-first");
+
+    info!(
+        "Writing program blob to memory LENGTH: {}",
+        program_blob.len()
+    );
+
+    let _ = machine.write_memory(0x8000_0000u64, program_blob.as_ref())?;
+
+    loop {
+        let _ = machine.run(u64::MAX)?;
+        match machine.receive_cmio_request() {
+            Ok(req) => {
+                info!("Handling CMIO request: {:?}", req);
+                let data = match req {
+                    CmioRequest::Automatic(AutomaticReason::TxOutput { data }) => data,
+                    CmioRequest::Manual(ManualReason::GIO { data, .. }) => data,
+                    _ => {
+                        let _ = machine.send_cmio_response(CmioResponseReason::Advance, &[]);
+                        continue;
+                    }
+                };
+                info!("Handling CMIO data: {:?}", data);
+
+                if let Some(msg) = CmioMessage::from_bytes(&data).ok() {
+                    if let CmioMessage::Exit { code } = msg {
+                        machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                        break;
+                    }
+                    // Handle query via state and respond
+                    info!("Handling CMIO query: {:?}", msg);
+                    let response = state.handle_cmio_query(msg);
+                    let resp_bytes = response
+                        .map(|r| r.to_bytes().unwrap_or_default())
+                        .unwrap_or_default();
+                    machine.send_cmio_response(CmioResponseReason::Advance, &resp_bytes)?;
+                    // keep running until Exit
+                    continue;
+                } else {
+                    machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let _ = machine.run(u64::MAX)?;
+
+    Ok(())
+}
+
+fn run_intent_for(state: &mut CoreLaneState, intent_id: B256) -> Result<()> {
+    let mut program_blob: Option<Vec<u8>> = None;
+
+    if let Some(intent) = state.intents.get(&intent_id) {
+        if let Ok(intent_data) = IntentData::from_cbor(&intent.data) {
+            if intent_data.intent_type == crate::intents::IntentType::RiscVProgram {
+                if let Ok(prog) = intent_data.parse_riscv_program() {
+                    let blob_hash = B256::from_slice(&prog.blob_hash);
+                    if let Some(bytes) = state.stored_blobs.get(&blob_hash) {
+                        program_blob = Some(bytes.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    run_intent_with_image(state, program_blob)?;
+    Ok(())
 }
