@@ -6,7 +6,6 @@ use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
-use bitcoincore_rpc::RpcApi;
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,6 +16,7 @@ use tracing::info;
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
+    #[allow(dead_code)]
     pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
@@ -40,28 +40,6 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TransactionRequest {
-    #[serde(rename = "from")]
-    pub from: Option<String>,
-    #[serde(rename = "to")]
-    pub to: Option<String>,
-    #[serde(rename = "gas")]
-    pub gas: Option<String>,
-    #[serde(rename = "gasPrice")]
-    pub gas_price: Option<String>,
-    #[serde(rename = "maxFeePerGas")]
-    pub max_fee_per_gas: Option<String>,
-    #[serde(rename = "maxPriorityFeePerGas")]
-    pub max_priority_fee_per_gas: Option<String>,
-    #[serde(rename = "value")]
-    pub value: Option<String>,
-    #[serde(rename = "data")]
-    pub data: Option<String>,
-    #[serde(rename = "nonce")]
-    pub nonce: Option<String>,
-}
-
 pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
@@ -70,15 +48,6 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
-    pub fn new(state: Arc<Mutex<CoreLaneState>>) -> Self {
-        Self {
-            state,
-            bitcoin_client: None,
-            network: None,
-            wallet: None,
-        }
-    }
-
     pub fn with_bitcoin_client(
         state: Arc<Mutex<CoreLaneState>>,
         bitcoin_client: Arc<bitcoincore_rpc::Client>,
@@ -259,18 +228,10 @@ impl RpcServer {
             }));
         }
 
-        let address_str = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
-
-        // Parse address
-        let address = address_from_str(address_str.trim_start_matches("0x"))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-
-        // Get account from account manager
-        let state = state.state.lock().await;
-        let account = state.account_manager.get_account(address);
+        let _address_str = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
         // Return code as hex string (0x-prefixed)
-        let code_hex = format!("0x{}", hex::encode(&account.unwrap().code));
+        let code_hex = "0x";
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -812,7 +773,7 @@ impl RpcServer {
                 // Get transaction hash from block
                 if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                     // Find the actual transaction data
-                    for (stored_index, stored_tx) in state.transactions.iter().enumerate() {
+                    for (_stored_index, stored_tx) in state.transactions.iter().enumerate() {
                         let current_tx_hash = format!(
                             "0x{}",
                             hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1110,7 +1071,7 @@ impl RpcServer {
             // Get transaction hash from block
             if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                 // Find the actual transaction data
-                for (stored_index, stored_tx) in state.transactions.iter().enumerate() {
+                for (_stored_index, stored_tx) in state.transactions.iter().enumerate() {
                     let current_tx_hash = format!(
                         "0x{}",
                         hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1697,6 +1658,7 @@ impl RpcServer {
     }
 
     // Storage and state methods
+    // We don't support storage at the moment
     async fn handle_get_storage_at(
         request: JsonRpcRequest,
         state: &Arc<Self>,
@@ -1724,12 +1686,7 @@ impl RpcServer {
 
         // Get storage value from account manager
         let state = state.state.lock().await;
-        let account = state.account_manager.get_account(address);
-        let storage_value = account
-            .unwrap()
-            .storage
-            .get(&position)
-            .unwrap_or(&B256::ZERO);
+        let storage_value = B256::ZERO;
 
         // Convert to hex string (0x-prefixed, 32 bytes)
         let storage_hex = format!("0x{}", hex::encode(storage_value.as_slice()));

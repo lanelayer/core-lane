@@ -85,8 +85,6 @@ enum Commands {
     SendTransaction {
         #[arg(long)]
         raw_tx_hex: String,
-        #[arg(long)]
-        fee_sats: Option<u64>,
         #[arg(long, default_value = "mine")]
         rpc_wallet: String,
         #[arg(long, default_value = "http://127.0.0.1:18443")]
@@ -142,6 +140,7 @@ struct CoreLaneBlock {
     transaction_count: u64,
     gas_used: U256,
     gas_limit: U256,
+    #[allow(dead_code)]
     base_fee_per_gas: Option<U256>,
     difficulty: U256,
     total_difficulty: U256,
@@ -326,54 +325,6 @@ impl CoreLaneNode {
         }
     }
 
-    fn parse_network(network: &str) -> Result<bitcoin::Network, String> {
-        match network.to_lowercase().as_str() {
-            "mainnet" => Ok(bitcoin::Network::Bitcoin),
-            "testnet" => Ok(bitcoin::Network::Testnet),
-            "signet" => Ok(bitcoin::Network::Signet),
-            "regtest" => Ok(bitcoin::Network::Regtest),
-            _ => Err(format!("unknown network: {}", network)),
-        }
-    }
-
-    // Helper function to get current state
-    async fn get_state(&self) -> CoreLaneState {
-        self.state.lock().await.clone()
-    }
-
-    // Helper function to get account balance
-    async fn get_account_balance(&self, address: Address) -> U256 {
-        let state = self.state.lock().await;
-        state.account_manager.get_balance(address)
-    }
-
-    // Helper function to get transaction count
-    async fn get_transaction_count(&self) -> usize {
-        let state = self.state.lock().await;
-        state.transactions.len()
-    }
-
-    // Block management methods
-    async fn get_block_by_number(&self, number: u64) -> Option<CoreLaneBlock> {
-        let state = self.state.lock().await;
-        state.blocks.get(&number).cloned()
-    }
-
-    async fn get_block_by_hash(&self, hash: B256) -> Option<CoreLaneBlock> {
-        let state = self.state.lock().await;
-        if let Some(&number) = state.block_hashes.get(&hash) {
-            state.blocks.get(&number).cloned()
-        } else {
-            None
-        }
-    }
-
-    async fn get_latest_block(&self) -> Option<CoreLaneBlock> {
-        let state = self.state.lock().await;
-        let latest_number = state.blocks.keys().max().copied().unwrap_or(0);
-        state.blocks.get(&latest_number).cloned()
-    }
-
     async fn create_new_block(
         &self,
         bitcoin_block_hash: String,
@@ -423,7 +374,7 @@ impl CoreLaneNode {
         new_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
         new_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
         new_block.transactions_root = B256::from_slice(&[0u8; 32]); // Simplified for now
-        for (stored_tx, receipt, tx_hash) in transactions.clone() {
+        for (_stored_tx, _receipt, tx_hash) in transactions.clone() {
             new_block.transactions.push(tx_hash.clone());
             new_block.transaction_count = new_block.transactions.len() as u64;
         }
@@ -924,72 +875,6 @@ impl CoreLaneNode {
         } else {
             warn!(
                 "   ⚠️  No intended burn: {} sats input <= {} sats spendable output",
-                total_input, total_spendable_output
-            );
-            0u64
-        }
-    }
-
-    /// Calculate the burnt value from transaction inputs and outputs (legacy method)
-    fn calculate_burnt_value(&self, tx: &Transaction) -> u64 {
-        // Look for OP_RETURN output that contains the burn data
-        for (i, output) in tx.output.iter().enumerate() {
-            if output.script_pubkey.is_op_return() {
-                // Check if this OP_RETURN contains BRN1 data
-                if output.script_pubkey.as_bytes().len() > 4
-                    && &output.script_pubkey.as_bytes()[1..5] == b"BRN1"
-                {
-                    // The burnt value is the amount sent to this OP_RETURN output
-                    let burnt_value = output.value.to_sat();
-                    info!(
-                        "   💰 Found burn OP_RETURN output {}: {} sats",
-                        i, burnt_value
-                    );
-                    return burnt_value;
-                }
-            }
-        }
-
-        // Fallback: calculate total burnt as difference between inputs and spendable outputs
-        let mut total_input: u64 = 0;
-
-        // Calculate total input value by fetching previous transaction outputs
-        for input in &tx.input {
-            match self
-                .bitcoin_client
-                .get_raw_transaction(&input.previous_output.txid, None)
-            {
-                Ok(prev_tx) => {
-                    let prev_output = &prev_tx.output[input.previous_output.vout as usize];
-                    total_input += prev_output.value.to_sat();
-                }
-                Err(e) => {
-                    warn!(
-                        "   ⚠️  Could not fetch previous transaction {}: {}",
-                        input.previous_output.txid, e
-                    );
-                    // Continue with other inputs
-                }
-            }
-        }
-
-        // Calculate total spendable output (exclude OP_RETURN outputs)
-        let total_spendable_output: u64 = tx
-            .output
-            .iter()
-            .filter(|output| !output.script_pubkey.is_op_return())
-            .map(|output| output.value.to_sat())
-            .sum();
-
-        // The burnt value is the difference between inputs and spendable outputs
-        if total_input > total_spendable_output {
-            let burnt_value = total_input - total_spendable_output;
-            info!("   💰 Burn calculation (fallback): {} sats input - {} sats spendable output = {} sats burnt",
-                total_input, total_spendable_output, burnt_value);
-            burnt_value
-        } else {
-            warn!(
-                "   ⚠️  No value burnt: {} sats input <= {} sats spendable output",
                 total_input, total_spendable_output
             );
             0u64
@@ -1592,7 +1477,6 @@ async fn main() -> Result<()> {
 
         Commands::SendTransaction {
             raw_tx_hex,
-            fee_sats,
             rpc_wallet,
             rpc_url,
             rpc_user,
