@@ -2,7 +2,6 @@
 mod tests {
     use super::*;
     use crate::account::AccountManager;
-    use crate::transaction::{calculate_gas_cost, validate_transaction};
     use alloy_consensus::{TxEnvelope, TxLegacy};
     use alloy_primitives::{Address, Bytes, U256};
     use std::str::FromStr;

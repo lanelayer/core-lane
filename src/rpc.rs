@@ -1263,20 +1263,16 @@ impl RpcServer {
                                 }
                             }
                             _ => {
-                                // Fallback for other transaction types
-                                result.insert("nonce".to_string(), json!("0x0"));
-                                result.insert("gasPrice".to_string(), json!("0x3b9aca00"));
-                                result.insert("gas".to_string(), json!("0x0"));
-                                result.insert("to".to_string(), json!(null));
-                                result.insert("value".to_string(), json!("0x0"));
-                                result.insert("input".to_string(), json!("0x"));
-                                result.insert("v".to_string(), json!("0x0"));
-                                result.insert("r".to_string(), json!("0x0"));
-                                result.insert("s".to_string(), json!("0x0"));
-                                result.insert(
-                                    "from".to_string(),
-                                    json!("0x0000000000000000000000000000000000000000"),
-                                );
+                                // Unsupported transaction type - return JSON-RPC error
+                                return Ok(JsonResponse::from(JsonRpcResponse {
+                                    jsonrpc: "2.0".to_string(),
+                                    result: None,
+                                    error: Some(JsonRpcError {
+                                        code: -32602,
+                                        message: "Unsupported transaction type".to_string(),
+                                    }),
+                                    id: request.id,
+                                }));
                             }
                         }
 
@@ -1575,7 +1571,8 @@ impl RpcServer {
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
         // Return a reasonable gas price (1 Gwei = 1000000000 wei)
-        let gas_price = "0x3b9aca00"; // 1 Gwei in hex
+        let gas_price = U256::from(214285714u64);
+        let gas_price = format!("0x{}", hex::encode(gas_price.to_be_bytes_vec()));
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
