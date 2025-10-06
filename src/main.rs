@@ -21,7 +21,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod account;
 mod intents;
+mod block;
 mod rpc;
+mod bitcoin_block;
 mod taproot_da;
 mod transaction;
 
@@ -29,15 +31,17 @@ mod transaction;
 mod tests;
 
 use account::AccountManager;
-use alloy_consensus::TxEnvelope;
+use alloy_consensus::{TxEnvelope};
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
-use intents::{create_anchor_bitcoin_fill_intent, decode_intent_calldata, Intent};
+use intents::{create_anchor_bitcoin_fill_intent, Intent};
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
 use transaction::{
-    execute_transaction, get_transaction_input_bytes, recover_sender, validate_transaction,
+    execute_transaction,
 };
+
+use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 
 #[derive(Parser)]
 #[command(name = "core-lane-node")]
@@ -151,8 +155,7 @@ struct CoreLaneBlock {
     receipts_root: B256,
     transactions_root: B256,
     logs_bloom: Vec<u8>,
-    bitcoin_block_hash: Option<String>, // Reference to Bitcoin block
-    bitcoin_block_height: Option<u64>,
+    block_origin: Option<CoreLaneBlockParsed>,
 }
 
 impl CoreLaneBlock {
@@ -160,8 +163,7 @@ impl CoreLaneBlock {
         number: u64,
         parent_hash: B256,
         timestamp: u64,
-        bitcoin_block_hash: Option<String>,
-        bitcoin_block_height: Option<u64>,
+        block_origin: Option<CoreLaneBlockParsed>,
     ) -> Self {
         let mut extra_data = vec![0u8; 32];
         extra_data[0] = b'C';
@@ -192,8 +194,7 @@ impl CoreLaneBlock {
             receipts_root: B256::default(),
             transactions_root: B256::default(),
             logs_bloom: vec![0u8; 256],
-            bitcoin_block_hash,
-            bitcoin_block_height,
+            block_origin: block_origin,
         }
     }
 
@@ -202,7 +203,6 @@ impl CoreLaneBlock {
             0,
             B256::default(), // Genesis has no parent
             1704067200,      // January 1, 2024 00:00:00 UTC
-            None,
             None,
         );
 
@@ -327,9 +327,7 @@ impl CoreLaneNode {
 
     async fn create_new_block(
         &self,
-        bitcoin_block_hash: String,
-        bitcoin_block_height: u64,
-        bitcoin_block_timestamp: u64,
+        block_origin: Option<CoreLaneBlockParsed>,
     ) -> Result<CoreLaneBlock> {
         let mut state = self.state.lock().await;
 
@@ -344,13 +342,15 @@ impl CoreLaneNode {
             state.genesis_block.hash
         };
 
+
+        let anchor_block_timestamp = if let Some(ref block_origin) = block_origin { block_origin.anchor_block_timestamp } else { 0 };
+
         // Create new block with Bitcoin block timestamp
         let mut new_block = CoreLaneBlock::new(
             next_number,
             parent_hash,
-            bitcoin_block_timestamp,
-            Some(bitcoin_block_hash),
-            Some(bitcoin_block_height),
+            anchor_block_timestamp,
+            block_origin,
         );
 
         // Calculate hash
@@ -358,7 +358,7 @@ impl CoreLaneNode {
         // Set as current block
         info!(
             "🆕 Created Core Lane block {} (parent: {}) with timestamp {}",
-            next_number, latest_number, bitcoin_block_timestamp
+            next_number, latest_number, new_block.timestamp
         );
         Ok(new_block)
     }
@@ -385,7 +385,7 @@ impl CoreLaneNode {
         state.blocks.insert(new_block.number, new_block.clone());
         state.block_hashes.insert(new_block.hash, new_block.number);
 
-        for (stored_tx, receipt, tx_hash) in transactions {
+        for (stored_tx, receipt, tx_hash) in transactions.clone() {
             state.transactions.push(stored_tx);
             state.transaction_receipts.insert(tx_hash, receipt);
         }
@@ -448,7 +448,9 @@ impl CoreLaneNode {
         );
 
         for height in start_block..=tip {
-            match self.process_block(height).await {
+            let bitcoin_block = process_bitcoin_block(self.bitcoin_client.clone(), height)?;
+            
+            match self.process_block(bitcoin_block).await {
                 Ok(_) => {
                     // Update the last processed block
                     let mut state = self.state.lock().await;
@@ -464,631 +466,126 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    async fn process_block(&self, height: u64) -> Result<()> {
-        let hash = self.bitcoin_client.get_block_hash(height)?;
-        let block = self.bitcoin_client.get_block(&hash)?;
-
-        info!(
-            "📦 Processing Bitcoin block {} with {} transactions",
-            height,
-            block.txdata.len()
-        );
-
-        let mut burn_transactions_found = 0;
-        let mut da_transactions_found = 0;
-        let mut core_lane_transactions = Vec::new();
-        // Create a new Core Lane block for this Bitcoin block
-        let bitcoin_block_hash = hash.to_string();
-        let bitcoin_block_timestamp = block.header.time as u64;
-        info!(
-            "📅 Using Bitcoin block timestamp: {} (block {})",
-            bitcoin_block_timestamp, height
-        );
+    async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<()> {
         let new_block = self
-            .create_new_block(bitcoin_block_hash, height, bitcoin_block_timestamp)
+            .create_new_block(Some(bitcoin_block))
             .await?;
 
-        // Phase 1: Process ALL Bitcoin burns first to mint Core Lane tokens
-        debug!("🔥 Phase 1: Processing Bitcoin burns...");
-        for (tx_index, tx) in block.txdata.iter().enumerate() {
-            let txid = tx.compute_txid();
+        let new_block_clone = new_block.clone();
+        let mut core_lane_transactions = Vec::new();
 
-            if let Some((payload, burn_value)) = self.extract_burn_payload_from_tx(&tx) {
-                burn_transactions_found += 1;
-                info!(
-                    "   🔥 Found Bitcoin burn in tx {}: {} ({}sats)",
-                    tx_index, txid, burn_value
-                );
-                self.process_bitcoin_burn(payload, burn_value, txid.to_string(), "regtest")
-                    .await?;
+        if let Some(block_origin) = new_block_clone.block_origin {
+            debug!("🔥 Phase 1: Processing burns...");
+            for burn in  block_origin.burns.iter() {
+                let mut state = self.state.lock().await;
+                info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
+                state.account_manager.add_balance(burn.address, burn.amount)?;
             }
-        }
-        let mut tx_count = 0;
-        // Phase 2: Process ALL Core Lane DA transactions after all burns are complete
-        debug!("🔍 Phase 2: Processing Core Lane DA transactions...");
-        for (tx_index, tx) in block.txdata.iter().enumerate() {
-            let txid = tx.compute_txid();
-
-            if let Some(lane_tx) = self.extract_core_lane_transaction(tx) {
-                da_transactions_found += 1;
-                info!(
-                    "   🔍 Found Core Lane DA transaction in tx {}: {}",
-                    tx_index, txid
-                );
-                let tx = self
-                    .process_core_lane_transaction(lane_tx, new_block.number, tx_count)
-                    .await;
-                if let Some((stored_tx, receipt, tx_hash)) = tx {
-                    core_lane_transactions.push((stored_tx, receipt, tx_hash));
-                    tx_count += 1;
+            let mut tx_count = 0;
+            for bundle in block_origin.bundles.iter() {
+                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number {
+                    // skip this bundle because it's not valid for this block
+                    continue;
+                }
+                for (tx_index, tx) in bundle.transactions.iter().enumerate() {
+                    let tx = self
+                        .process_core_lane_transaction(tx, new_block.number, tx_count)
+                        .await;
+                    if let Some((stored_tx, receipt, tx_hash)) = tx {
+                        core_lane_transactions.push((stored_tx, receipt, tx_hash));
+                        tx_count += 1;
+                    }
                 }
             }
+    
         }
-
         // Finalize the Core Lane block
         self.finalize_current_block(core_lane_transactions, new_block)
-            .await?;
-
-        if burn_transactions_found > 0 {
-            info!(
-                "   🔥 Found {} Bitcoin burn transactions in block {}",
-                burn_transactions_found, height
-            );
-        }
-        if da_transactions_found > 0 {
-            info!(
-                "   ✅ Found {} Core Lane DA transactions in block {}",
-                da_transactions_found, height
-            );
-        }
-        if burn_transactions_found == 0 && da_transactions_found == 0 {
-            debug!("   ℹ️  No Core Lane activity found in block {}", height);
-        }
-
-        info!(
-            "🏁 Finalized Core Lane block for Bitcoin block {} with {} total transactions",
-            height,
-            burn_transactions_found + da_transactions_found
-        );
-
-        Ok(())
-    }
-
-    fn extract_core_lane_transaction(&self, tx: &Transaction) -> Option<Vec<u8>> {
-        // Look for Core Lane transactions in Bitcoin DA envelopes
-        // Check inputs for witness data (revealed Taproot envelopes)
-        for (input_idx, input) in tx.input.iter().enumerate() {
-            if input.witness.len() >= 2 {
-                trace!(
-                    "   🔍 Input {} has witness with {} elements",
-                    input_idx,
-                    input.witness.len()
-                );
-
-                // Debug: print witness elements
-                for (i, witness_elem) in input.witness.to_vec().iter().enumerate() {
-                    trace!("     Witness[{}]: {} bytes", i, witness_elem.len());
-                    if witness_elem.len() < 100 {
-                        trace!("     Witness[{}] hex: {}", i, hex::encode(witness_elem));
-                    } else if witness_elem.len() >= 50 {
-                        // This might be our Core Lane envelope script
-                        trace!(
-                            "     Witness[{}] (first 50 bytes): {}",
-                            i,
-                            hex::encode(&witness_elem[..50])
-                        );
-                        if witness_elem.len() >= 100 {
-                            trace!(
-                                "     Witness[{}] (last 50 bytes): {}",
-                                i,
-                                hex::encode(&witness_elem[witness_elem.len() - 50..])
-                            );
-                        }
-                    }
-                }
-
-                if let Some(script_bytes) = input.witness.to_vec().get(0) {
-                    let script = Script::from_bytes(script_bytes);
-
-                    // Use the bitcoin-data-layer extraction logic
-                    if let Some(data) = self.extract_envelope_data_bitcoin_da_style(&script) {
-                        // If we got data back, it means we found a Core Lane transaction
-                        if !data.is_empty() {
-                            info!("   🎯 Found Core Lane transaction in Taproot envelope!");
-                            return Some(data);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also check outputs (for newly created Taproot envelopes)
-        for output in &tx.output {
-            // For Taproot outputs, we need to check if this is a P2TR address
-            // and then try to extract the embedded data
-            let script_pubkey = &output.script_pubkey;
-
-            // Check if this is a P2TR output
-            if script_pubkey.as_bytes().len() == 34 && script_pubkey.as_bytes()[0] == 0x51 {
-                // This is a P2TR output, but we can't directly extract the data
-                // because it's committed in the Taproot tree
-                // We'll need to look for the actual spend transaction later
-                debug!("   🔍 Found P2TR output (potential Core Lane envelope)");
-            }
-        }
-
-        None
-    }
-
-    // Use the bitcoin-data-layer extraction logic but be more selective about data extraction
-    fn extract_envelope_data_bitcoin_da_style(&self, script: &Script) -> Option<Vec<u8>> {
-        let mut instr = script.instructions();
-
-        let first = instr.next().and_then(|r| r.ok());
-        if first != Some(Instruction::Op(OP_FALSE))
-            && first
-                != Some(Instruction::PushBytes(
-                    bitcoin::blockdata::script::PushBytes::empty(),
-                ))
-        {
-            return None;
-        }
-
-        if instr.next().and_then(|r| r.ok()) != Some(Instruction::Op(OP_IF)) {
-            return None;
-        }
-
-        // Collect all push operations between OP_IF and OP_ENDIF
-        let mut push_operations: Vec<Vec<u8>> = Vec::new();
-        loop {
-            match instr.next().and_then(|r| r.ok()) {
-                Some(Instruction::Op(OP_ENDIF)) => break,
-                Some(Instruction::PushBytes(b)) => {
-                    push_operations.push(b.as_bytes().to_vec());
-                }
-                _ => return None,
-            }
-        }
-
-        let last = instr.next().and_then(|r| r.ok());
-        if last != Some(Instruction::Op(OP_TRUE))
-            && last
-                != Some(Instruction::Op(
-                    bitcoin::blockdata::opcodes::all::OP_PUSHNUM_1,
-                ))
-        {
-            return None;
-        }
-
-        trace!(
-            "   🔍 Script analysis: found {} push operations",
-            push_operations.len()
-        );
-        for (i, push_op) in push_operations.iter().enumerate() {
-            trace!("     Push[{}]: {} bytes", i, push_op.len());
-            if push_op.len() < 100 {
-                trace!("     Push[{}] hex: {}", i, hex::encode(push_op));
-            } else {
-                trace!(
-                    "     Push[{}] (first 50): {}",
-                    i,
-                    hex::encode(&push_op[..50])
-                );
-                trace!(
-                    "     Push[{}] (last 50): {}",
-                    i,
-                    hex::encode(&push_op[push_op.len() - 50..])
-                );
-            }
-        }
-
-        // Concatenate all push operations to get the complete data
-        let mut data: Vec<u8> = Vec::new();
-        for push_op in push_operations {
-            data.extend_from_slice(&push_op);
-        }
-
-        trace!("   🔍 Concatenated data: {} bytes", data.len());
-        if data.len() < 100 {
-            trace!("   🔍 Concatenated hex: {}", hex::encode(&data));
-        } else {
-            trace!(
-                "   🔍 Concatenated (first 50): {}",
-                hex::encode(&data[..50])
-            );
-            trace!(
-                "   🔍 Concatenated (last 50): {}",
-                hex::encode(&data[data.len() - 50..])
-            );
-        }
-
-        // For Core Lane, check if the concatenated data starts with "CORE_LANE"
-        if data.starts_with(b"CORE_LANE") {
-            // Return just the transaction data (after CORE_LANE prefix)
-            let tx_data = &data[9..];
-
-            // Remove padding from the end (look for 0xf0 padding pattern)
-            let mut clean_end = tx_data.len();
-            for i in (0..tx_data.len()).rev() {
-                if tx_data[i] == 0xf0 {
-                    clean_end = i;
-                } else {
-                    break;
-                }
-            }
-
-            let clean_tx_data = &tx_data[..clean_end];
-            trace!(
-                "   🔍 Extracted transaction data: {} bytes (removed {} padding bytes)",
-                clean_tx_data.len(),
-                tx_data.len() - clean_tx_data.len()
-            );
-            if clean_tx_data.len() < 100 {
-                trace!("   🔍 Transaction hex: {}", hex::encode(clean_tx_data));
-            } else {
-                trace!(
-                    "   🔍 Transaction (first 50): {}",
-                    hex::encode(&clean_tx_data[..50])
-                );
-                trace!(
-                    "   🔍 Transaction (last 50): {}",
-                    hex::encode(&clean_tx_data[clean_tx_data.len() - 50..])
-                );
-            }
-
-            return Some(clean_tx_data.to_vec());
-        }
-
-        Some(data)
-    }
-
-    /// Extract burn payload from Bitcoin transaction (BRN1 format)
-    fn extract_burn_payload_from_tx(&self, tx: &Transaction) -> Option<(Vec<u8>, u64)> {
-        // Look for hybrid P2WSH + OP_RETURN burn pattern
-        let mut p2wsh_burn_value = 0u64;
-        let mut brn1_payload = None;
-
-        for output in &tx.output {
-            // Check for P2WSH burn outputs
-            if self.is_p2wsh_script(&output.script_pubkey) {
-                let burnt_value = output.value.to_sat();
-                if burnt_value > 0 {
-                    p2wsh_burn_value = burnt_value;
-                    debug!("   🔍 Found P2WSH burn output: {} sats", burnt_value);
-                }
-            }
-
-            // Check for OP_RETURN with BRN1 data
-            if self.is_op_return_script(&output.script_pubkey) {
-                let payload_bytes = output.script_pubkey.as_bytes();
-
-                // OP_RETURN script structure: [OP_RETURN] [push_opcode] [data...]
-                if payload_bytes.len() >= 30 && payload_bytes[0] == 0x6a {
-                    let data = &payload_bytes[2..]; // Skip OP_RETURN and push opcode
-
-                    // Check for BRN1 prefix
-                    if data.len() >= 28 && &data[0..4] == b"BRN1" {
-                        let mut payload = Vec::with_capacity(28);
-                        payload.extend_from_slice(b"BRN1");
-                        payload.extend_from_slice(&data[4..8]); // chain_id
-                        payload.extend_from_slice(&data[8..28]); // eth_address
-                        brn1_payload = Some(payload);
-                        debug!("   🔍 Found BRN1 data in OP_RETURN");
-                    }
-                }
-            }
-        }
-
-        // If we found both P2WSH burn and BRN1 data, this is our hybrid burn
-        if p2wsh_burn_value > 0 && brn1_payload.is_some() {
-            info!(
-                "   ✅ Found hybrid P2WSH + OP_RETURN burn: {} sats",
-                p2wsh_burn_value
-            );
-            return Some((brn1_payload.unwrap(), p2wsh_burn_value));
-        }
-
-        // Fallback: legacy OP_RETURN only burns
-        for output in &tx.output {
-            if self.is_op_return_script(&output.script_pubkey) {
-                let payload_bytes = output.script_pubkey.as_bytes();
-
-                if payload_bytes.len() >= 30 && payload_bytes[0] == 0x6a {
-                    let data = &payload_bytes[2..];
-
-                    if data.len() >= 28 && &data[0..4] == b"BRN1" {
-                        let mut payload = Vec::with_capacity(28);
-                        payload.extend_from_slice(b"BRN1");
-                        payload.extend_from_slice(&data[4..8]);
-                        payload.extend_from_slice(&data[8..28]);
-
-                        let burnt_value = self.calculate_intended_burn_amount(tx);
-                        return Some((payload, burnt_value));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Check if script is OP_RETURN
-    fn is_op_return_script(&self, script: &Script) -> bool {
-        let mut instr = script.instructions();
-        if let Some(Ok(Instruction::Op(op))) = instr.next() {
-            op == OP_RETURN
-        } else {
-            false
-        }
-    }
-
-    /// Check if script is P2WSH
-    fn is_p2wsh_script(&self, script: &Script) -> bool {
-        let bytes = script.as_bytes();
-        // P2WSH: OP_0 (0x00) + 32-byte hash
-        bytes.len() == 34 && bytes[0] == 0x00
-    }
-
-    /// Calculate the intended burn amount from transaction structure
-    /// This is the amount that was intended to be burned, not including fees
-    fn calculate_intended_burn_amount(&self, tx: &Transaction) -> u64 {
-        // For BRN1 burns, we need to determine the intended burn amount
-        // Since the OP_RETURN output has 0 value, we need to look at the transaction structure
-
-        // Calculate total input value
-        let mut total_input: u64 = 0;
-        for input in &tx.input {
-            match self
-                .bitcoin_client
-                .get_raw_transaction(&input.previous_output.txid, None)
-            {
-                Ok(prev_tx) => {
-                    let prev_output = &prev_tx.output[input.previous_output.vout as usize];
-                    total_input += prev_output.value.to_sat();
-                }
-                Err(e) => {
-                    warn!(
-                        "   ⚠️  Could not fetch previous transaction {}: {}",
-                        input.previous_output.txid, e
-                    );
-                }
-            }
-        }
-
-        // Calculate total spendable output (exclude OP_RETURN outputs)
-        let total_spendable_output: u64 = tx
-            .output
-            .iter()
-            .filter(|output| !output.script_pubkey.is_op_return())
-            .map(|output| output.value.to_sat())
-            .sum();
-
-        // The intended burn amount is the difference between input and spendable output
-        // This excludes the transaction fee
-        if total_input > total_spendable_output {
-            let intended_burn = total_input - total_spendable_output;
-            info!(
-                "   💰 Intended burn amount: {} sats (input: {} sats, spendable: {} sats)",
-                intended_burn, total_input, total_spendable_output
-            );
-            intended_burn
-        } else {
-            warn!(
-                "   ⚠️  No intended burn: {} sats input <= {} sats spendable output",
-                total_input, total_spendable_output
-            );
-            0u64
-        }
-    }
-
-    /// Process Bitcoin burn transaction and mint Core Lane tokens
-    async fn process_bitcoin_burn(
-        &self,
-        payload: Vec<u8>,
-        burn_value: u64,
-        txid: String,
-        _network: &str,
-    ) -> Result<()> {
-        // Extract chain ID and ETH address from BRN1 payload
-        if payload.len() >= 28 && &payload[0..4] == b"BRN1" {
-            let chain_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
-            let eth_address_bytes = &payload[8..28];
-            let eth_address = Address::from_slice(eth_address_bytes);
-
-            info!("🔥 Processing Bitcoin burn:");
-            info!("   Transaction: {}", txid);
-            info!("   Burnt value: {} sats", burn_value);
-            info!("   Chain ID: {}", chain_id);
-            info!("   ETH Address: {}", eth_address);
-
-            // Check if this is for Core Lane (chain ID 1 for example)
-            if chain_id == 1 {
-                // Convert Bitcoin sats to Core Lane tokens with proper decimal scaling
-                // Bitcoin: 1 BTC = 100,000,000 sats (8 decimals)
-                // Core Lane: 1 CMEL = 10^18 wei (18 decimals)
-                // Conversion: 1 sat = 10^10 wei (to maintain reasonable exchange rate)
-                let conversion_factor = U256::from(10_000_000_000u64); // 10^10
-                let mint_amount = U256::from(burn_value) * conversion_factor;
-
-                info!(
-                    "   🪙 Attempting to mint {} tokens to {}",
-                    mint_amount, eth_address
-                );
-
-                debug!("   🔒 Acquiring state lock...");
-                let mut state = self.state.lock().await;
-                debug!("   🔓 State lock acquired, adding balance...");
-
-                match state.account_manager.add_balance(eth_address, mint_amount) {
-                    Ok(_) => {
-                        info!(
-                            "   ✅ Minted {} Core Lane tokens to {}",
-                            mint_amount, eth_address
-                        );
-                        let new_balance = state.account_manager.get_balance(eth_address);
-                        info!("   💰 New balance: {}", new_balance);
-                        info!("   🎯 Minting successful! Balance updated.");
-                    }
-                    Err(e) => {
-                        error!("   ❌ Failed to mint tokens: {}", e);
-                        error!("   🔍 Error details: {:?}", e);
-                    }
-                }
-
-                debug!("   🔓 Releasing state lock...");
-            } else {
-                warn!(
-                    "   ⚠️  Burn for different chain ID ({}), ignoring",
-                    chain_id
-                );
-            }
-        } else {
-            error!("   ❌ Invalid BRN1 payload format");
-        }
+            .await?;                
+        // Phase 1: Process ALL Bitcoin burns first to mint Core Lane tokens
 
         Ok(())
     }
 
     async fn process_core_lane_transaction(
         &self,
-        tx_data: Vec<u8>,
+        tx: &(TxEnvelope, Address, Vec<u8>),
         block_number: u64,
         tx_number: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
-        // The tx_data now contains the raw Ethereum transaction bytes (without CORE_LANE prefix)
-        debug!(
-            "   📝 Processing {} bytes of Ethereum transaction data",
-            tx_data.len()
-        );
-        debug!("   📝 Full transaction hex: {}", hex::encode(&tx_data));
-
-        // Try to parse as Ethereum transaction directly
-        match TxEnvelope::decode(&mut tx_data.as_slice()) {
-            Ok(tx) => {
-                info!("✅ Successfully parsed Core Lane transaction!");
-
-                // Print transaction details
-                match &tx {
-                    TxEnvelope::Legacy(_) => debug!("   Type: Legacy"),
-                    TxEnvelope::Eip1559(_) => debug!("   Type: EIP-1559"),
-                    TxEnvelope::Eip2930(_) => debug!("   Type: EIP-2930"),
-                    TxEnvelope::Eip4844(_) => debug!("   Type: EIP-4844"),
-                    _ => debug!("   Type: Other"),
-                }
-
-                // Validate the transaction
-                if let Err(e) = validate_transaction(&tx) {
-                    error!("   ❌ Transaction validation failed: {}", e);
-                    return None;
-                }
-                debug!("   ✅ Transaction validation passed");
-
-                // Recover sender address
-                let sender = match recover_sender(&tx) {
-                    Ok(addr) => {
-                        info!("   📧 Sender: {}", addr);
-                        addr
-                    }
-                    Err(e) => {
-                        error!("   ❌ Failed to recover sender: {}", e);
-                        return None;
-                    }
-                };
-
-                let input_bytes = get_transaction_input_bytes(&tx);
-                if !input_bytes.is_empty() {
-                    if let Some(intent_call) = decode_intent_calldata(&input_bytes) {
-                        info!("Decoded IntentSystem call: {:?}", intent_call);
-                    }
-                }
-                let execution_result = {
-                    let mut state = self.state.lock().await;
-                    execute_transaction(&tx, sender, &mut state)
-                };
-
-                match execution_result {
-                    Ok(result) => {
-                        if result.success {
-                            info!("   ✅ Transaction executed successfully!");
-                            info!("      Gas used: {}", result.gas_used);
-                            if let Some(error) = &result.error {
-                                warn!("      Error: {}", error);
-                            }
-                            for log in &result.logs {
-                                debug!("      📝 {}", log);
-                            }
-
-                            // Charge gas fees (using a reasonable gas price for testing)
-                            let gas_fee = result.gas_used * U256::from(1000000000u64); // 1 gwei per gas
-                            {
-                                let mut state = self.state.lock().await;
-                                if let Err(e) = state.account_manager.sub_balance(sender, gas_fee) {
-                                    warn!("      ⚠️  Failed to charge gas fee: {}", e);
-                                } else {
-                                    info!("      💰 Charged gas fee: {} wei", gas_fee);
-                                }
-                            }
-                        } else {
-                            error!("   ❌ Transaction execution failed!");
-                            if let Some(error) = &result.error {
-                                error!("      Error: {}", error);
-                            }
-                            for log in &result.logs {
-                                debug!("      📝 {}", log);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("   ❌ Transaction execution error: {}", e);
-                    }
-                }
-
-                // Store the transaction with both envelope and raw data
-                let state = self.state.lock().await;
-                let stored_tx = StoredTransaction {
-                    envelope: tx.clone(),
-                    raw_data: tx_data.clone(),
-                    block_number: block_number,
-                };
-                // Create and store transaction receipt
-                let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx_data)));
-
-                let receipt = TransactionReceipt {
-                    transaction_hash: tx_hash.clone(),
-                    block_number: block_number,
-                    transaction_index: tx_number,
-                    from: format!("0x{}", hex::encode(sender.as_slice())),
-                    to: None, // Will be set based on transaction type
-                    cumulative_gas_used: "0x0".to_string(),
-                    gas_used: "0x0".to_string(),
-                    contract_address: None,
-                    logs: Vec::new(),
-                    status: "0x1".to_string(), // Success
-                    effective_gas_price: "0x3b9aca00".to_string(), // 1 gwei
-                    tx_type: match &tx {
-                        TxEnvelope::Legacy(_) => "0x0".to_string(),
-                        TxEnvelope::Eip2930(_) => "0x1".to_string(),
-                        TxEnvelope::Eip1559(_) => "0x2".to_string(),
-                        TxEnvelope::Eip4844(_) => "0x3".to_string(),
-                        _ => "0x0".to_string(),
-                    },
-                    logs_bloom: format!("0x{}", hex::encode(vec![0u8; 256])),
-                };
-
-                // Print account balances after execution
-                debug!(
-                    "   💰 Account balance after execution: {}",
-                    state.account_manager.get_balance(sender)
-                );
-                Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
+        let gas_price = U256::from(214285714u64);
+        // charge gas fee first, we return unused gas later
+        {
+            let mut state = self.state.lock().await;
+            //  Transaction size ≈ 150 byte
+            // Fee rate = 3 sats/vbyte
+            // Conversion rate: 1 sat = 10¹⁰ wei
+            // Gas cost for comparable tx: 21,000 gas = 150 bytes
+            //
+            if !tx.0.is_eip1559() {
+                warn!("      ⚠️  Non-EIP 1559 transactions are not supported, skipping: {:?}", tx.0);
+                return None;
             }
-            Err(e) => {
-                error!("❌ Failed to parse Ethereum transaction: {}", e);
-                None
+            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
+                warn!("      ⚠️  Gas fee is greater than the transaction max fee per gas, skipping: {:?}", tx.0);
+                return None;
+            }
+            let gas_fee =  gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
+            if let Err(e) = state.account_manager.sub_balance(tx.1, gas_fee) {
+                warn!("      ⚠️  Failed to charge gas fee ahead of tx execution: {}", e);
+                return None;
+            } else {
+                info!("      💰 Charged gas fee: {} wei", gas_fee);
             }
         }
-    }
 
+        let _execution_result = {
+            let mut state = self.state.lock().await;
+            execute_transaction(&tx.0, tx.1, &mut state)
+        };
+
+        // XXX add gas refund later
+
+        // Store the transaction with both envelope and raw data
+        let state = self.state.lock().await;
+        let stored_tx = StoredTransaction {
+            envelope: tx.0.clone(),
+            raw_data: tx.2.clone(),
+            block_number: block_number,
+        };
+        // Create and store transaction receipt
+        let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
+
+        let receipt = TransactionReceipt {
+            transaction_hash: tx_hash.clone(),
+            block_number: block_number,
+            transaction_index: tx_number,
+            from: format!("0x{}", hex::encode(tx.1.as_slice())),
+            to: None, // Will be set based on transaction type
+            cumulative_gas_used: "0x0".to_string(),
+            gas_used: "0x0".to_string(),
+            contract_address: None,
+            logs: Vec::new(),
+            status: "0x1".to_string(), // Success
+            effective_gas_price: format!("0x{}", hex::encode(gas_price.to_be_bytes_vec())),
+            tx_type: match &tx.0 {
+                TxEnvelope::Legacy(_) => "0x0".to_string(),
+                TxEnvelope::Eip2930(_) => "0x1".to_string(),
+                TxEnvelope::Eip1559(_) => "0x2".to_string(),
+                TxEnvelope::Eip4844(_) => "0x3".to_string(),
+                _ => "0x0".to_string(),
+            },
+            logs_bloom: format!("0x{}", hex::encode(vec![0u8; 256])),
+        };
+
+        // Print account balances after execution
+        debug!(
+            "   💰 Account balance after execution: {}",
+            state.account_manager.get_balance(tx.1)
+        );
+        Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
+    }
+    
     /// Create a Bitcoin burn transaction using RPC wallet
     async fn create_burn_transaction_from_wallet(
         &self,
