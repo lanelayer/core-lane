@@ -6,9 +6,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct CoreLaneAccount {
     pub balance: U256,
-    pub nonce: U256,
-    pub code: Bytes,
-    pub storage: HashMap<B256, B256>,
+    pub nonce: U256
 }
 
 impl CoreLaneAccount {
@@ -16,8 +14,6 @@ impl CoreLaneAccount {
         Self {
             balance: U256::ZERO,
             nonce: U256::ZERO,
-            code: Bytes::new(),
-            storage: HashMap::new(),
         }
     }
 
@@ -25,13 +21,7 @@ impl CoreLaneAccount {
         Self {
             balance,
             nonce: U256::ZERO,
-            code: Bytes::new(),
-            storage: HashMap::new(),
         }
-    }
-
-    pub fn is_contract(&self) -> bool {
-        !self.code.is_empty()
     }
 
     pub fn increment_nonce(&mut self) -> Result<()> {
@@ -59,14 +49,6 @@ impl CoreLaneAccount {
             .checked_sub(amount)
             .ok_or_else(|| anyhow!("Balance underflow"))?;
         Ok(())
-    }
-
-    pub fn set_storage(&mut self, key: B256, value: B256) {
-        self.storage.insert(key, value);
-    }
-
-    pub fn get_storage(&self, key: B256) -> B256 {
-        self.storage.get(&key).copied().unwrap_or(B256::ZERO)
     }
 }
 
@@ -126,43 +108,5 @@ impl AccountManager {
     pub fn increment_nonce(&mut self, address: Address) -> Result<()> {
         let account = self.get_account_mut(address);
         account.increment_nonce()
-    }
-
-    pub fn deploy_contract(&mut self, address: Address, code: Bytes) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.code = code;
-        Ok(())
-    }
-
-    pub fn set_storage(&mut self, address: Address, key: B256, value: B256) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.set_storage(key, value);
-        Ok(())
-    }
-
-    pub fn get_storage(&self, address: Address, key: B256) -> B256 {
-        self.accounts
-            .get(&address)
-            .map(|acc| acc.get_storage(key))
-            .unwrap_or(B256::ZERO)
-    }
-
-    pub fn account_exists(&self, address: Address) -> bool {
-        self.accounts.contains_key(&address)
-    }
-
-    pub fn is_contract(&self, address: Address) -> bool {
-        self.accounts
-            .get(&address)
-            .map(|acc| acc.is_contract())
-            .unwrap_or(false)
-    }
-
-    pub fn get_all_accounts(&self) -> &HashMap<Address, CoreLaneAccount> {
-        &self.accounts
-    }
-
-    pub fn clear_account(&mut self, address: Address) {
-        self.accounts.remove(&address);
     }
 }

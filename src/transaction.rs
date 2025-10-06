@@ -1,14 +1,13 @@
 use crate::intents::{decode_intent_calldata, Intent, IntentCall, IntentData, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
-use alloy_consensus::{SignableTransaction, Signed, TxEnvelope};
+use alloy_consensus::TxEnvelope;
 use alloy_primitives::B256;
 use alloy_primitives::{keccak256, Address, Bytes, U256};
-use alloy_rlp::{Decodable, Encodable};
+use alloy_rlp::Decodable;
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::RpcApi;
-use secp256k1::{ecdsa::RecoverableSignature, ecdsa::RecoveryId, Message, SECP256K1};
 use std::str::FromStr;
 use tracing::{debug, info};
 
@@ -105,22 +104,6 @@ pub fn parse_core_lane_transaction(data: &[u8]) -> Result<TxEnvelope> {
         )),
     }
 }
-
-/// Encode Core Lane transaction for Bitcoin DA
-pub fn encode_core_lane_transaction(tx: &TxEnvelope) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    data.extend_from_slice(b"CORE_LANE");
-
-    // Encode the full Ethereum transaction as RLP
-    let mut tx_bytes = Vec::new();
-    tx.encode(&mut tx_bytes);
-
-    // Append the encoded transaction
-    data.extend_from_slice(&tx_bytes);
-
-    Ok(data)
-}
-
 /// Validate Core Lane transaction
 pub fn validate_transaction(tx: &TxEnvelope) -> Result<()> {
     // Basic validation - check that we have a valid transaction envelope
@@ -182,60 +165,6 @@ pub fn recover_sender(tx: &TxEnvelope) -> Result<Address> {
         _ => Err(anyhow!("Unsupported transaction type for sender recovery")),
     }
 }
-
-/// Manual ECDSA signature recovery for Ethereum transactions
-fn recover_sender_manual<T>(signed_tx: &Signed<T>) -> Result<Address>
-where
-    T: SignableTransaction<alloy_primitives::Signature>,
-{
-    // Get the signature from the signed transaction
-    let signature = signed_tx.signature();
-
-    // Get the signature hash (this is what was actually signed)
-    let sig_hash = signed_tx.signature_hash();
-
-    // Extract r, s, and recovery_id from the signature
-    let r = signature.r();
-    let s = signature.s();
-    let recovery_id = signature.v();
-
-    // Convert to secp256k1 format for recovery
-    let recovery_id = RecoveryId::from_i32(recovery_id as i32)
-        .map_err(|e| anyhow!("Invalid recovery ID {}: {}", recovery_id, e))?;
-
-    // Create secp256k1 signature from r and s components
-    let r_bytes: [u8; 32] = r.to_be_bytes();
-    let s_bytes: [u8; 32] = s.to_be_bytes();
-
-    let mut sig_bytes = [0u8; 64];
-    sig_bytes[..32].copy_from_slice(&r_bytes);
-    sig_bytes[32..].copy_from_slice(&s_bytes);
-
-    let sig = RecoverableSignature::from_compact(&sig_bytes, recovery_id)
-        .map_err(|e| anyhow!("Invalid signature format: {}", e))?;
-
-    // Convert message hash to secp256k1 message
-    let message = Message::from_digest_slice(sig_hash.as_slice())
-        .map_err(|e| anyhow!("Invalid message hash: {}", e))?;
-
-    // Recover public key
-    let public_key = SECP256K1
-        .recover_ecdsa(&message, &sig)
-        .map_err(|e| anyhow!("Signature recovery failed: {}", e))?;
-
-    // Convert public key to Ethereum address
-    let public_key_bytes = public_key.serialize_uncompressed();
-
-    // Ethereum address is last 20 bytes of Keccak256 hash of public key (excluding 0x04 prefix)
-    let hash = keccak256(&public_key_bytes[1..]); // Skip the 0x04 prefix
-
-    // Take last 20 bytes as the address
-    let mut address_bytes = [0u8; 20];
-    address_bytes.copy_from_slice(&hash[12..]);
-
-    Ok(Address::from(address_bytes))
-}
-
 /// Transaction execution result
 #[derive(Debug, Clone)]
 pub struct ExecutionResult {
