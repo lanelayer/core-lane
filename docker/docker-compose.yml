@@ -14,7 +14,7 @@ services:
       - RPC_USER=${RPC_USER}
       - RPC_PASSWORD=${RPC_PASSWORD}
     volumes:
-      - ./volumes/bitcoind:/home/bitcoin/.bitcoin
+      - bitcoind:/home/bitcoin/.bitcoin
     networks:
       - lane-network
     healthcheck:
@@ -22,7 +22,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 60s
+      start_period: 600s
 
   core-lane:
     image: ghcr.io/lanelayer/core-lane/core-lane:latest
@@ -38,7 +38,7 @@ services:
       --start-block 916201
       --rpc-wallet hot
     volumes:
-      - ./volumes/core-lane:/data
+      - core-lane:/data
     restart: unless-stopped
     networks:
       - lane-network
@@ -46,3 +46,7 @@ services:
 networks:
   lane-network:
     driver: bridge
+
+volumes:
+  bitcoind:
+  core-lane:

@@ -2,9 +2,7 @@
 set -e
 
 DATADIR="/home/bitcoin/.bitcoin"
-TAR_URL="http://144.76.56.210/bitcoin-data.22sep.tar"
-TAR_FILE="bitcoin-data.22sep.tar"
-TAR_CHECKSUM="45676a796cfedc964eb69aba693d5cbb24b764c442c755c88bc7de60090298e5"
+UTXO_URL="http://144.76.56.210/utxo-916200.dat"
 # Make sure datadir exists
 mkdir -p "$DATADIR"
 REINDEX_FLAG=""
@@ -13,18 +11,7 @@ REINDEX_FLAG=""
 if [ ! -d "$DATADIR/blocks" ]; then
   echo "[*] No blockchain data found. Fetching snapshot..."
   cd /tmp
-  curl -O "$TAR_URL"
-  echo "$TAR_CHECKSUM  $TAR_FILE" | sha256sum -c -
-  if [ $? -ne 0 ]; then
-     echo " ERROR: Snapshot checksum mismatch!"
-    exit 1
-  fi
-
-  echo "[*] Checksum verified." 
-
-  tar -C "$DATADIR" -xf "$TAR_FILE"
-
-  rm "$TAR_FILE"
+  curl -O "$UTXO_URL"
 
   echo "[*] Snapshot extracted."
   REINDEX_FLAG="-reindex"
@@ -36,7 +23,7 @@ fi
 CONF_FILE="$DATADIR/bitcoin.conf"
 if [ ! -f "$CONF_FILE" ]; then
   echo "[*] Creating default bitcoin.conf ..."
-  cat > "$CONF_FILE" <<'CONF'
+  cat > "$CONF_FILE" <<CONF
 server=1
 listen=1
 prune=0
@@ -48,6 +35,7 @@ zmqpubrawblock=tcp://0.0.0.0:28332
 zmqpubrawtx=tcp://0.0.0.0:28333
 dbcache=2048
 txindex=1
+assumevalid=000000000000000000003b57a64583fe0544d3eddd4482f82ad0509fe1b9e7e2
 CONF
 else
   # Ensure prune=0 is set
@@ -66,4 +54,24 @@ else
 fi
 
 echo "[*] Starting bitcoind "
-exec bitcoind -conf="$CONF_FILE" -datadir="$DATADIR" $REINDEX_FLAG -printtoconsole
+bitcoind -conf="$CONF_FILE" -datadir="$DATADIR" $REINDEX_FLAG -printtoconsole &
+
+if [ -e /tmp/utxo-916200.dat ]; then
+	echo "Waiting for initial block import"
+	while true; do
+		INITIAL=`bitcoin-cli -rpcclienttimeout=0 getblockchaininfo | jq -r .headers`
+		if [ -n "$INITIAL" ]; then
+			if [ "$INITIAL" -gt 916200 ]; then
+				echo "initialblockdownload done"
+				bitcoin-cli setnetworkactive false
+				break
+			fi
+		fi
+		sleep 0.5
+	done
+	bitcoin-cli -rpcclienttimeout=0 loadtxoutset /tmp/utxo-916200.dat
+	rm -f /tmp/utxo-916200.dat
+	bitcoin-cli setnetworkactive true
+fi
+
+while true; do sleep 86400; done
