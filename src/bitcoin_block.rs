@@ -1,7 +1,14 @@
 use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
-use bitcoin::{opcodes::{all::{OP_IF, OP_RETURN, OP_ENDIF}, OP_FALSE, OP_TRUE}, script::Instruction, Script, Transaction};
+use bitcoin::{
+    opcodes::{
+        all::{OP_ENDIF, OP_IF, OP_RETURN},
+        OP_FALSE, OP_TRUE,
+    },
+    script::Instruction,
+    Script, Transaction,
+};
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use tracing::{debug, info, trace, warn};
 
@@ -26,7 +33,7 @@ pub fn process_bitcoin_block(
     let mut core_lane_block = CoreLaneBlockParsed::new(
         bitcoin_block_hash.as_bytes().to_vec(),
         bitcoin_block_timestamp,
-        height
+        height,
     );
 
     for (tx_index, tx) in block.txdata.iter().enumerate() {
@@ -55,11 +62,13 @@ pub fn process_bitcoin_block(
             if let Some((tx, sender)) = decode_tx_envelope(&lane_tx) {
                 core_lane_block.add_bundle_from_single_tx(tx, sender, lane_tx);
             } else {
-                warn!("   ❌ Failed to decode Core Lane DA transaction in tx {}: {}", tx_index, txid);
+                warn!(
+                    "   ❌ Failed to decode Core Lane DA transaction in tx {}: {}",
+                    tx_index, txid
+                );
             }
         }
     }
-
 
     Ok(core_lane_block)
 }
@@ -151,10 +160,9 @@ fn extract_burn_payload_from_tx(client: &Client, tx: &Transaction) -> Option<(Ve
         );
         return Some((brn1_payload.unwrap(), p2wsh_burn_value));
     }
-    
+
     None
 }
-
 
 /// Check if script is OP_RETURN
 fn is_op_return_script(script: &Script) -> bool {
