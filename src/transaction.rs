@@ -480,7 +480,7 @@ fn verify_intent_fill_on_bitcoin(
     intent_id: B256,
     block_number: u64,
 ) -> Result<bool> {
-    let client = state.bitcoin_client();
+    let client = state.bitcoin_client_read();
 
     let network = bitcoin::Network::Regtest;
     let intent = state

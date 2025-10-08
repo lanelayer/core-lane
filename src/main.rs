@@ -21,6 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod account;
 mod bitcoin_block;
+mod bitcoin_cache_rpc;
 mod block;
 mod intents;
 mod rpc;
@@ -34,6 +35,7 @@ use account::AccountManager;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
+use bitcoin_cache_rpc::BitcoinCacheRpcServer;
 use intents::{create_anchor_bitcoin_fill_intent, Intent};
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
@@ -52,12 +54,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Start {
+        /// Bitcoin RPC URL for reading blockchain data
         #[arg(long, default_value = "http://127.0.0.1:18443")]
-        rpc_url: String,
+        bitcoin_rpc_read_url: String,
+        /// Bitcoin RPC user for read operations
         #[arg(long, default_value = "user")]
-        rpc_user: String,
+        bitcoin_rpc_read_user: String,
+        /// Bitcoin RPC password for read operations
         #[arg(long)]
-        rpc_password: String,
+        bitcoin_rpc_read_password: String,
+        /// Bitcoin RPC URL for writing/wallet operations (optional, defaults to read URL)
+        #[arg(long)]
+        bitcoin_rpc_write_url: Option<String>,
+        /// Bitcoin RPC user for write operations (optional, defaults to read user)
+        #[arg(long)]
+        bitcoin_rpc_write_user: Option<String>,
+        /// Bitcoin RPC password for write operations (optional, defaults to read password)
+        #[arg(long)]
+        bitcoin_rpc_write_password: Option<String>,
         #[arg(long)]
         start_block: Option<u64>,
         #[arg(long, default_value = "127.0.0.1")]
@@ -105,6 +119,22 @@ enum Commands {
         max_fee: u64,
         #[arg(long)]
         expire_by: u64,
+    },
+    BitcoinCache {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value = "8332")]
+        port: u16,
+        #[arg(long, default_value = "./bitcoin-cache")]
+        cache_dir: String,
+        #[arg(long)]
+        bitcoin_rpc_url: String,
+        #[arg(long, default_value = "")]
+        bitcoin_rpc_user: String,
+        #[arg(long, default_value = "")]
+        bitcoin_rpc_password: String,
+        #[arg(long)]
+        no_rpc_auth: bool,
     },
 }
 
@@ -275,29 +305,36 @@ struct CoreLaneState {
     current_block: Option<CoreLaneBlock>, // Current block being built
     genesis_block: CoreLaneBlock,         // Genesis block
     intents: HashMap<B256, Intent>,
-    bitcoin_client: Arc<Client>,
+    bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
+    bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
     stored_blobs: HashSet<B256>,
 }
 
 impl CoreLaneState {
-    pub fn bitcoin_client(&self) -> Arc<Client> {
-        self.bitcoin_client.clone()
+    pub fn bitcoin_client_read(&self) -> Arc<Client> {
+        self.bitcoin_client_read.clone()
+    }
+
+    pub fn bitcoin_client_write(&self) -> Arc<Client> {
+        self.bitcoin_client_write.clone()
     }
 }
 
 struct CoreLaneNode {
-    bitcoin_client: Arc<Client>,
+    bitcoin_client_read: Arc<Client>,
+    bitcoin_client_write: Arc<Client>,
     state: Arc<Mutex<CoreLaneState>>,
 }
 
 impl CoreLaneNode {
-    fn new(bitcoin_client: Client) -> Self {
+    fn new(bitcoin_client_read: Client, bitcoin_client_write: Client) -> Self {
         let genesis_block = CoreLaneBlock::genesis();
         let genesis_hash = genesis_block.hash;
 
         let mut blocks = HashMap::new();
         let mut block_hashes = HashMap::new();
-        let bitcoin_client = Arc::new(bitcoin_client);
+        let bitcoin_client_read = Arc::new(bitcoin_client_read);
+        let bitcoin_client_write = Arc::new(bitcoin_client_write);
 
         // Store genesis block
         blocks.insert(0, genesis_block.clone());
@@ -313,12 +350,14 @@ impl CoreLaneNode {
             current_block: None,
             genesis_block,
             intents: HashMap::new(),
-            bitcoin_client: bitcoin_client.clone(),
+            bitcoin_client_read: bitcoin_client_read.clone(),
+            bitcoin_client_write: bitcoin_client_write.clone(),
             stored_blobs: HashSet::new(),
         }));
 
         Self {
-            bitcoin_client: bitcoin_client.clone(),
+            bitcoin_client_read: bitcoin_client_read.clone(),
+            bitcoin_client_write: bitcoin_client_write.clone(),
             state,
         }
     }
@@ -426,7 +465,7 @@ impl CoreLaneNode {
     }
 
     async fn scan_new_blocks(&self) -> Result<()> {
-        let tip = self.bitcoin_client.get_block_count()?;
+        let tip = self.bitcoin_client_read.get_block_count()?;
 
         // Get the starting block without holding the lock
         let start_block = {
@@ -449,7 +488,7 @@ impl CoreLaneNode {
         );
 
         for height in start_block..=tip {
-            let bitcoin_block = process_bitcoin_block(self.bitcoin_client.clone(), height)?;
+            let bitcoin_block = process_bitcoin_block(self.bitcoin_client_read.clone(), height)?;
 
             match self.process_block(bitcoin_block).await {
                 Ok(_) => {
@@ -641,9 +680,9 @@ impl CoreLaneNode {
         info!("   ETH address: {}", eth_address);
         info!("   Payload: {} bytes", payload.len());
 
-        // Check wallet balance
+        // Check wallet balance - use write client for wallet operations
         let balance_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getbalances", &[]);
+            self.bitcoin_client_write.call("getbalances", &[]);
 
         match balance_result {
             Ok(balances) => {
@@ -672,8 +711,8 @@ impl CoreLaneNode {
 
         info!("📡 Creating burn transaction...");
 
-        // Get list of unspent outputs
-        let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+        // Get list of unspent outputs - use write client for wallet operations
+        let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
             "listunspent",
             &[
                 serde_json::json!(0),
@@ -766,8 +805,8 @@ impl CoreLaneNode {
 
         // Add change output if substantial enough
         if change_amount > 546 {
-            // dust threshold
-            let change_addr_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
+            // dust threshold - use write client for wallet operations
+            let change_addr_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
                 "getnewaddress",
                 &[serde_json::json!(wallet), serde_json::json!("bech32")],
             );
@@ -806,9 +845,9 @@ impl CoreLaneNode {
         // Now we need to sign the transaction using the wallet
         // We'll use the signrawtransactionwithwallet RPC call
 
-        // Sign the transaction
+        // Sign the transaction - use write client for wallet operations
         let signed_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
+            .bitcoin_client_write
             .call("signrawtransactionwithwallet", &[serde_json::json!(raw_tx)]);
 
         let signed_tx = match signed_result {
@@ -822,9 +861,9 @@ impl CoreLaneNode {
             Err(e) => return Err(anyhow!("Failed to sign transaction: {}", e)),
         };
 
-        // Broadcast the transaction
+        // Broadcast the transaction - use write client
         let tx_result: Result<bitcoin::Txid, _> = self
-            .bitcoin_client
+            .bitcoin_client_write
             .call("sendrawtransaction", &[serde_json::json!(signed_tx)]);
 
         match tx_result {
@@ -855,7 +894,8 @@ impl CoreLaneNode {
         network: bitcoin::Network,
     ) -> Result<()> {
         // Delegate to the TaprootDA implementation which handles all validation and logic
-        let taproot_da = TaprootDA::new(self.bitcoin_client.clone());
+        // Use write client for DA transactions (wallet operations)
+        let taproot_da = TaprootDA::new(self.bitcoin_client_write.clone());
         let _bitcoin_txid = taproot_da
             .send_transaction_to_da(raw_tx_hex, wallet, network)
             .await?;
@@ -880,20 +920,47 @@ async fn main() -> Result<()> {
 
     match &cli.command {
         Commands::Start {
-            rpc_url,
-            rpc_user,
-            rpc_password,
+            bitcoin_rpc_read_url,
+            bitcoin_rpc_read_user,
+            bitcoin_rpc_read_password,
+            bitcoin_rpc_write_url,
+            bitcoin_rpc_write_user,
+            bitcoin_rpc_write_password,
             start_block,
             http_host,
             http_port,
             rpc_wallet,
         } => {
             let wallet = rpc_wallet.to_string();
-            let client = bitcoincore_rpc::Client::new(
-                &format!("{}/wallet/{}", rpc_url, rpc_wallet),
-                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
+
+            // Create read client (without wallet endpoint)
+            let read_client = bitcoincore_rpc::Client::new(
+                bitcoin_rpc_read_url,
+                Auth::UserPass(
+                    bitcoin_rpc_read_user.to_string(),
+                    bitcoin_rpc_read_password.to_string(),
+                ),
             )?;
-            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+
+            // Create write client - use write params if provided, otherwise use read params
+            let write_url = bitcoin_rpc_write_url
+                .as_ref()
+                .unwrap_or(bitcoin_rpc_read_url);
+            let write_user = bitcoin_rpc_write_user
+                .as_ref()
+                .unwrap_or(bitcoin_rpc_read_user);
+            let write_password = bitcoin_rpc_write_password
+                .as_ref()
+                .unwrap_or(bitcoin_rpc_read_password);
+
+            // Write client connects to wallet endpoint for wallet operations
+            let write_client = bitcoincore_rpc::Client::new(
+                &format!("{}/wallet/{}", write_url, rpc_wallet),
+                Auth::UserPass(write_user.to_string(), write_password.to_string()),
+            )?;
+
+            // Get blockchain info from read client
+            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
                 match chain.as_str() {
@@ -909,13 +976,18 @@ async fn main() -> Result<()> {
                     "No 'chain' field found in getblockchaininfo response"
                 ));
             };
-            let node = CoreLaneNode::new(client);
+
+            info!("🔗 Bitcoin RPC connections configured:");
+            info!("   📖 Read:  {}", bitcoin_rpc_read_url);
+            info!("   ✍️  Write: {}/wallet/{}", write_url, rpc_wallet);
+
+            let node = CoreLaneNode::new(read_client, write_client);
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
             let rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
-                node.bitcoin_client.clone(),
+                node.bitcoin_client_write.clone(),
                 network,
                 wallet,
             );
@@ -949,14 +1021,20 @@ async fn main() -> Result<()> {
             rpc_user,
             rpc_password,
         } => {
-            // add /wallet/<rpc_wallet> to the rpc_url
-            let rpc_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
-            let client = bitcoincore_rpc::Client::new(
-                &rpc_url,
+            // Create read client (without wallet)
+            let read_client = bitcoincore_rpc::Client::new(
+                rpc_url,
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
-            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+            // Create write client with wallet endpoint for wallet operations
+            let write_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
+            let write_client = bitcoincore_rpc::Client::new(
+                &write_url,
+                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
+            )?;
+
+            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
                 match chain.as_str() {
@@ -972,7 +1050,7 @@ async fn main() -> Result<()> {
                     "No 'chain' field found in getblockchaininfo response"
                 ));
             };
-            let node = CoreLaneNode::new(client);
+            let node = CoreLaneNode::new(read_client, write_client);
             node.create_burn_transaction_from_wallet(
                 *burn_amount,
                 *chain_id,
@@ -990,12 +1068,20 @@ async fn main() -> Result<()> {
             rpc_user,
             rpc_password,
         } => {
-            let client = bitcoincore_rpc::Client::new(
+            // Create read client (without wallet)
+            let read_client = bitcoincore_rpc::Client::new(
                 rpc_url,
                 Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
             )?;
 
-            let blockchain_info: serde_json::Value = client.call("getblockchaininfo", &[])?;
+            // Create write client with wallet endpoint for wallet operations
+            let write_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
+            let write_client = bitcoincore_rpc::Client::new(
+                &write_url,
+                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
+            )?;
+
+            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
                 match chain.as_str() {
@@ -1012,7 +1098,7 @@ async fn main() -> Result<()> {
                 ));
             };
 
-            let node = CoreLaneNode::new(client);
+            let node = CoreLaneNode::new(read_client, write_client);
             node.send_transaction_to_da(raw_tx_hex, rpc_wallet, network)
                 .await?;
         }
@@ -1057,6 +1143,141 @@ async fn main() -> Result<()> {
             info!(
                 "   3. The intent will be submitted for bitcoin withdrawal (exit from Core Lane)"
             );
+        }
+
+        Commands::BitcoinCache {
+            host,
+            port,
+            cache_dir,
+            bitcoin_rpc_url,
+            bitcoin_rpc_user,
+            bitcoin_rpc_password,
+            no_rpc_auth,
+        } => {
+            info!("🚀 Starting Bitcoin Cache RPC server...");
+            info!("📁 Cache directory: {}", cache_dir);
+            info!("🔗 Bitcoin RPC: {}", bitcoin_rpc_url);
+
+            // Use HTTP client for public RPCs (no auth), bitcoincore-rpc for authenticated ones
+            let cache_server = if *no_rpc_auth {
+                info!("🔓 Using HTTP client (no authentication)");
+
+                // Health check with HTTP client
+                info!("🏥 Testing Bitcoin RPC connection...");
+                let test_client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to build health check HTTP client: {}", e)
+                    })?;
+                let test_body = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getblockcount",
+                    "params": []
+                });
+
+                match test_client
+                    .post(bitcoin_rpc_url)
+                    .json(&test_body)
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            match response.json::<serde_json::Value>().await {
+                                Ok(json) => {
+                                    if let Some(result) = json.get("result") {
+                                        if let Some(count) = result.as_u64() {
+                                            info!("✅ Bitcoin RPC connection successful! Current block height: {}", count);
+                                        }
+                                    } else if let Some(error) = json.get("error") {
+                                        if !error.is_null() {
+                                            error!("❌ RPC error: {}", error);
+                                            return Err(anyhow::anyhow!(
+                                                "Bitcoin RPC returned error: {}",
+                                                error
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("❌ Failed to parse response: {}", e);
+                                    return Err(anyhow::anyhow!(
+                                        "Invalid JSON response from Bitcoin RPC: {}",
+                                        e
+                                    ));
+                                }
+                            }
+                        } else {
+                            error!("❌ HTTP error: {}", response.status());
+                            return Err(anyhow::anyhow!(
+                                "Bitcoin RPC returned HTTP {}",
+                                response.status()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to connect to Bitcoin RPC: {}", e);
+                        return Err(anyhow::anyhow!(
+                            "Bitcoin RPC health check failed: {}. Please verify:\n\
+                             - URL is correct: {}\n\
+                             - Bitcoin node is running and accessible",
+                            e,
+                            bitcoin_rpc_url
+                        ));
+                    }
+                }
+
+                BitcoinCacheRpcServer::new_with_http(cache_dir, bitcoin_rpc_url.to_string())?
+            } else {
+                info!(
+                    "🔐 Using bitcoincore-rpc client (user: {})",
+                    bitcoin_rpc_user
+                );
+
+                let bitcoin_client = bitcoincore_rpc::Client::new(
+                    bitcoin_rpc_url,
+                    Auth::UserPass(
+                        bitcoin_rpc_user.to_string(),
+                        bitcoin_rpc_password.to_string(),
+                    ),
+                )?;
+
+                // Health check with bitcoincore-rpc
+                info!("🏥 Testing Bitcoin RPC connection...");
+                match bitcoin_client.get_block_count() {
+                    Ok(count) => {
+                        info!(
+                            "✅ Bitcoin RPC connection successful! Current block height: {}",
+                            count
+                        );
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to connect to Bitcoin RPC: {}", e);
+                        return Err(anyhow::anyhow!(
+                            "Bitcoin RPC health check failed: {}. Please verify:\n\
+                             - URL is correct: {}\n\
+                             - Authentication is configured properly\n\
+                             - Bitcoin node is running and accessible",
+                            e,
+                            bitcoin_rpc_url
+                        ));
+                    }
+                }
+
+                BitcoinCacheRpcServer::new(cache_dir, bitcoin_client)?
+            };
+
+            let app = cache_server.router();
+
+            let addr = format!("{}:{}", host, port);
+            info!("📡 Bitcoin Cache RPC listening on http://{}", addr);
+            info!("📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only)");
+
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            axum::serve(listener, app).await?;
         }
     }
 
