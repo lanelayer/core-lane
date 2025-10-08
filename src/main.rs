@@ -135,6 +135,10 @@ enum Commands {
         bitcoin_rpc_password: String,
         #[arg(long)]
         no_rpc_auth: bool,
+        #[arg(long, default_value = "http://144.76.56.210/blocks")]
+        block_archive: String,
+        #[arg(long)]
+        starting_block_count: Option<u64>,
     },
 }
 
@@ -1153,10 +1157,16 @@ async fn main() -> Result<()> {
             bitcoin_rpc_user,
             bitcoin_rpc_password,
             no_rpc_auth,
+            block_archive,
+            starting_block_count,
         } => {
             info!("🚀 Starting Bitcoin Cache RPC server...");
             info!("📁 Cache directory: {}", cache_dir);
             info!("🔗 Bitcoin RPC: {}", bitcoin_rpc_url);
+            info!("📦 Block archive: {}", block_archive);
+            if let Some(start) = starting_block_count {
+                info!("🎯 Starting block for prefetch: {}", start);
+            }
 
             // Use HTTP client for public RPCs (no auth), bitcoincore-rpc for authenticated ones
             let cache_server = if *no_rpc_auth {
@@ -1230,7 +1240,12 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                BitcoinCacheRpcServer::new_with_http(cache_dir, bitcoin_rpc_url.to_string())?
+                BitcoinCacheRpcServer::new_with_http(
+                    cache_dir,
+                    bitcoin_rpc_url.to_string(),
+                    block_archive.to_string(),
+                    *starting_block_count,
+                )?
             } else {
                 info!(
                     "🔐 Using bitcoincore-rpc client (user: {})",
@@ -1267,14 +1282,19 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                BitcoinCacheRpcServer::new(cache_dir, bitcoin_client)?
+                BitcoinCacheRpcServer::new(
+                    cache_dir,
+                    bitcoin_client,
+                    block_archive.to_string(),
+                    *starting_block_count,
+                )?
             };
 
             let app = cache_server.router();
 
             let addr = format!("{}:{}", host, port);
             info!("📡 Bitcoin Cache RPC listening on http://{}", addr);
-            info!("📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only)");
+            info!("📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only), getblockchaininfo");
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;

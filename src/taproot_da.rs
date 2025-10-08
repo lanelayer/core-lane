@@ -426,18 +426,6 @@ impl TaprootDA {
         // Now immediately create a reveal transaction that spends the Taproot output
         tracing::info!("🔍 Creating reveal transaction to immediately expose Core Lane data...");
 
-        // Use the same wallet address for the reveal output (change address from commit)
-        // This ensures the reveal output goes back to our wallet
-        tracing::info!(
-            "📍 Using wallet address for reveal output: {}",
-            change_address
-        );
-
-        // Reveal transaction inputs will be created after we find the correct vout index
-
-        // Create reveal transaction outputs
-        let mut reveal_outputs = serde_json::Map::new();
-
         // Get the Taproot output amount from the commit transaction (parse it directly)
         let commit_tx_bytes = hex::decode(&commit_tx_hex)?;
         let commit_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&commit_tx_bytes)?;
@@ -472,12 +460,6 @@ impl TaprootDA {
         // Get the commit transaction ID from the transaction hash
         let commit_txid = commit_tx.compute_txid();
 
-        // Update the reveal inputs with the correct vout index
-        let reveal_inputs = vec![serde_json::json!({
-            "txid": commit_txid.to_string(),
-            "vout": taproot_vout_index
-        })];
-
         // Calculate exact reveal transaction fee based on payload size (capped to available amount)
         let exact_reveal_fee = self.calculate_exact_reveal_fee(
             &envelope_script,
@@ -496,36 +478,31 @@ impl TaprootDA {
 
         tracing::info!("🔍 Using OP_RETURN output with zero value");
 
-        // Create OP_RETURN output with zero value
-        // For Bitcoin Core RPC, we need to use "data" as the key for OP_RETURN outputs
-        // Add meaningful data to meet minimum transaction size requirements
-        let op_return_data = hex::encode(b"CORELANE");
-        reveal_outputs.insert(
-            "data".to_string(),
-            serde_json::json!(op_return_data), // Core Lane reveal data
-        );
+        // Create OP_RETURN output with Core Lane reveal data
+        let op_return_data = b"CORELANE";
+        let op_return_script = Builder::new()
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_RETURN)
+            .push_slice(op_return_data)
+            .into_script();
 
-        // Create raw reveal transaction
-        let reveal_raw_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "createrawtransaction",
-            &[
-                serde_json::json!(reveal_inputs),
-                serde_json::json!(reveal_outputs),
-            ],
-        );
-
-        let reveal_raw_tx = match reveal_raw_result {
-            Ok(tx) => tx.as_str().unwrap().to_string(),
-            Err(e) => return Err(anyhow!("Failed to create reveal transaction: {}", e)),
+        // Construct reveal transaction directly using bitcoin crate
+        let mut reveal_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: commit_txid,
+                    vout: taproot_vout_index as u32,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(), // Will be set below
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: op_return_script,
+            }],
         };
-
-        if reveal_outputs.is_empty() {
-            tracing::warn!("⚠️  No reveal outputs created");
-        }
-
-        // Sign the reveal transaction with the internal key
-        let mut reveal_tx: Transaction =
-            bitcoin::consensus::deserialize(&hex::decode(&reveal_raw_tx)?)?;
 
         // Add the witness data to reveal the Core Lane transaction
         let mut witness = Witness::new();

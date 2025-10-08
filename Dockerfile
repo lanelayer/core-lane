@@ -10,8 +10,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY . .
-
+COPY src ./src
+COPY Cargo.toml ./Cargo.toml
+COPY Cargo.lock ./Cargo.lock
 RUN cargo build --release
 
 
@@ -29,10 +30,6 @@ WORKDIR /app
 
 
 COPY --from=builder /app/target/release/core-lane-node .
-
-COPY --from=builder /app/scripts ./scripts
-RUN chmod +x scripts/*.sh
-
 EXPOSE 8545
 
 ENV RPC_URL=http://127.0.0.1:18443

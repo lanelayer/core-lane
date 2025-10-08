@@ -18,6 +18,10 @@ pub fn process_bitcoin_block(
     bitcoin_client: Arc<Client>,
     height: u64,
 ) -> Result<CoreLaneBlockParsed, anyhow::Error> {
+    info!(
+        "📦 Processing Bitcoin block {} with height {}",
+        height, height
+    );
     let hash = bitcoin_client.get_block_hash(height)?;
     let block = bitcoin_client.get_block(&hash)?;
 

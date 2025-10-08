@@ -4,9 +4,6 @@ target/
 *~
 *.pdb
 
-# Cargo
-Cargo.lock
-
 # Generated demo files
 *.json
 broadcast_info.json
