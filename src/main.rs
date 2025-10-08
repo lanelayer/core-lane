@@ -522,12 +522,18 @@ impl CoreLaneNode {
             // Conversion rate: 1 sat = 10¹⁰ wei
             // Gas cost for comparable tx: 21,000 gas = 150 bytes
             //
-            if !tx.0.is_eip1559() {
-                warn!("      ⚠️  Non-EIP 1559 transactions are not supported, skipping: {:?}", tx.0);
-                return None;
-            }
-            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
-                warn!("      ⚠️  Gas fee is greater than the transaction max fee per gas, skipping: {:?}", tx.0);
+            if tx.0.is_eip1559() {
+                if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
+                    warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
+                    return None;
+                }
+            } else if tx.0.is_legacy() {
+                if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
+                    warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
+                    return None;
+                }
+            } else {
+                warn!("      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}", tx.0);
                 return None;
             }
             let gas_fee =  gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
