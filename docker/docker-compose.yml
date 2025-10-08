@@ -1,45 +1,70 @@
-version: "3.8"
-
 services:
-  bitcoind:
-    build: ./bitcoind
-    container_name: bitcoind
+  # bitcoind:
+  #   build: ./bitcoind
+  #   container_name: bitcoind
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8332:8332"   # RPC
+  #     - "8333:8333"   # P2P
+  #     - "28332:28332" # ZMQ raw block
+  #     - "28333:28333" # ZMQ raw tx
+  #   environment:
+  #     - RPC_USER=${RPC_USER}
+  #     - RPC_PASSWORD=${RPC_PASSWORD}
+  #   volumes:
+  #     - bitcoind:/home/bitcoin/.bitcoin
+  #   networks:
+  #     - lane-network
+  #   healthcheck:
+  #     test: ["CMD", "bitcoin-cli", "-rpcuser=${RPC_USER}", "-rpcpassword=${RPC_PASSWORD}", "getblockchaininfo"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #     start_period: 600s
+
+  bitcoin-cache:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: bitcoin-cache
     restart: unless-stopped
     ports:
-      - "8332:8332"   # RPC
-      - "8333:8333"   # P2P
-      - "28332:28332" # ZMQ raw block
-      - "28333:28333" # ZMQ raw tx
-    environment:
-      - RPC_USER=${RPC_USER}
-      - RPC_PASSWORD=${RPC_PASSWORD}
+      - "8332:8332"   # Bitcoin Cache RPC
+    command: >
+      /app/core-lane-node bitcoin-cache
+      --host 0.0.0.0
+      --port 8332
+      --cache-dir /cache
+      --bitcoin-rpc-url https://bitcoin-rpc.publicnode.com
+      --block-archive http://144.76.56.210/blocks
+      --starting-block-count 916201
+      --no-rpc-auth
     volumes:
-      - bitcoind:/home/bitcoin/.bitcoin
+      - bitcoin-cache:/cache
     networks:
       - lane-network
-    healthcheck:
-      test: ["CMD", "bitcoin-cli", "-rpcuser=${RPC_USER}", "-rpcpassword=${RPC_PASSWORD}", "getblockchaininfo"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 600s
 
   core-lane:
-    image: ghcr.io/lanelayer/core-lane/core-lane:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
     container_name: core-lane
     depends_on:
-      bitcoind:
-        condition: service_healthy
+      - bitcoin-cache
+    ports:
+      - "8545:8545"   # Core Lane RPC
     command: >
       /app/core-lane-node start
-      --bitcoin-rpc-read-url http://bitcoind:8332
+      --bitcoin-rpc-read-url http://bitcoin-cache:8332
       --bitcoin-rpc-read-user ${RPC_USER}
       --bitcoin-rpc-read-password ${RPC_PASSWORD}
-      --bitcoin-rpc-write-url http://bitcoind:8332
+      --bitcoin-rpc-write-url http://bitcoin-cache:8332
       --bitcoin-rpc-write-user ${RPC_USER}
       --bitcoin-rpc-write-password ${RPC_PASSWORD}
       --start-block 916201
       --rpc-wallet hot
+      --http-host 0.0.0.0
+      --http-port 8545
     volumes:
       - core-lane:/data
     restart: unless-stopped
@@ -51,5 +76,6 @@ networks:
     driver: bridge
 
 volumes:
-  bitcoind:
+  # bitcoind:
+  bitcoin-cache:
   core-lane:
