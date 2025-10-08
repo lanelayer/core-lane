@@ -1,4 +1,4 @@
-FROM rust:1.86
+FROM rust:1.86 AS builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -12,8 +12,26 @@ WORKDIR /app
 
 COPY . .
 
-RUN cargo build --release && \
-    chmod +x scripts/*.sh
+RUN cargo build --release
+
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y \
+    libssl3 \
+    libudev1 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+
+WORKDIR /app
+
+
+COPY --from=builder /app/target/release/core-lane-node .
+
+COPY --from=builder /app/scripts ./scripts
+RUN chmod +x scripts/*.sh
 
 EXPOSE 8545
 
@@ -21,4 +39,4 @@ ENV RPC_URL=http://127.0.0.1:18443
 ENV HTTP_HOST=0.0.0.0
 ENV HTTP_PORT=8545
 
-CMD ["./target/release/core-lane-node", "start", "--rpc-url", "http://127.0.0.1:18443", "--http-host", "0.0.0.0", "--http-port", "8545"]
+CMD ["./core-lane-node", "start", "--rpc-url", "http://127.0.0.1:18443", "--http-host", "0.0.0.0", "--http-port", "8545"]

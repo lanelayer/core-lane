@@ -31,7 +31,7 @@ services:
       bitcoind:
         condition: service_healthy
     command: >
-      /app/target/release/core-lane-node start
+      /app/core-lane-node start
       --rpc-url http://bitcoind:8332
       --rpc-user ${RPC_USER}
       --rpc-password ${RPC_PASSWORD}
