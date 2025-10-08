@@ -6,7 +6,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct CoreLaneAccount {
     pub balance: U256,
-    pub nonce: U256
+    pub nonce: U256,
 }
 
 impl CoreLaneAccount {

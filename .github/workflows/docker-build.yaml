@@ -26,6 +26,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
+      - name: Run Rustfmt
+        run: cargo fmt --all -- --check
+
       - name: Cache Rust dependencies
         uses: actions/cache@v3
         with:

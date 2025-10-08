@@ -20,10 +20,10 @@ use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod account;
-mod intents;
-mod block;
-mod rpc;
 mod bitcoin_block;
+mod block;
+mod intents;
+mod rpc;
 mod taproot_da;
 mod transaction;
 
@@ -31,15 +31,13 @@ mod transaction;
 mod tests;
 
 use account::AccountManager;
-use alloy_consensus::{TxEnvelope};
+use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
 use intents::{create_anchor_bitcoin_fill_intent, Intent};
 use rpc::RpcServer;
 use taproot_da::TaprootDA;
-use transaction::{
-    execute_transaction,
-};
+use transaction::execute_transaction;
 
 use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 
@@ -342,8 +340,11 @@ impl CoreLaneNode {
             state.genesis_block.hash
         };
 
-
-        let anchor_block_timestamp = if let Some(ref block_origin) = block_origin { block_origin.anchor_block_timestamp } else { 0 };
+        let anchor_block_timestamp = if let Some(ref block_origin) = block_origin {
+            block_origin.anchor_block_timestamp
+        } else {
+            0
+        };
 
         // Create new block with Bitcoin block timestamp
         let mut new_block = CoreLaneBlock::new(
@@ -449,7 +450,7 @@ impl CoreLaneNode {
 
         for height in start_block..=tip {
             let bitcoin_block = process_bitcoin_block(self.bitcoin_client.clone(), height)?;
-            
+
             match self.process_block(bitcoin_block).await {
                 Ok(_) => {
                     // Update the last processed block
@@ -467,23 +468,24 @@ impl CoreLaneNode {
     }
 
     async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<()> {
-        let new_block = self
-            .create_new_block(Some(bitcoin_block))
-            .await?;
+        let new_block = self.create_new_block(Some(bitcoin_block)).await?;
 
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
 
         if let Some(block_origin) = new_block_clone.block_origin {
             debug!("🔥 Phase 1: Processing burns...");
-            for burn in  block_origin.burns.iter() {
+            for burn in block_origin.burns.iter() {
                 let mut state = self.state.lock().await;
                 info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
-                state.account_manager.add_balance(burn.address, burn.amount)?;
+                state
+                    .account_manager
+                    .add_balance(burn.address, burn.amount)?;
             }
             let mut tx_count = 0;
             for bundle in block_origin.bundles.iter() {
-                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number {
+                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
+                {
                     // skip this bundle because it's not valid for this block
                     continue;
                 }
@@ -497,11 +499,10 @@ impl CoreLaneNode {
                     }
                 }
             }
-    
         }
         // Finalize the Core Lane block
         self.finalize_current_block(core_lane_transactions, new_block)
-            .await?;                
+            .await?;
         // Phase 1: Process ALL Bitcoin burns first to mint Core Lane tokens
 
         Ok(())
@@ -536,9 +537,13 @@ impl CoreLaneNode {
                 warn!("      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}", tx.0);
                 return None;
             }
-            let gas_fee =  gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
+            let gas_fee =
+                gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
             if let Err(e) = state.account_manager.sub_balance(tx.1, gas_fee) {
-                warn!("      ⚠️  Failed to charge gas fee ahead of tx execution: {}", e);
+                warn!(
+                    "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
+                    e
+                );
                 return None;
             } else {
                 info!("      💰 Charged gas fee: {} wei", gas_fee);
@@ -591,7 +596,7 @@ impl CoreLaneNode {
         );
         Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
     }
-    
+
     /// Create a Bitcoin burn transaction using RPC wallet
     async fn create_burn_transaction_from_wallet(
         &self,

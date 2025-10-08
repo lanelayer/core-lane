@@ -14,7 +14,6 @@ pub struct CoreLaneBundle {
     pub transactions: Vec<(TxEnvelope, Address, Vec<u8>)>,
 }
 
-
 impl CoreLaneBundle {
     pub fn new(transaction: TxEnvelope, sender: Address, raw_tx: Vec<u8>) -> Self {
         Self {
@@ -47,7 +46,11 @@ pub struct CoreLaneBlockParsed {
 }
 
 impl CoreLaneBlockParsed {
-    pub fn new(anchor_block_hash: Vec<u8>, anchor_block_timestamp: u64, anchor_block_height: u64) -> Self {
+    pub fn new(
+        anchor_block_hash: Vec<u8>,
+        anchor_block_timestamp: u64,
+        anchor_block_height: u64,
+    ) -> Self {
         Self {
             bundles: Vec::new(),
             burns: Vec::new(),
@@ -83,7 +86,10 @@ pub fn decode_tx_envelope(tx_data: &[u8]) -> Option<(TxEnvelope, Address)> {
             Some((tx, sender))
         }
         Err(_) => {
-            error!("   ❌ Failed to decode tx envelope: {}", hex::encode(tx_data));
+            error!(
+                "   ❌ Failed to decode tx envelope: {}",
+                hex::encode(tx_data)
+            );
             None
         }
     }
@@ -119,12 +125,13 @@ pub fn recover_sender(tx: &TxEnvelope) -> anyhow::Result<Address> {
                 )),
             }
         }
-        TxEnvelope::Eip4844(signed_tx) => {
-            match signed_tx.recover_signer() {
-                Ok(address) => Ok(address),
-                Err(e) => Err(anyhow!("Failed to recover signer from EIP-4844 tx: {:?}", e)),
-            }
-        }
+        TxEnvelope::Eip4844(signed_tx) => match signed_tx.recover_signer() {
+            Ok(address) => Ok(address),
+            Err(e) => Err(anyhow!(
+                "Failed to recover signer from EIP-4844 tx: {:?}",
+                e
+            )),
+        },
         _ => Err(anyhow!("Unsupported transaction type for sender recovery")),
     }
 }
