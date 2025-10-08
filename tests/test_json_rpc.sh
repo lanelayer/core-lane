@@ -8,7 +8,7 @@ echo "======================================"
 
 # Start the Core Lane node in the background
 echo "🚀 Starting Core Lane node..."
-cargo run -- start --rpc-user bitcoin --rpc-password bitcoin123 --http-host 127.0.0.1 --http-port 8545 --rpc-wallet mine &
+cargo run -- start --bitcoin-rpc-read-user bitcoin --bitcoin-rpc-read-password bitcoin123 --http-host 127.0.0.1 --http-port 8545 --rpc-wallet mine &
 NODE_PID=$!
 
 # Wait for node to start

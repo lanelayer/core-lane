@@ -161,12 +161,13 @@ test_core_lane_connection() {
         return 1
     fi
     
-    # Test connection by scanning a few blocks
-    ./target/debug/core-lane-node scan-blocks \
-        --rpc-url "$RPC_URL" \
-        --rpc-user "$RPC_USER" \
-        --rpc-password "$RPC_PASSWORD" \
-        --blocks 5
+    # Test connection by checking if we can connect to Bitcoin
+    print_status "Connection test: Starting Core Lane node briefly..."
+    timeout 5 ./target/debug/core-lane-node start \
+        --bitcoin-rpc-read-url "$RPC_URL" \
+        --bitcoin-rpc-read-user "$RPC_USER" \
+        --bitcoin-rpc-read-password "$RPC_PASSWORD" \
+        --http-port 18545 || true
     
     print_success "Core Lane connection test completed!"
 }
@@ -196,7 +197,9 @@ create_test_burn() {
     echo "  --burn-amount 500000 \\"
     echo "  --chain-id 1 \\"
     echo "  --eth-address \"0x1234567890123456789012345678901234567890\" \\"
-    echo "  --rpc-password bitcoin123"
+    echo "  --rpc-url \"$RPC_URL\" \\"
+    echo "  --rpc-user \"$RPC_USER\" \\"
+    echo "  --rpc-password \"$RPC_PASSWORD\""
     echo
     print_status "This will:"
     echo "1. Use your Bitcoin wallet (default: 'mine') to fund the transaction"

@@ -192,7 +192,10 @@ test_burn_transaction() {
         --burn-amount $TEST_BURN_AMOUNT \
         --chain-id $TEST_CHAIN_ID \
         --eth-address $TEST_ETH_ADDRESS \
-        --rpc-password $RPC_PASSWORD 2>&1)
+        --rpc-url $RPC_URL \
+        --rpc-user $RPC_USER \
+        --rpc-password $RPC_PASSWORD \
+        --rpc-wallet $RPC_WALLET 2>&1)
     
     if echo "$burn_output" | grep -q "✅ Burn transaction created and broadcast successfully"; then
         # Extract transaction ID
@@ -221,8 +224,10 @@ test_send_ethereum_transaction() {
     # Send the transaction using CLI for verification purposes
     local send_output=$(./target/debug/core-lane-node send-transaction \
         --raw-tx-hex "$sample_eth_tx" \
-        --rpc-wallet "mine" \
-        --rpc-password $RPC_PASSWORD 2>&1)
+        --rpc-url "$RPC_URL" \
+        --rpc-user "$RPC_USER" \
+        --rpc-password "$RPC_PASSWORD" \
+        --rpc-wallet "mine" 2>&1)
     
     if echo "$send_output" | grep -q "✅ Core Lane transaction package submitted successfully"; then
         # Extract transaction IDs
@@ -283,8 +288,9 @@ test_send_ethereum_transaction() {
     # Start the Core Lane node with JSON-RPC to test the RPC interface
     print_status "Starting Core Lane node with JSON-RPC for RPC testing..."
     RUST_LOG=info ./target/debug/core-lane-node start \
-        --rpc-user $RPC_USER \
-        --rpc-password $RPC_PASSWORD \
+        --bitcoin-rpc-read-url $RPC_URL \
+        --bitcoin-rpc-read-user $RPC_USER \
+        --bitcoin-rpc-read-password $RPC_PASSWORD \
         --http-host 127.0.0.1 \
         --rpc-wallet $RPC_WALLET \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_rpc_output 2>&1 &
@@ -546,8 +552,9 @@ test_start_core_lane_node() {
     # Start Core Lane node with JSON-RPC in background
     RUST_LOG=info ./target/debug/core-lane-node start \
         --start-block $scan_from_block \
-        --rpc-user $RPC_USER \
-        --rpc-password $RPC_PASSWORD \
+        --bitcoin-rpc-read-url $RPC_URL \
+        --bitcoin-rpc-read-user $RPC_USER \
+        --bitcoin-rpc-read-password $RPC_PASSWORD \
         --rpc-wallet $RPC_WALLET \
         --http-host 127.0.0.1 \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_output 2>&1 &
