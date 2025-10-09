@@ -53,8 +53,14 @@ services:
       - bitcoin-cache
     ports:
       - "8545:8545"   # Core Lane RPC
+    environment:
+      - CORE_LANE_MNEMONIC=${CORE_LANE_MNEMONIC}
+      - NETWORK=${NETWORK:-mainnet}
+      - ELECTRUM_URL=${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}
     command: >
+      sh -c "
       /app/core-lane-node start
+      --data-dir /data
       --bitcoin-rpc-read-url http://bitcoin-cache:8332
       --bitcoin-rpc-read-user ${RPC_USER}
       --bitcoin-rpc-read-password ${RPC_PASSWORD}
@@ -63,10 +69,13 @@ services:
       --bitcoin-rpc-write-password ${RPC_PASSWORD}
       --start-block 916201
       --rpc-wallet hot
+      --mnemonic \"$$CORE_LANE_MNEMONIC\"
+      --electrum-url \"$$ELECTRUM_URL\"
       --http-host 0.0.0.0
       --http-port 8545
+      "
     volumes:
-      - core-lane:/data
+      - core-lane:/data  # Persist wallet database and state
     restart: unless-stopped
     networks:
       - lane-network
@@ -78,4 +87,4 @@ networks:
 volumes:
   # bitcoind:
   bitcoin-cache:
-  core-lane:
+  core-lane:  # Stores wallet databases (wallet_<network>.sqlite3) and state

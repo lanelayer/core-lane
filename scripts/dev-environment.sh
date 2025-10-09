@@ -98,10 +98,10 @@ setup_bdk_wallet() {
     print_status "Setting up BDK wallet..."
 
     # Check if core-lane-node is built
-    if [ ! -f "./target/release/core-lane-node" ]; then
-        print_error "Core Lane node is not built (release mode)"
+    if [ ! -f "./target/debug/core-lane-node" ]; then
+        print_error "Core Lane node is not built (debug mode)"
         print_status "Building now..."
-        cargo build --release
+        cargo build
     fi
 
     # Clean up any existing wallet
@@ -109,7 +109,7 @@ setup_bdk_wallet() {
     rm -f wallet_regtest.sqlite3
 
     # Create BDK wallet and capture mnemonic
-    local mnemonic=$(./target/release/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
+    local mnemonic=$(./target/debug/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
     
     if [ -z "$mnemonic" ]; then
         print_error "Failed to create BDK wallet"
@@ -125,7 +125,7 @@ setup_bdk_wallet() {
     print_status "Mnemonic: $mnemonic"
 
     # Generate mining address from BDK wallet
-    local mining_address=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+    local mining_address=$(./target/debug/core-lane-node --plain get-address --network regtest 2>/dev/null)
     print_status "Mining address (BDK): $mining_address"
 
     # Mine 101 blocks to activate coinbase (maturity) - all to BDK wallet
@@ -151,13 +151,21 @@ burn_btc_to_address() {
 
     print_status "Burning $amount sats to $address..."
 
+    # Check mnemonic file exists
+    if [ ! -f ".dev-wallets/mnemonic_regtest.txt" ]; then
+        print_error "Mnemonic not found! Setup BDK wallet first."
+        return 1
+    fi
+
     local burn_output=$(./target/debug/core-lane-node burn \
         --burn-amount $amount \
         --chain-id $chain_id \
         --eth-address $address \
+        --network regtest \
+        --mnemonic-file ".dev-wallets/mnemonic_regtest.txt" \
         --rpc-password $RPC_PASSWORD 2>&1)
 
-    if echo "$burn_output" | grep -q "✅ Burn transaction created and broadcast successfully"; then
+    if echo "$burn_output" | grep -q "✅ Burn transaction broadcast successfully"; then
         local txid=$(echo "$burn_output" | grep "📍 Transaction ID:" | grep -o '[a-f0-9]\{64\}')
         print_success "Burn transaction created: $txid"
         return 0
@@ -175,10 +183,17 @@ start_core_lane_node() {
         exit 1
     fi
 
+    # Check mnemonic file exists
+    if [ ! -f ".dev-wallets/mnemonic_regtest.txt" ]; then
+        print_error "Mnemonic not found! Setup BDK wallet first."
+        exit 1
+    fi
+
     RUST_LOG=info,debug ./target/debug/core-lane-node start \
         --start-block 0 \
-        --rpc-user $RPC_USER \
-        --rpc-password $RPC_PASSWORD \
+        --bitcoin-rpc-read-user $RPC_USER \
+        --bitcoin-rpc-read-password $RPC_PASSWORD \
+        --mnemonic-file ".dev-wallets/mnemonic_regtest.txt" \
         --http-host 127.0.0.1 \
         --http-port $JSON_RPC_PORT &
 
@@ -204,7 +219,7 @@ start_mining_loop() {
             sleep 10
             if is_bitcoin_running; then
                 # Get new address from BDK wallet for mining rewards
-                local address=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+                local address=$(./target/debug/core-lane-node --plain get-address --network regtest 2>/dev/null)
                 if [ -n "$address" ]; then
                     bitcoin_cli generatetoaddress 1 "$address" >/dev/null 2>&1
                     local block_count=$(bitcoin_cli getblockcount)
@@ -327,13 +342,12 @@ start_dev_environment() {
     
     start_core_lane_node
 
+
+    start_mining_loop
     print_status "Burning BTC to test addresses..."
     for address in "${ANVIL_ADDRESSES[@]}"; do
         burn_btc_to_address "$address" 1000000 1
-        sleep 2
     done
-
-    start_mining_loop
     sleep 5
     check_balances
 
