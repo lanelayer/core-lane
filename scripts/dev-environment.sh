@@ -94,25 +94,54 @@ start_bitcoin() {
     print_success "Bitcoin regtest network started!"
 }
 
-setup_bitcoin_wallet() {
-    print_status "Setting up Bitcoin wallet..."
+setup_bdk_wallet() {
+    print_status "Setting up BDK wallet..."
 
-    bitcoin_cli createwallet "mine" 2>/dev/null || print_warning "Wallet 'mine' already exists"
+    # Check if core-lane-node is built
+    if [ ! -f "./target/release/core-lane-node" ]; then
+        print_error "Core Lane node is not built (release mode)"
+        print_status "Building now..."
+        cargo build --release
+    fi
 
-    local address=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
-    print_status "Generated address: $address"
+    # Clean up any existing wallet
+    rm -rf .dev-wallets
+    rm -f wallet_regtest.sqlite3
 
+    # Create BDK wallet and capture mnemonic
+    local mnemonic=$(./target/release/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
+    
+    if [ -z "$mnemonic" ]; then
+        print_error "Failed to create BDK wallet"
+        return 1
+    fi
+
+    # Save mnemonic to file
+    mkdir -p .dev-wallets
+    echo "$mnemonic" > .dev-wallets/mnemonic_regtest.txt
+    
+    print_success "BDK wallet created"
+    print_status "Mnemonic saved to: .dev-wallets/mnemonic_regtest.txt"
+    print_status "Mnemonic: $mnemonic"
+
+    # Generate mining address from BDK wallet
+    local mining_address=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+    print_status "Mining address (BDK): $mining_address"
+
+    # Mine 101 blocks to activate coinbase (maturity) - all to BDK wallet
     print_status "Mining 101 blocks to activate coinbase..."
-    bitcoin_cli -rpcwallet=mine generatetoaddress 101 "$address" >/dev/null 2>&1
+    bitcoin_cli generatetoaddress 101 "$mining_address" >/dev/null 2>&1
 
-    local balance_info=$(bitcoin_cli -rpcwallet=mine getbalances)
-    local mineable_balance=$(echo "$balance_info" | grep -o '"mineable": [0-9.]*' | grep -o '[0-9.]*')
-    print_status "Mined 101 blocks. Mineable balance: $mineable_balance BTC"
+    print_status "Mined 101 blocks to BDK wallet"
 
-    bitcoin_cli -rpcwallet=mine generatetoaddress 10 "$address" >/dev/null 2>&1
+    # Mine 10 more blocks for good measure
+    print_status "Mining 10 more blocks..."
+    bitcoin_cli generatetoaddress 10 "$mining_address" >/dev/null 2>&1
 
-    local final_balance=$(bitcoin_cli -rpcwallet=mine getbalances | grep -o '"mineable": [0-9.]*' | grep -o '[0-9.]*')
-    print_success "Final balance: $final_balance BTC"
+    # Show block count
+    local block_count=$(bitcoin_cli getblockcount)
+    print_success "Total blocks: $block_count"
+    print_success "BDK wallet funded with mining rewards"
 }
 
 burn_btc_to_address() {
@@ -174,10 +203,15 @@ start_mining_loop() {
         while true; do
             sleep 10
             if is_bitcoin_running; then
-                local address=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
-                bitcoin_cli -rpcwallet=mine generatetoaddress 1 "$address" >/dev/null 2>&1
-                local block_count=$(bitcoin_cli getblockcount)
-                print_status "Mined block $block_count"
+                # Get new address from BDK wallet for mining rewards
+                local address=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+                if [ -n "$address" ]; then
+                    bitcoin_cli generatetoaddress 1 "$address" >/dev/null 2>&1
+                    local block_count=$(bitcoin_cli getblockcount)
+                    print_status "Mined block $block_count (reward to BDK wallet)"
+                else
+                    print_warning "Failed to get BDK address, skipping block"
+                fi
             else
                 print_warning "Bitcoin not running, stopping mining loop"
                 break
@@ -288,7 +322,9 @@ start_dev_environment() {
         print_warning "Bitcoin is already running"
     fi
 
-    setup_bitcoin_wallet
+    # Setup BDK wallet (used for mining and Core Lane operations)
+    setup_bdk_wallet
+    
     start_core_lane_node
 
     print_status "Burning BTC to test addresses..."
@@ -315,6 +351,7 @@ start_dev_environment() {
         echo "  ($i) ${ANVIL_ADDRESSES[$i]}"
     done
     echo ""
+    echo "💰 BDK Wallet mnemonic: .dev-wallets/mnemonic_regtest.txt"
     echo "⛏️  Mining blocks every 10 seconds..."
     echo "🛑 Use '$0 stop' to stop the environment"
 }

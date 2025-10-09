@@ -47,6 +47,10 @@ use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 #[command(name = "core-lane-node")]
 #[command(about = "Core Lane Node - Bitcoin-anchored execution environment")]
 struct Cli {
+    /// Plain output mode (no emojis, machine-readable)
+    #[arg(long, global = true)]
+    plain: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -139,6 +143,19 @@ enum Commands {
         block_archive: String,
         #[arg(long)]
         starting_block_count: Option<u64>,
+    },
+    CreateWallet {
+        /// Network to create wallet for (bitcoin, testnet, signet, regtest)
+        #[arg(long, default_value = "regtest")]
+        network: String,
+        /// Optional mnemonic phrase to restore wallet (12 or 24 words)
+        #[arg(long)]
+        mnemonic: Option<String>,
+    },
+    GetAddress {
+        /// Network of the wallet to load (bitcoin, testnet, signet, regtest)
+        #[arg(long, default_value = "regtest")]
+        network: String,
     },
 }
 
@@ -857,18 +874,20 @@ impl CoreLaneNode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "core_lane_node=info,tower_http=debug".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    info!("Starting Core Lane Node");
-
     let cli = Cli::parse();
+
+    // Initialize tracing only if not in plain mode
+    if !cli.plain {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "core_lane_node=info,tower_http=debug".into()),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+
+        info!("Starting Core Lane Node");
+    }
 
     match &cli.command {
         Commands::Start {
@@ -1246,6 +1265,152 @@ async fn main() -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;
+        }
+
+        Commands::CreateWallet {
+            network,
+            mnemonic: mnemonic_opt,
+        } => {
+            use bdk_wallet::bitcoin::Network as BdkNetwork;
+            use bdk_wallet::keys::{
+                bip39::{Language, Mnemonic, WordCount},
+                DerivableKey, ExtendedKey, GeneratableKey, GeneratedKey,
+            };
+            use bdk_wallet::rusqlite::Connection;
+            use bdk_wallet::{KeychainKind, Wallet};
+
+            // Parse network
+            let bdk_network = match network.as_str() {
+                "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
+                "testnet" => BdkNetwork::Testnet,
+                "signet" => BdkNetwork::Signet,
+                "regtest" => BdkNetwork::Regtest,
+                _ => return Err(anyhow::anyhow!("Invalid network: {}", network)),
+            };
+
+            // Either use provided mnemonic or generate a new one
+            let (mnemonic_words, is_restored) = if let Some(mnemonic_str) = mnemonic_opt {
+                if !cli.plain {
+                    info!(
+                        "🔐 Restoring BDK wallet from mnemonic for network: {}",
+                        network
+                    );
+                }
+                (mnemonic_str.clone(), true)
+            } else {
+                if !cli.plain {
+                    info!("🔐 Creating new BDK wallet for network: {}", network);
+                }
+                // Generate new mnemonic (12 words)
+                let mnemonic: GeneratedKey<_, bdk_wallet::miniscript::Segwitv0> =
+                    Mnemonic::generate((WordCount::Words12, Language::English))
+                        .map_err(|_| anyhow::anyhow!("Failed to generate mnemonic"))?;
+                (mnemonic.to_string(), false)
+            };
+
+            if !is_restored && !cli.plain {
+                println!("\n🔑 WALLET MNEMONIC (SAVE THIS SECURELY!)");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("{}", mnemonic_words);
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+            } else if is_restored && !cli.plain {
+                info!("📝 Using provided mnemonic to restore wallet");
+            }
+
+            // Parse mnemonic string
+            let mnemonic = Mnemonic::parse(&mnemonic_words)
+                .map_err(|e| anyhow::anyhow!("Invalid mnemonic: {}", e))?;
+
+            // Derive extended key from mnemonic
+            let xkey: ExtendedKey = mnemonic
+                .into_extended_key()
+                .map_err(|_| anyhow::anyhow!("Failed to derive extended key"))?;
+            let xprv = xkey
+                .into_xprv(bdk_network)
+                .ok_or_else(|| anyhow::anyhow!("Failed to get xprv"))?;
+
+            // Create descriptor from xprv (using BIP84 path for native segwit)
+            let external_descriptor = format!("wpkh({}/84'/0'/0'/0/*)", xprv);
+            let internal_descriptor = format!("wpkh({}/84'/0'/0'/1/*)", xprv);
+
+            // Create wallet database file
+            let db_path = format!("wallet_{}.sqlite3", network);
+            if !cli.plain {
+                info!("💾 Creating wallet database: {}", db_path);
+            }
+
+            let mut conn = Connection::open(&db_path)
+                .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
+
+            let _wallet = Wallet::create(external_descriptor, internal_descriptor)
+                .network(bdk_network)
+                .create_wallet(&mut conn)
+                .map_err(|e| anyhow::anyhow!("Failed to create wallet: {}", e))?;
+
+            // Output formatting based on plain flag
+            if cli.plain {
+                // Plain mode: just print mnemonic for new wallets, nothing for restored
+                if !is_restored {
+                    println!("{}", mnemonic_words);
+                }
+            } else {
+                // Pretty mode with emojis
+                if is_restored {
+                    println!("✅ Wallet restored successfully!");
+                } else {
+                    println!("✅ Wallet created successfully!");
+                }
+                println!("📁 Database file: {}", db_path);
+
+                if !is_restored {
+                    println!("\n⚠️  IMPORTANT: Save your mnemonic phrase securely!");
+                    println!("   Without it, you cannot recover your wallet.\n");
+                }
+            }
+        }
+
+        Commands::GetAddress { network } => {
+            use bdk_wallet::rusqlite::Connection;
+            use bdk_wallet::{KeychainKind, Wallet};
+
+            let db_path = format!("wallet_{}.sqlite3", network);
+
+            if !std::path::Path::new(&db_path).exists() {
+                return Err(anyhow::anyhow!(
+                    "Wallet database not found: {}\nCreate a wallet first with: create-wallet --network {}",
+                    db_path,
+                    network
+                ));
+            }
+
+            if !cli.plain {
+                info!("📂 Loading wallet from: {}", db_path);
+            }
+
+            let mut conn = Connection::open(&db_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+
+            let mut wallet = Wallet::load()
+                .load_wallet(&mut conn)
+                .map_err(|e| anyhow::anyhow!("Failed to load wallet: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("No wallet found in database"))?;
+
+            // Get next unused address
+            let address = wallet.reveal_next_address(KeychainKind::External);
+
+            // Persist the wallet state to save the updated address index
+            wallet
+                .persist(&mut conn)
+                .map_err(|e| anyhow::anyhow!("Failed to persist wallet: {}", e))?;
+
+            if cli.plain {
+                // Plain mode: just print the address
+                println!("{}", address.address);
+            } else {
+                // Pretty mode with emojis
+                println!("📍 Receive address: {}", address.address);
+                println!("🔢 Address index: {}", address.index);
+            }
         }
     }
 

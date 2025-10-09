@@ -123,22 +123,40 @@ reset_bitcoin() {
 
 # Function to setup wallet and mine initial blocks
 setup_wallet() {
-    print_status "Setting up Bitcoin wallet..."
+    print_status "Setting up BDK wallet..."
     
-    # Create wallet
-    bitcoin_cli createwallet "mine" || print_warning "Wallet 'mine' already exists"
+    # Check if core-lane-node is built
+    if [ ! -f "target/release/core-lane-node" ]; then
+        print_status "Building Core Lane node (release)..."
+        cargo build --release
+    fi
     
-    # Get new address
-    ADDRESS=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
-    print_status "Generated address: $ADDRESS"
+    # Clean up any existing wallet
+    rm -f wallet_regtest.sqlite3
+    rm -f .test-address .test-mnemonic
+    
+    # Create BDK wallet
+    print_status "Creating BDK wallet..."
+    MNEMONIC=$(./target/release/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
+    
+    if [ -z "$MNEMONIC" ]; then
+        print_error "Failed to create BDK wallet"
+        return 1
+    fi
+    
+    print_success "BDK wallet created"
+    echo "$MNEMONIC" > .test-mnemonic
+    print_status "Mnemonic saved to: .test-mnemonic"
+    
+    # Get new address from BDK wallet
+    ADDRESS=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+    print_status "Generated BDK address: $ADDRESS"
     
     # Mine 101 blocks to activate coinbase
     print_status "Mining 101 blocks to activate coinbase..."
-    bitcoin_cli -rpcwallet=mine generatetoaddress 101 "$ADDRESS" > /dev/null
+    bitcoin_cli generatetoaddress 101 "$ADDRESS" > /dev/null
     
-    # Check balance
-    BALANCE=$(bitcoin_cli -rpcwallet=mine getbalances | grep -o '"mineable": [0-9.]*' | grep -o '[0-9.]*')
-    print_success "Mined 101 blocks. Balance: $BALANCE BTC"
+    print_success "Mined 101 blocks to BDK wallet"
     
     echo "$ADDRESS" > .test-address
     print_status "Test address saved to .test-address"
