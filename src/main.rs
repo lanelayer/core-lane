@@ -684,92 +684,12 @@ impl CoreLaneNode {
         info!("   ETH address: {}", eth_address);
         info!("   Payload: {} bytes", payload.len());
 
-        // Check wallet balance - use write client for wallet operations
-        let balance_result: Result<serde_json::Value, _> =
-            self.bitcoin_client_write.call("getbalances", &[]);
+        info!("📡 Creating burn transaction using PSBT...");
 
-        match balance_result {
-            Ok(balances) => {
-                if let Some(trusted) = balances.get(wallet).and_then(|m| m.get("trusted")) {
-                    let balance_btc = trusted.as_f64().unwrap_or(0.0);
-                    let balance_sats = (balance_btc * 100_000_000.0) as u64;
-                    info!(
-                        "💰 Wallet balance: {} sats ({:.8} BTC)",
-                        balance_sats, balance_btc
-                    );
-
-                    if balance_sats < burn_amount + 1000 {
-                        // +1000 for estimated fee
-                        return Err(anyhow!(
-                            "Insufficient balance. Have {} sats, need {} sats + fees",
-                            balance_sats,
-                            burn_amount
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("⚠️  Could not check wallet balance: {}", e);
-            }
-        }
-
-        info!("📡 Creating burn transaction...");
-
-        // Get list of unspent outputs - use write client for wallet operations
-        let unspent_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
-            "listunspent",
-            &[
-                serde_json::json!(0),
-                serde_json::json!(9999999),
-                serde_json::json!([]),
-                serde_json::json!(true),
-                serde_json::json!({"minimumAmount": (burn_amount as f64 + 1000.0) / 100_000_000.0}),
-            ],
-        );
-
-        let unspent = match unspent_result {
-            Ok(utxos) => utxos,
-            Err(e) => return Err(anyhow!("Failed to get unspent outputs: {}", e)),
-        };
-
-        if !unspent.is_array() || unspent.as_array().unwrap().is_empty() {
-            return Err(anyhow!("No suitable unspent outputs found for burn amount"));
-        }
-
-        // Use the first suitable UTXO
-        let utxo = &unspent.as_array().unwrap()[0];
-        let prev_txid = utxo["txid"].as_str().unwrap();
-        let prev_vout = utxo["vout"].as_u64().unwrap() as u32;
-        let prev_amount = (utxo["amount"].as_f64().unwrap() * 100_000_000.0) as u64;
-
-        println!(
-            "📍 Using UTXO: {}:{} ({} sats)",
-            prev_txid, prev_vout, prev_amount
-        );
-
-        // Create inputs
-        let _inputs = vec![serde_json::json!({
-            "txid": prev_txid,
-            "vout": prev_vout
-        })];
-
-        // Create OP_RETURN output
-        let hex_payload = hex::encode(&payload);
-        let _opreturn_script = format!("6a{:02x}{}", payload.len(), hex_payload);
-
-        // Calculate change (input - burn_amount - estimated fee)
-        let estimated_fee = 500u64; // 500 sats estimated fee
-        let change_amount = prev_amount
-            .saturating_sub(burn_amount)
-            .saturating_sub(estimated_fee);
-
-        // Create P2WSH burn transaction with OP_RETURN wrapped inside
+        // Create P2WSH burn transaction with OP_RETURN
         // This is the standard, reliable way to burn Bitcoin without turning it into fee
         use bitcoin::hashes::{sha256, Hash};
-        use bitcoin::{
-            blockdata::opcodes::all::OP_RETURN, blockdata::witness::Witness, Amount, OutPoint,
-            ScriptBuf, Transaction, TxIn, TxOut,
-        };
+        use bitcoin::{blockdata::opcodes::all::OP_RETURN, ScriptBuf};
 
         // Create the burn script: OP_RETURN + BRN1 payload
         let payload_bytes = <&bitcoin::blockdata::script::PushBytes>::try_from(&payload[..])
@@ -788,81 +708,111 @@ impl CoreLaneNode {
         info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
         debug!("📝 Burn script: {}", burn_script);
 
-        // Create transaction outputs
-        let mut tx_outputs = Vec::new();
+        // Create outputs for the burn transaction
+        let mut outputs = serde_json::Map::new();
 
-        // Add P2WSH burn output with the burn amount
-        tx_outputs.push(TxOut {
-            value: Amount::from_sat(burn_amount),
-            script_pubkey: p2wsh_address.script_pubkey(),
-        });
+        // P2WSH burn output with the burn amount
+        outputs.insert(
+            p2wsh_address.to_string(),
+            serde_json::json!(burn_amount as f64 / 100_000_000.0),
+        );
 
-        // Add 0-value OP_RETURN output with BRN1 data
-        let opret_script = ScriptBuf::builder()
-            .push_opcode(OP_RETURN)
-            .push_slice(payload_bytes)
-            .into_script();
-        tx_outputs.push(TxOut {
-            value: Amount::from_sat(0),
-            script_pubkey: opret_script,
-        });
+        // OP_RETURN output with BRN1 data
+        outputs.insert("data".to_string(), serde_json::json!(hex::encode(&payload)));
 
-        // Add change output if substantial enough
-        if change_amount > 546 {
-            // dust threshold - use write client for wallet operations
-            let change_addr_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
-                "getnewaddress",
-                &[serde_json::json!(wallet), serde_json::json!("bech32")],
-            );
+        // Get a change address from the wallet
+        let change_address_result: Result<serde_json::Value, _> = self
+            .bitcoin_client_write
+            .call("getnewaddress", &[serde_json::json!(wallet)]);
 
-            if let Ok(change_addr) = change_addr_result {
-                let change_addr_str = change_addr.as_str().unwrap();
-                let change_address =
-                    bitcoin::Address::from_str(change_addr_str)?.require_network(network)?;
-                tx_outputs.push(TxOut {
-                    value: Amount::from_sat(change_amount),
-                    script_pubkey: change_address.script_pubkey(),
-                });
-                info!("💰 Change: {} sats -> {}", change_amount, change_addr_str);
-            }
-        }
-
-        // Create transaction
-        let tx = Transaction {
-            version: bitcoin::transaction::Version(2),
-            lock_time: bitcoin::absolute::LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_str(prev_txid)?,
-                    vout: prev_vout,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: bitcoin::Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: tx_outputs,
+        let change_address = match change_address_result {
+            Ok(addr) => addr.as_str().unwrap().to_string(),
+            Err(e) => return Err(anyhow!("Failed to get change address: {}", e)),
         };
 
-        // Get the raw transaction hex
-        let raw_tx = hex::encode(bitcoin::consensus::serialize(&tx));
+        // Estimate fee rate
+        let fee_estimate: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
+            "estimatesmartfee",
+            &[serde_json::json!(6), serde_json::json!("ECONOMICAL")],
+        );
 
-        // Now we need to sign the transaction using the wallet
-        // We'll use the signrawtransactionwithwallet RPC call
-
-        // Sign the transaction - use write client for wallet operations
-        let signed_result: Result<serde_json::Value, _> = self
-            .bitcoin_client_write
-            .call("signrawtransactionwithwallet", &[serde_json::json!(raw_tx)]);
-
-        let signed_tx = match signed_result {
+        let sat_per_vb = match fee_estimate {
             Ok(result) => {
-                if result["complete"].as_bool().unwrap_or(false) {
-                    result["hex"].as_str().unwrap().to_string()
+                if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
+                    // Convert from BTC/kB to sat/vB
+                    let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
+                    let sat_per_vb = fee_per_kb_sats / 1000;
+                    sat_per_vb.max(1).min(10) // Cap between 1-10 sat/vB
                 } else {
-                    return Err(anyhow!("Failed to sign transaction: {}", result["errors"]));
+                    2 // Fallback to 2 sat/vB
                 }
             }
-            Err(e) => return Err(anyhow!("Failed to sign transaction: {}", e)),
+            Err(_) => 2, // Fallback to 2 sat/vB
+        };
+
+        info!("💰 Using fee rate: {} sat/vB", sat_per_vb);
+
+        // Create and fund PSBT in one step using walletcreatefundedpsbt
+        let fund_options = serde_json::json!({
+            "feeRate": sat_per_vb as f64 / 100_000.0, // Convert sat/vB to BTC/kB
+            "changeAddress": change_address
+        });
+
+        let funded_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
+            "walletcreatefundedpsbt",
+            &[
+                serde_json::json!([]), // inputs (empty = auto-select)
+                serde_json::json!(outputs),
+                serde_json::json!(0), // locktime
+                serde_json::json!(fund_options),
+            ],
+        );
+
+        let funded_psbt = match funded_result {
+            Ok(result) => {
+                let psbt = result["psbt"].as_str().unwrap().to_string();
+                let fee = result["fee"].as_f64().unwrap() * 100_000_000.0;
+                info!("💰 Created funded PSBT, fee: {} sats", fee as u64);
+                psbt
+            }
+            Err(e) => return Err(anyhow!("Failed to create funded PSBT: {}", e)),
+        };
+
+        // Process the PSBT to sign it
+        let processed_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
+            "walletprocesspsbt",
+            &[serde_json::json!(funded_psbt), serde_json::json!(true)],
+        );
+
+        let processed_psbt = match processed_result {
+            Ok(result) => {
+                let psbt = result["psbt"].as_str().unwrap().to_string();
+                let complete = result["complete"].as_bool().unwrap_or(false);
+                if !complete {
+                    return Err(anyhow!("PSBT signing incomplete"));
+                }
+                info!("💰 PSBT signed successfully");
+                psbt
+            }
+            Err(e) => return Err(anyhow!("Failed to process PSBT: {}", e)),
+        };
+
+        // Finalize the PSBT into a raw transaction
+        let finalize_result: Result<serde_json::Value, _> = self
+            .bitcoin_client_write
+            .call("finalizepsbt", &[serde_json::json!(processed_psbt)]);
+
+        let signed_tx = match finalize_result {
+            Ok(result) => {
+                let hex = result["hex"].as_str().unwrap().to_string();
+                let complete = result["complete"].as_bool().unwrap();
+                if !complete {
+                    return Err(anyhow!("PSBT finalization incomplete"));
+                }
+                info!("💰 PSBT finalized successfully");
+                hex
+            }
+            Err(e) => return Err(anyhow!("Failed to finalize PSBT: {}", e)),
         };
 
         // Broadcast the transaction - use write client
@@ -878,12 +828,10 @@ impl CoreLaneNode {
                 info!("🎯 Chain ID: {}", chain_id);
                 info!("📫 ETH Address: 0x{}", eth_address);
                 info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_address);
-                info!("🔍 Monitor with: ./target/debug/core-mel-node start --start-block {} --rpc-password {}", "latest", "bitcoin123");
+                info!("🔍 Monitor with: ./target/debug/core-lane-node start --start-block {} --rpc-password {}", "latest", "bitcoin123");
             }
             Err(e) => {
-                // Try alternative approach with raw transaction if sendmany fails
-                error!("❌ sendmany failed: {}", e);
-                warn!("💡 Try using a manual approach with listunspent and createrawtransaction");
+                error!("❌ Failed to broadcast burn transaction: {}", e);
                 return Err(anyhow!("Failed to create burn transaction: {}", e));
             }
         }
