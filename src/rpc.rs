@@ -45,6 +45,9 @@ pub struct RpcServer {
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
     network: Option<bitcoin::Network>,
     wallet: Option<String>,
+    mnemonic: Option<String>,
+    electrum_url: Option<String>,
+    data_dir: String,
 }
 
 impl RpcServer {
@@ -53,12 +56,18 @@ impl RpcServer {
         bitcoin_client: Arc<bitcoincore_rpc::Client>,
         network: bitcoin::Network,
         wallet: String,
+        mnemonic: String,
+        electrum_url: Option<String>,
+        data_dir: String,
     ) -> Self {
         Self {
             state,
             bitcoin_client: Some(bitcoin_client),
             network: Some(network),
             wallet: Some(wallet),
+            mnemonic: Some(mnemonic),
+            electrum_url,
+            data_dir,
         }
     }
 
@@ -337,11 +346,34 @@ impl RpcServer {
         };
 
         // Send transaction to Bitcoin DA
+        let mnemonic = server.mnemonic.clone().ok_or_else(|| {
+            tracing::error!("Mnemonic not configured for RPC server");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // Validate network is configured
+        let network = server.network.ok_or_else(|| {
+            tracing::error!("Network not configured for RPC server");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let network_str = match network {
+            bitcoin::Network::Bitcoin => "bitcoin",
+            bitcoin::Network::Testnet => "testnet",
+            bitcoin::Network::Signet => "signet",
+            bitcoin::Network::Regtest => "regtest",
+            _ => "regtest",
+        };
+        let electrum_url = server.electrum_url.as_deref();
+
         match Self::send_to_bitcoin_da(
             raw_tx_hex,
             bitcoin_client,
-            server.network.unwrap(),
-            &server.wallet.clone().unwrap(),
+            network,
+            &mnemonic,
+            network_str,
+            electrum_url,
+            &server.data_dir,
         )
         .await
         {
@@ -379,13 +411,23 @@ impl RpcServer {
         raw_tx_hex: &str,
         bitcoin_client: &Arc<bitcoincore_rpc::Client>,
         network: bitcoin::Network,
-        rpc_wallet: &str,
+        mnemonic: &str,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
     ) -> Result<String, anyhow::Error> {
         // Use the shared TaprootDA module with proper Taproot envelope method
         let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
 
         taproot_da
-            .send_transaction_to_da(raw_tx_hex, rpc_wallet, network)
+            .send_transaction_to_da(
+                raw_tx_hex,
+                mnemonic,
+                network,
+                network_str,
+                electrum_url,
+                data_dir,
+            )
             .await
     }
 

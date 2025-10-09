@@ -6,9 +6,20 @@
 echo "🧪 Testing eth_sendRawTransaction"
 echo "================================="
 
-# Start the Core Lane node in the background
+# Check for mnemonic file
+if [ ! -f ".test-mnemonic" ]; then
+    echo "❌ Mnemonic not found! Run: ./tests/test-environment.sh setup-wallet"
+    exit 1
+fi
+
+# Start the Core Lane node in the background using mnemonic-file (more secure)
 echo "🚀 Starting Core Lane node..."
-cargo run -- start --bitcoin-rpc-read-user bitcoin --bitcoin-rpc-read-password bitcoin123 --bitcoin-rpc-write-user bitcoin --bitcoin-rpc-write-password bitcoin123 --http-host 127.0.0.1 --http-port 8545 --rpc-wallet mine &
+cargo run -- start \
+  --bitcoin-rpc-read-user bitcoin \
+  --bitcoin-rpc-read-password bitcoin123 \
+  --mnemonic-file ".test-mnemonic" \
+  --http-host 127.0.0.1 \
+  --http-port 8545 &
 NODE_PID=$!
 
 # Wait for node to start

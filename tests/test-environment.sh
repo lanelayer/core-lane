@@ -126,9 +126,9 @@ setup_wallet() {
     print_status "Setting up BDK wallet..."
     
     # Check if core-lane-node is built
-    if [ ! -f "target/release/core-lane-node" ]; then
-        print_status "Building Core Lane node (release)..."
-        cargo build --release
+    if [ ! -f "target/debug/core-lane-node" ]; then
+        print_status "Building Core Lane node (debug)..."
+        cargo build
     fi
     
     # Clean up any existing wallet
@@ -137,7 +137,7 @@ setup_wallet() {
     
     # Create BDK wallet
     print_status "Creating BDK wallet..."
-    MNEMONIC=$(./target/release/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
+    MNEMONIC=$(./target/debug/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
     
     if [ -z "$MNEMONIC" ]; then
         print_error "Failed to create BDK wallet"
@@ -149,7 +149,7 @@ setup_wallet() {
     print_status "Mnemonic saved to: .test-mnemonic"
     
     # Get new address from BDK wallet
-    ADDRESS=$(./target/release/core-lane-node --plain get-address --network regtest 2>/dev/null)
+    ADDRESS=$(./target/debug/core-lane-node --plain get-address --network regtest 2>/dev/null)
     print_status "Generated BDK address: $ADDRESS"
     
     # Mine 101 blocks to activate coinbase
@@ -211,17 +211,20 @@ create_test_burn() {
     print_status "To create a burn transaction, you just need an Ethereum address!"
     echo
     print_status "Example burn command (burns 500,000 sats):"
-    echo "./target/debug/core-lane-node burn \\"
+    echo "MNEMONIC=\$(cat .test-mnemonic)  # Load your saved mnemonic"
+    echo "./target/release/core-lane-node burn \\"
     echo "  --burn-amount 500000 \\"
     echo "  --chain-id 1 \\"
     echo "  --eth-address \"0x1234567890123456789012345678901234567890\" \\"
+    echo "  --network regtest \\"
+    echo "  --mnemonic \"\$MNEMONIC\" \\"
     echo "  --rpc-url \"$RPC_URL\" \\"
     echo "  --rpc-user \"$RPC_USER\" \\"
     echo "  --rpc-password \"$RPC_PASSWORD\""
     echo
     print_status "This will:"
-    echo "1. Use your Bitcoin wallet (default: 'mine') to fund the transaction"
-    echo "2. Create an OP_RETURN transaction burning 500,000 sats"
+    echo "1. Use your BDK wallet (wallet_regtest.sqlite3) to fund the transaction"
+    echo "2. Create a P2WSH + OP_RETURN burn transaction with 500,000 sats"
     echo "3. Automatically mint 500,000 Core Lane tokens to the ETH address"
     echo "4. Handle all transaction creation, signing, and broadcasting"
 }

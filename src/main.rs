@@ -43,6 +43,45 @@ use transaction::execute_transaction;
 
 use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 
+/// Helper function to construct wallet database path
+fn wallet_db_path(data_dir: &str, network: &str) -> String {
+    let path = std::path::Path::new(data_dir);
+    path.join(format!("wallet_{}.sqlite3", network))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Helper function to resolve mnemonic from various sources
+/// Priority: explicit mnemonic > file > environment variable
+fn resolve_mnemonic(
+    explicit_mnemonic: Option<&str>,
+    mnemonic_file: Option<&str>,
+) -> Result<String> {
+    // Priority 1: Explicit mnemonic flag
+    if let Some(mnemonic) = explicit_mnemonic {
+        return Ok(mnemonic.to_string());
+    }
+
+    // Priority 2: Mnemonic file
+    if let Some(file_path) = mnemonic_file {
+        let mnemonic = std::fs::read_to_string(file_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read mnemonic file '{}': {}", file_path, e))?;
+        return Ok(mnemonic.trim().to_string());
+    }
+
+    // Priority 3: Environment variable
+    if let Ok(mnemonic) = std::env::var("CORE_LANE_MNEMONIC") {
+        return Ok(mnemonic.trim().to_string());
+    }
+
+    Err(anyhow::anyhow!(
+        "Mnemonic required. Provide via:\n  \
+         1. --mnemonic \"your words here\" (less secure, visible in process list)\n  \
+         2. --mnemonic-file /path/to/file (recommended)\n  \
+         3. CORE_LANE_MNEMONIC environment variable"
+    ))
+}
+
 #[derive(Parser)]
 #[command(name = "core-lane-node")]
 #[command(about = "Core Lane Node - Bitcoin-anchored execution environment")]
@@ -50,6 +89,10 @@ struct Cli {
     /// Plain output mode (no emojis, machine-readable)
     #[arg(long, global = true)]
     plain: bool,
+
+    /// Data directory for wallet databases and state
+    #[arg(long, global = true, default_value = ".")]
+    data_dir: String,
 
     #[command(subcommand)]
     command: Commands,
@@ -84,6 +127,15 @@ enum Commands {
         http_port: u16,
         #[arg(long, default_value = "mine")]
         rpc_wallet: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
+        /// Electrum server URL (for mainnet/signet/testnet)
+        #[arg(long)]
+        electrum_url: Option<String>,
     },
 
     Burn {
@@ -93,26 +145,50 @@ enum Commands {
         chain_id: u32,
         #[arg(long)]
         eth_address: String,
-        #[arg(long, default_value = "mine")]
-        rpc_wallet: String,
+        #[arg(long, default_value = "regtest")]
+        network: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
+        /// Bitcoin RPC URL (for regtest)
         #[arg(long, default_value = "http://127.0.0.1:18443")]
         rpc_url: String,
+        /// Bitcoin RPC user (for regtest)
         #[arg(long, default_value = "bitcoin")]
         rpc_user: String,
+        /// Bitcoin RPC password (for regtest)
         #[arg(long)]
-        rpc_password: String,
+        rpc_password: Option<String>,
+        /// Electrum server URL (for mainnet/signet/testnet)
+        #[arg(long)]
+        electrum_url: Option<String>,
     },
     SendTransaction {
         #[arg(long)]
         raw_tx_hex: String,
-        #[arg(long, default_value = "mine")]
-        rpc_wallet: String,
+        #[arg(long, default_value = "regtest")]
+        network: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
+        /// Bitcoin RPC URL (for regtest)
         #[arg(long, default_value = "http://127.0.0.1:18443")]
         rpc_url: String,
+        /// Bitcoin RPC user (for regtest)
         #[arg(long, default_value = "bitcoin")]
         rpc_user: String,
+        /// Bitcoin RPC password (for regtest)
         #[arg(long)]
-        rpc_password: String,
+        rpc_password: Option<String>,
+        /// Electrum server URL (for mainnet/signet/testnet)
+        #[arg(long)]
+        electrum_url: Option<String>,
     },
     ConstructExitIntent {
         #[arg(long)]
@@ -151,6 +227,9 @@ enum Commands {
         /// Optional mnemonic phrase to restore wallet (12 or 24 words)
         #[arg(long)]
         mnemonic: Option<String>,
+        /// Only generate/output mnemonic, don't create database file
+        #[arg(long)]
+        mnemonic_only: bool,
     },
     GetAddress {
         /// Network of the wallet to load (bitcoin, testnet, signet, regtest)
@@ -657,216 +736,27 @@ impl CoreLaneNode {
         Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
     }
 
-    /// Create a Bitcoin burn transaction using RPC wallet
-    async fn create_burn_transaction_from_wallet(
-        &self,
-        burn_amount: u64,
-        chain_id: u32,
-        eth_address: &str,
-        wallet: &str,
-        network: bitcoin::Network,
-    ) -> Result<()> {
-        info!(
-            "🔥 Creating Bitcoin burn transaction using wallet '{}'...",
-            wallet
-        );
-
-        // Validate ETH address
-        let eth_addr = eth_address.trim_start_matches("0x").to_string();
-        if eth_addr.len() != 40 {
-            return Err(anyhow!("Ethereum address must be 20 bytes (40 hex chars)"));
-        }
-
-        // Create BRN1 payload
-        let addr_bytes = hex::decode(&eth_addr)?;
-        let mut payload = Vec::with_capacity(4 + 4 + 20);
-        payload.extend_from_slice(b"BRN1");
-        payload.extend_from_slice(&chain_id.to_be_bytes());
-        payload.extend_from_slice(&addr_bytes);
-
-        if payload.len() > 80 {
-            return Err(anyhow!(
-                "OP_RETURN payload {} bytes exceeds standard relay policy (80 bytes)",
-                payload.len()
-            ));
-        }
-
-        // Convert network string to Bitcoin Network enum
-
-        info!("📋 Burn Details:");
-        info!("   Wallet: {}", wallet);
-        info!("   Network: {}", network.to_string());
-        info!("   Burn amount: {} sats", burn_amount);
-        info!("   Chain ID: {}", chain_id);
-        info!("   ETH address: {}", eth_address);
-        info!("   Payload: {} bytes", payload.len());
-
-        info!("📡 Creating burn transaction using PSBT...");
-
-        // Create P2WSH burn transaction with OP_RETURN
-        // This is the standard, reliable way to burn Bitcoin without turning it into fee
-        use bitcoin::hashes::{sha256, Hash};
-        use bitcoin::{blockdata::opcodes::all::OP_RETURN, ScriptBuf};
-
-        // Create the burn script: OP_RETURN + BRN1 payload
-        let payload_bytes = <&bitcoin::blockdata::script::PushBytes>::try_from(&payload[..])
-            .map_err(|_| anyhow!("Payload too large for OP_RETURN"))?;
-        let burn_script = ScriptBuf::builder()
-            .push_opcode(OP_RETURN)
-            .push_slice(payload_bytes)
-            .into_script();
-
-        // Create P2WSH address from the burn script
-        let script_hash = sha256::Hash::hash(burn_script.as_bytes());
-        let wscript_hash =
-            bitcoin::blockdata::script::WScriptHash::from_slice(&script_hash.to_byte_array())?;
-        let p2wsh_address = bitcoin::Address::p2wsh(&ScriptBuf::new_p2wsh(&wscript_hash), network);
-
-        info!("🔥 Created P2WSH burn address: {}", p2wsh_address);
-        debug!("📝 Burn script: {}", burn_script);
-
-        // Create outputs for the burn transaction
-        let mut outputs = serde_json::Map::new();
-
-        // P2WSH burn output with the burn amount
-        outputs.insert(
-            p2wsh_address.to_string(),
-            serde_json::json!(burn_amount as f64 / 100_000_000.0),
-        );
-
-        // OP_RETURN output with BRN1 data
-        outputs.insert("data".to_string(), serde_json::json!(hex::encode(&payload)));
-
-        // Get a change address from the wallet
-        let change_address_result: Result<serde_json::Value, _> = self
-            .bitcoin_client_write
-            .call("getnewaddress", &[serde_json::json!(wallet)]);
-
-        let change_address = match change_address_result {
-            Ok(addr) => addr.as_str().unwrap().to_string(),
-            Err(e) => return Err(anyhow!("Failed to get change address: {}", e)),
-        };
-
-        // Estimate fee rate
-        let fee_estimate: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
-            "estimatesmartfee",
-            &[serde_json::json!(6), serde_json::json!("ECONOMICAL")],
-        );
-
-        let sat_per_vb = match fee_estimate {
-            Ok(result) => {
-                if let Some(fee_rate) = result.get("feerate").and_then(|v| v.as_f64()) {
-                    // Convert from BTC/kB to sat/vB
-                    let fee_per_kb_sats = (fee_rate * 100_000_000.0) as u64;
-                    let sat_per_vb = fee_per_kb_sats / 1000;
-                    sat_per_vb.max(1).min(10) // Cap between 1-10 sat/vB
-                } else {
-                    2 // Fallback to 2 sat/vB
-                }
-            }
-            Err(_) => 2, // Fallback to 2 sat/vB
-        };
-
-        info!("💰 Using fee rate: {} sat/vB", sat_per_vb);
-
-        // Create and fund PSBT in one step using walletcreatefundedpsbt
-        let fund_options = serde_json::json!({
-            "feeRate": sat_per_vb as f64 / 100_000.0, // Convert sat/vB to BTC/kB
-            "changeAddress": change_address
-        });
-
-        let funded_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
-            "walletcreatefundedpsbt",
-            &[
-                serde_json::json!([]), // inputs (empty = auto-select)
-                serde_json::json!(outputs),
-                serde_json::json!(0), // locktime
-                serde_json::json!(fund_options),
-            ],
-        );
-
-        let funded_psbt = match funded_result {
-            Ok(result) => {
-                let psbt = result["psbt"].as_str().unwrap().to_string();
-                let fee = result["fee"].as_f64().unwrap() * 100_000_000.0;
-                info!("💰 Created funded PSBT, fee: {} sats", fee as u64);
-                psbt
-            }
-            Err(e) => return Err(anyhow!("Failed to create funded PSBT: {}", e)),
-        };
-
-        // Process the PSBT to sign it
-        let processed_result: Result<serde_json::Value, _> = self.bitcoin_client_write.call(
-            "walletprocesspsbt",
-            &[serde_json::json!(funded_psbt), serde_json::json!(true)],
-        );
-
-        let processed_psbt = match processed_result {
-            Ok(result) => {
-                let psbt = result["psbt"].as_str().unwrap().to_string();
-                let complete = result["complete"].as_bool().unwrap_or(false);
-                if !complete {
-                    return Err(anyhow!("PSBT signing incomplete"));
-                }
-                info!("💰 PSBT signed successfully");
-                psbt
-            }
-            Err(e) => return Err(anyhow!("Failed to process PSBT: {}", e)),
-        };
-
-        // Finalize the PSBT into a raw transaction
-        let finalize_result: Result<serde_json::Value, _> = self
-            .bitcoin_client_write
-            .call("finalizepsbt", &[serde_json::json!(processed_psbt)]);
-
-        let signed_tx = match finalize_result {
-            Ok(result) => {
-                let hex = result["hex"].as_str().unwrap().to_string();
-                let complete = result["complete"].as_bool().unwrap();
-                if !complete {
-                    return Err(anyhow!("PSBT finalization incomplete"));
-                }
-                info!("💰 PSBT finalized successfully");
-                hex
-            }
-            Err(e) => return Err(anyhow!("Failed to finalize PSBT: {}", e)),
-        };
-
-        // Broadcast the transaction - use write client
-        let tx_result: Result<bitcoin::Txid, _> = self
-            .bitcoin_client_write
-            .call("sendrawtransaction", &[serde_json::json!(signed_tx)]);
-
-        match tx_result {
-            Ok(txid) => {
-                info!("✅ Burn transaction created and broadcast successfully!");
-                info!("📍 Transaction ID: {}", txid);
-                info!("🔥 Burned: {} sats", burn_amount);
-                info!("🎯 Chain ID: {}", chain_id);
-                info!("📫 ETH Address: 0x{}", eth_address);
-                info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_address);
-                info!("🔍 Monitor with: ./target/debug/core-lane-node start --start-block {} --rpc-password {}", "latest", "bitcoin123");
-            }
-            Err(e) => {
-                error!("❌ Failed to broadcast burn transaction: {}", e);
-                return Err(anyhow!("Failed to create burn transaction: {}", e));
-            }
-        }
-
-        Ok(())
-    }
-
     async fn send_transaction_to_da(
         &self,
         raw_tx_hex: &str,
-        wallet: &str,
+        mnemonic: &str,
         network: bitcoin::Network,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
     ) -> Result<()> {
         // Delegate to the TaprootDA implementation which handles all validation and logic
         // Use write client for DA transactions (wallet operations)
         let taproot_da = TaprootDA::new(self.bitcoin_client_write.clone());
         let _bitcoin_txid = taproot_da
-            .send_transaction_to_da(raw_tx_hex, wallet, network)
+            .send_transaction_to_da(
+                raw_tx_hex,
+                mnemonic,
+                network,
+                network_str,
+                electrum_url,
+                data_dir,
+            )
             .await?;
         Ok(())
     }
@@ -901,7 +791,13 @@ async fn main() -> Result<()> {
             http_host,
             http_port,
             rpc_wallet,
+            mnemonic,
+            mnemonic_file,
+            electrum_url,
         } => {
+            // Resolve mnemonic from various sources
+            let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
+
             let wallet = rpc_wallet.to_string();
 
             // Create read client (without wallet endpoint)
@@ -961,6 +857,9 @@ async fn main() -> Result<()> {
                 node.bitcoin_client_write.clone(),
                 network,
                 wallet,
+                mnemonic_str.clone(),
+                electrum_url.clone(),
+                cli.data_dir.clone(),
             );
 
             let app = rpc_server.router();
@@ -987,91 +886,490 @@ async fn main() -> Result<()> {
             burn_amount,
             chain_id,
             eth_address,
-            rpc_wallet,
+            network: network_str,
+            mnemonic,
+            mnemonic_file,
             rpc_url,
             rpc_user,
             rpc_password,
+            electrum_url,
         } => {
-            // Create read client (without wallet)
-            let read_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
+            use bdk_wallet::bitcoin::Network as BdkNetwork;
+            use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
+            use bdk_wallet::rusqlite::Connection;
+            use bdk_wallet::{KeychainKind, Wallet};
+
+            // Resolve mnemonic from various sources
+            let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
+
+            if !cli.plain {
+                info!("🔥 Creating Bitcoin burn transaction...");
+            }
+
+            // Parse network
+            let bdk_network = match network_str.as_str() {
+                "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
+                "testnet" => BdkNetwork::Testnet,
+                "signet" => BdkNetwork::Signet,
+                "regtest" => BdkNetwork::Regtest,
+                _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
+            };
+
+            // Parse mnemonic and derive signing keys
+            if !cli.plain {
+                info!("🔑 Parsing mnemonic for signing keys...");
+            }
+
+            let mnemonic = Mnemonic::parse(mnemonic_str)
+                .map_err(|e| anyhow::anyhow!("Invalid mnemonic: {}", e))?;
+
+            let xkey: ExtendedKey = mnemonic
+                .into_extended_key()
+                .map_err(|_| anyhow::anyhow!("Failed to derive extended key"))?;
+            let xprv = xkey
+                .into_xprv(bdk_network)
+                .ok_or_else(|| anyhow::anyhow!("Failed to get xprv"))?;
+
+            // Reconstruct descriptors with xprv for signing
+            let external_descriptor = format!("wpkh({}/0/*)", xprv);
+            let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+            // Ensure data directory exists
+            std::fs::create_dir_all(&cli.data_dir)?;
+
+            // Load BDK wallet with descriptors
+            let wallet_path = wallet_db_path(&cli.data_dir, network_str);
+
+            if !cli.plain {
+                info!("📂 Loading wallet from: {}", wallet_path);
+            }
+
+            let mut conn = Connection::open(&wallet_path)?;
+
+            // Load wallet with descriptors to ensure signing keys are available
+            let wallet_opt = Wallet::load()
+                .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
+                .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
+                .extract_keys()
+                .check_network(bdk_network)
+                .load_wallet(&mut conn)?;
+
+            let mut wallet = match wallet_opt {
+                Some(w) => w,
+                None => {
+                    // Create wallet if it doesn't exist
+                    Wallet::create(external_descriptor, internal_descriptor)
+                        .network(bdk_network)
+                        .create_wallet(&mut conn)?
+                }
+            };
+
+            if !cli.plain {
+                info!("✅ Wallet loaded with signing keys from mnemonic");
+            }
+
+            // Sync wallet based on network
+            if network_str == "regtest" {
+                // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
+                use bdk_bitcoind_rpc::Emitter;
+                use std::sync::Arc;
+
+                if !cli.plain {
+                    info!("🔗 Syncing with Bitcoin RPC: {}", rpc_url);
+                }
+
+                let rpc_pass = rpc_password
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("bitcoin123");
+                let rpc_client = Client::new(
+                    rpc_url,
+                    RpcAuth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+                )?;
+
+                let mut emitter = Emitter::new(
+                    &rpc_client,
+                    wallet.latest_checkpoint().clone(),
+                    0,
+                    std::iter::empty::<Arc<bitcoin::Transaction>>(), // No mempool txs
+                );
+
+                while let Some(block_emission) = emitter.next_block()? {
+                    wallet.apply_block(&block_emission.block, block_emission.block_height())?;
+                }
+
+                wallet.persist(&mut conn)?;
+            } else {
+                // Use Electrum for other networks
+                use bdk_electrum::electrum_client::ElectrumApi;
+                use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+                let electrum_url = electrum_url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--electrum-url required for network: {}", network_str)
+                })?;
+
+                if !cli.plain {
+                    info!("🔗 Syncing with Electrum: {}", electrum_url);
+                }
+
+                let electrum_client = electrum_client::Client::new(&electrum_url)?;
+                let electrum = BdkElectrumClient::new(electrum_client);
+
+                if !cli.plain {
+                    info!("🔍 Scanning blockchain for wallet transactions...");
+                }
+
+                let request = wallet.start_full_scan().build();
+                let response = electrum.full_scan(request, 5, 1, false)?;
+
+                wallet.apply_update(response)?;
+                wallet.persist(&mut conn)?;
+            }
+
+            if !cli.plain {
+                info!("💰 Wallet synced successfully");
+            }
+
+            // Check balance
+            let balance = wallet.balance();
+            if !cli.plain {
+                info!(
+                    "💵 Balance: {} sats (confirmed: {}, pending: {})",
+                    balance.total().to_sat(),
+                    balance.confirmed.to_sat(),
+                    balance.untrusted_pending.to_sat()
+                );
+
+                // Debug: Show UTXOs
+                info!("🔍 Available UTXOs:");
+                let utxos: Vec<_> = wallet.list_unspent().collect();
+                for utxo in &utxos {
+                    info!(
+                        "  UTXO: {}:{} - {} sats (keychain: {:?})",
+                        utxo.outpoint.txid,
+                        utxo.outpoint.vout,
+                        utxo.txout.value.to_sat(),
+                        utxo.keychain
+                    );
+                }
+                if utxos.is_empty() {
+                    warn!("⚠️  No UTXOs found!");
+                }
+            }
+
+            if balance.confirmed.to_sat() < *burn_amount {
+                return Err(anyhow::anyhow!(
+                    "Insufficient funds. Need {} sats, have {} sats confirmed",
+                    burn_amount,
+                    balance.confirmed.to_sat()
+                ));
+            }
+
+            // Create burn transaction with BDK
+            use bitcoin::{blockdata::opcodes::all::OP_RETURN, Amount, ScriptBuf};
+
+            if !cli.plain {
+                info!("🔥 Building burn transaction...");
+            }
+
+            // Validate ETH address
+            let eth_addr = eth_address.trim_start_matches("0x");
+            if eth_addr.len() != 40 {
+                return Err(anyhow::anyhow!(
+                    "Ethereum address must be 20 bytes (40 hex chars)"
+                ));
+            }
+
+            // Create BRN1 payload
+            let addr_bytes = hex::decode(&eth_addr)?;
+            let mut payload = Vec::with_capacity(4 + 4 + 20);
+            payload.extend_from_slice(b"BRN1");
+            payload.extend_from_slice(&chain_id.to_be_bytes());
+            payload.extend_from_slice(&addr_bytes);
+
+            if payload.len() > 80 {
+                return Err(anyhow::anyhow!(
+                    "OP_RETURN payload {} bytes exceeds standard relay policy (80 bytes)",
+                    payload.len()
+                ));
+            }
+
+            // Create the burn script: OP_RETURN + BRN1 payload
+            let payload_bytes = <&bitcoin::blockdata::script::PushBytes>::try_from(&payload[..])
+                .map_err(|_| anyhow::anyhow!("Payload too large for OP_RETURN"))?;
+            let burn_script = ScriptBuf::builder()
+                .push_opcode(OP_RETURN)
+                .push_slice(payload_bytes)
+                .into_script();
+
+            // Create P2WSH address from the burn script (Address::p2wsh does the hashing)
+            let p2wsh_address = bitcoin::Address::p2wsh(&burn_script, bdk_network);
+
+            if !cli.plain {
+                info!("🔥 P2WSH burn address: {}", p2wsh_address);
+            }
+
+            // Build transaction using BDK
+            use bdk_wallet::bitcoin::FeeRate;
+
+            let mut tx_builder = wallet.build_tx();
+
+            // Set fee rate (2 sat/vB for regtest, higher for other networks)
+            let fee_rate = if network_str == "regtest" {
+                FeeRate::from_sat_per_vb(2).expect("valid fee rate")
+            } else {
+                FeeRate::from_sat_per_vb(10).expect("valid fee rate")
+            };
+            tx_builder.fee_rate(fee_rate);
+
+            // Add P2WSH burn output
+            tx_builder.add_recipient(
+                p2wsh_address.script_pubkey(),
+                Amount::from_sat(*burn_amount),
+            );
+
+            // Add OP_RETURN output with BRN1 data (manually as a recipient)
+            let opret_script = ScriptBuf::builder()
+                .push_opcode(OP_RETURN)
+                .push_slice(payload_bytes)
+                .into_script();
+            tx_builder.add_recipient(opret_script, Amount::from_sat(0));
+
+            if !cli.plain {
+                info!("💰 Fee rate: {} sat/vB", fee_rate.to_sat_per_vb_floor());
+            }
+
+            // Build PSBT with updated metadata
+            let mut psbt = tx_builder.finish();
+            let mut psbt =
+                psbt.map_err(|e| anyhow::anyhow!("Failed to build transaction: {}", e))?;
+
+            if !cli.plain {
+                info!(
+                    "📝 Transaction built ({} inputs, {} outputs)",
+                    psbt.inputs.len(),
+                    psbt.outputs.len()
+                );
+
+                // Debug: Show PSBT inputs before signing
+                for (i, input) in psbt.inputs.iter().enumerate() {
+                    info!("  Input {} before signing:", i);
+                    info!("    witness_utxo: {:?}", input.witness_utxo.is_some());
+                    info!(
+                        "    non_witness_utxo: {:?}",
+                        input.non_witness_utxo.is_some()
+                    );
+                    info!("    witness_script: {:?}", input.witness_script.is_some());
+                    info!("    redeem_script: {:?}", input.redeem_script.is_some());
+                    info!(
+                        "    bip32_derivation: {} keys",
+                        input.bip32_derivation.len()
+                    );
+
+                    // Show the derivation info
+                    for (pubkey, derivation) in &input.bip32_derivation {
+                        info!("      pubkey: {}, path: {:?}", pubkey, derivation.1);
+                    }
+                }
+
+                info!("🖊️  Signing transaction...");
+            }
+
+            // Sign the transaction using BDK
+            #[allow(deprecated)]
+            let finalized = wallet.sign(
+                &mut psbt,
+                bdk_wallet::SignOptions {
+                    trust_witness_utxo: true,
+                    try_finalize: true,
+                    ..Default::default()
+                },
             )?;
 
-            // Create write client with wallet endpoint for wallet operations
-            let write_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
-            let write_client = bitcoincore_rpc::Client::new(
-                &write_url,
-                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
-            )?;
+            if !cli.plain {
+                info!("✅ Transaction signed (finalized: {})", finalized);
 
-            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
+                // Debug: Check PSBT state after signing
+                for (i, input) in psbt.inputs.iter().enumerate() {
+                    info!("  Input {} after signing:", i);
+                    info!(
+                        "    final_script_witness: {:?}",
+                        input.final_script_witness.is_some()
+                    );
+                    info!(
+                        "    final_script_sig: {:?}",
+                        input.final_script_sig.is_some()
+                    );
+                    info!("    partial_sigs: {} sigs", input.partial_sigs.len());
+                    if !input.partial_sigs.is_empty() {
+                        info!("    ⚠️  Has partial signatures but not finalized!");
+                    }
+                }
+            }
 
-            let network = if let Some(chain) = blockchain_info.get("chain") {
-                match chain.as_str() {
-                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
-                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
-                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
-                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
-                    Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
-                    None => return Err(anyhow::anyhow!("Chain field is not a string")),
+            if !finalized {
+                if !cli.plain {
+                    warn!("⚠️  Transaction not fully finalized by BDK, attempting manual finalization...");
+                }
+
+                // Try manual finalization with miniscript
+                use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+                use bdk_wallet::miniscript::psbt::PsbtExt;
+
+                if let Err(e) = psbt.finalize_mut(&Secp256k1::new()) {
+                    return Err(anyhow::anyhow!("Failed to finalize PSBT manually: {:?}", e));
+                }
+
+                if !cli.plain {
+                    info!("✅ Manual finalization completed");
+
+                    // Check if we now have final witnesses
+                    for (i, input) in psbt.inputs.iter().enumerate() {
+                        info!("  Input {} after finalization:", i);
+                        info!(
+                            "    final_script_witness: {:?}",
+                            input.final_script_witness.is_some()
+                        );
+                        info!(
+                            "    final_script_sig: {:?}",
+                            input.final_script_sig.is_some()
+                        );
+                    }
+                }
+            }
+
+            // Extract the signed transaction
+            let tx = psbt
+                .extract_tx()
+                .map_err(|e| anyhow::anyhow!("Failed to extract transaction: {:?}", e))?;
+            let tx_bytes = bitcoin::consensus::serialize(&tx);
+            let tx_hex = hex::encode(&tx_bytes);
+            let txid = tx.compute_txid();
+
+            if !cli.plain {
+                info!("✅ Transaction signed: {}", txid);
+                info!("📡 Broadcasting transaction...");
+            }
+
+            // Broadcast transaction based on network
+            if network_str == "regtest" {
+                // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
+
+                let rpc_pass = rpc_password
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("bitcoin123");
+                let rpc_client = Client::new(
+                    rpc_url,
+                    RpcAuth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+                )?;
+
+                let broadcast_txid: bitcoin::Txid =
+                    rpc_client.call("sendrawtransaction", &[serde_json::json!(tx_hex)])?;
+
+                if !cli.plain {
+                    info!("✅ Burn transaction broadcast successfully!");
+                    info!("📍 Transaction ID: {}", broadcast_txid);
+                    info!("🔥 Burned: {} sats", burn_amount);
+                    info!("🎯 Chain ID: {}", chain_id);
+                    info!("📫 ETH Address: 0x{}", eth_addr);
                 }
             } else {
-                return Err(anyhow::anyhow!(
-                    "No 'chain' field found in getblockchaininfo response"
-                ));
-            };
-            let node = CoreLaneNode::new(read_client, write_client);
-            node.create_burn_transaction_from_wallet(
-                *burn_amount,
-                *chain_id,
-                eth_address,
-                rpc_wallet,
-                network,
-            )
-            .await?;
+                // Use Electrum for other networks
+                use bdk_electrum::electrum_client;
+                use bdk_electrum::electrum_client::ElectrumApi;
+
+                let electrum_url = electrum_url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--electrum-url required for network: {}", network_str)
+                })?;
+
+                let electrum_client = electrum_client::Client::new(&electrum_url)?;
+                let broadcast_txid = electrum_client.transaction_broadcast_raw(&tx_bytes)?;
+
+                if !cli.plain {
+                    info!("✅ Burn transaction broadcast successfully!");
+                    info!("📍 Transaction ID: {}", broadcast_txid);
+                    info!("🔥 Burned: {} sats", burn_amount);
+                    info!("🎯 Chain ID: {}", chain_id);
+                    info!("📫 ETH Address: 0x{}", eth_addr);
+                }
+            }
+
+            // Mark the transaction as broadcast in the wallet
+            if !cli.plain {
+                info!("📝 Updating wallet with broadcast transaction...");
+            }
+
+            // Apply the transaction as unconfirmed to mark inputs as spent
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // apply_unconfirmed_txs expects (Transaction, u64) where u64 is last_seen timestamp
+            wallet.apply_unconfirmed_txs([(tx.clone(), now)]);
+
+            // Persist wallet state to save the updated UTXO state
+            wallet.persist(&mut conn)?;
+
+            if cli.plain {
+                println!("{}", txid);
+            } else {
+                info!("✅ Wallet updated - inputs marked as spent");
+                info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_addr);
+            }
         }
 
         Commands::SendTransaction {
             raw_tx_hex,
-            rpc_wallet,
+            network: network_str,
+            mnemonic,
+            mnemonic_file,
             rpc_url,
             rpc_user,
             rpc_password,
+            electrum_url,
         } => {
-            // Create read client (without wallet)
-            let read_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
-            )?;
+            // Resolve mnemonic from various sources
+            let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
 
-            // Create write client with wallet endpoint for wallet operations
-            let write_url = format!("{}/wallet/{}", rpc_url, rpc_wallet);
-            let write_client = bitcoincore_rpc::Client::new(
-                &write_url,
-                Auth::UserPass(rpc_user.to_string(), rpc_password.to_string()),
-            )?;
-
-            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
-
-            let network = if let Some(chain) = blockchain_info.get("chain") {
-                match chain.as_str() {
-                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
-                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
-                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
-                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
-                    Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
-                    None => return Err(anyhow::anyhow!("Chain field is not a string")),
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "No 'chain' field found in getblockchaininfo response"
-                ));
+            // Parse network
+            let network = match network_str.as_str() {
+                "bitcoin" | "mainnet" => bitcoincore_rpc::bitcoin::Network::Bitcoin,
+                "testnet" => bitcoincore_rpc::bitcoin::Network::Testnet,
+                "signet" => bitcoincore_rpc::bitcoin::Network::Signet,
+                "regtest" => bitcoincore_rpc::bitcoin::Network::Regtest,
+                _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
             };
 
+            // Create Bitcoin RPC clients (only used for regtest)
+            let rpc_pass = rpc_password
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("bitcoin123");
+            let read_client = bitcoincore_rpc::Client::new(
+                rpc_url,
+                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+            )?;
+            let write_client = bitcoincore_rpc::Client::new(
+                rpc_url,
+                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+            )?;
+
             let node = CoreLaneNode::new(read_client, write_client);
-            node.send_transaction_to_da(raw_tx_hex, rpc_wallet, network)
-                .await?;
+            node.send_transaction_to_da(
+                raw_tx_hex,
+                &mnemonic_str,
+                network,
+                network_str,
+                electrum_url.as_deref(),
+                &cli.data_dir,
+            )
+            .await?;
         }
 
         Commands::ConstructExitIntent {
@@ -1270,6 +1568,7 @@ async fn main() -> Result<()> {
         Commands::CreateWallet {
             network,
             mnemonic: mnemonic_opt,
+            mnemonic_only,
         } => {
             use bdk_wallet::bitcoin::Network as BdkNetwork;
             use bdk_wallet::keys::{
@@ -1329,12 +1628,36 @@ async fn main() -> Result<()> {
                 .into_xprv(bdk_network)
                 .ok_or_else(|| anyhow::anyhow!("Failed to get xprv"))?;
 
+            // If mnemonic-only mode, just output the mnemonic and exit
+            if *mnemonic_only {
+                if cli.plain {
+                    // Plain mode: just print mnemonic
+                    println!("{}", mnemonic_words);
+                } else {
+                    // Pretty mode: show mnemonic with message
+                    if !is_restored {
+                        println!("✅ Mnemonic generated (no database created)");
+                    } else {
+                        println!("✅ Mnemonic validated (no database created)");
+                    }
+                    println!(
+                        "💡 To create wallet database later: create-wallet --network {} --mnemonic \"{}\"",
+                        network, mnemonic_words
+                    );
+                }
+                return Ok(());
+            }
+
             // Create descriptor from xprv (using BIP84 path for native segwit)
-            let external_descriptor = format!("wpkh({}/84'/0'/0'/0/*)", xprv);
-            let internal_descriptor = format!("wpkh({}/84'/0'/0'/1/*)", xprv);
+            // Simple format without key origin - BDK will derive keys directly
+            let external_descriptor = format!("wpkh({}/0/*)", xprv);
+            let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+            // Ensure data directory exists
+            std::fs::create_dir_all(&cli.data_dir)?;
 
             // Create wallet database file
-            let db_path = format!("wallet_{}.sqlite3", network);
+            let db_path = wallet_db_path(&cli.data_dir, network);
             if !cli.plain {
                 info!("💾 Creating wallet database: {}", db_path);
             }
@@ -1373,13 +1696,14 @@ async fn main() -> Result<()> {
             use bdk_wallet::rusqlite::Connection;
             use bdk_wallet::{KeychainKind, Wallet};
 
-            let db_path = format!("wallet_{}.sqlite3", network);
+            let db_path = wallet_db_path(&cli.data_dir, network);
 
             if !std::path::Path::new(&db_path).exists() {
                 return Err(anyhow::anyhow!(
-                    "Wallet database not found: {}\nCreate a wallet first with: create-wallet --network {}",
+                    "Wallet database not found: {}\nCreate a wallet first with: create-wallet --network {} --data-dir {}",
                     db_path,
-                    network
+                    network,
+                    cli.data_dir
                 ));
             }
 
@@ -1391,6 +1715,7 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
 
             let mut wallet = Wallet::load()
+                .extract_keys() // Extract private keys from descriptor
                 .load_wallet(&mut conn)
                 .map_err(|e| anyhow::anyhow!("Failed to load wallet: {}", e))?
                 .ok_or_else(|| anyhow::anyhow!("No wallet found in database"))?;

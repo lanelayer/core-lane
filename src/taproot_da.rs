@@ -5,14 +5,20 @@ use bitcoin::{
     blockdata::opcodes::all::{OP_ENDIF, OP_IF},
     blockdata::opcodes::{OP_FALSE, OP_TRUE},
     blockdata::script::Builder,
-    Address as BitcoinAddress, ScriptBuf, Transaction, Witness,
+    Address as BitcoinAddress, Amount, FeeRate, ScriptBuf, Transaction, Witness,
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use secp256k1::rand::rngs::OsRng;
 use serde_json;
 use std::sync::Arc;
 
+// BDK imports for wallet operations
+use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
+use bdk_wallet::rusqlite::Connection;
+use bdk_wallet::{KeychainKind, Wallet};
+
 pub struct TaprootDA {
+    // Keep bitcoin_client for RPC operations (fee estimation, broadcasting)
     bitcoin_client: Arc<Client>,
 }
 
@@ -215,8 +221,11 @@ impl TaprootDA {
     pub async fn send_transaction_to_da(
         &self,
         raw_tx_hex: &str,
-        _wallet: &str,
+        mnemonic_str: &str,
         network: bitcoin::Network,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
     ) -> Result<String> {
         tracing::info!(
             "🚀 Creating Core Lane transaction in Bitcoin DA (commit + reveal in one tx)..."
@@ -225,6 +234,109 @@ impl TaprootDA {
             "📝 Ethereum transaction: {}...",
             &raw_tx_hex[..64.min(raw_tx_hex.len())]
         );
+
+        // Load BDK wallet for commit transaction
+        tracing::info!("🔑 Loading BDK wallet for commit transaction...");
+
+        // Parse mnemonic and derive signing keys
+        let mnemonic =
+            Mnemonic::parse(mnemonic_str).map_err(|e| anyhow!("Invalid mnemonic: {}", e))?;
+
+        let xkey: ExtendedKey = mnemonic
+            .into_extended_key()
+            .map_err(|_| anyhow!("Failed to derive extended key"))?;
+        let xprv = xkey
+            .into_xprv(network)
+            .ok_or_else(|| anyhow!("Failed to get xprv"))?;
+
+        // Reconstruct descriptors with xprv for signing
+        let external_descriptor = format!("wpkh({}/0/*)", xprv);
+        let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+        // Ensure data directory exists
+        std::fs::create_dir_all(data_dir)?;
+
+        // Load wallet
+        let wallet_path =
+            std::path::Path::new(data_dir).join(format!("wallet_{}.sqlite3", network_str));
+        let mut conn = Connection::open(&wallet_path)?;
+
+        let wallet_opt = Wallet::load()
+            .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
+            .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
+            .extract_keys()
+            .check_network(network)
+            .load_wallet(&mut conn)?;
+
+        let mut wallet = match wallet_opt {
+            Some(w) => {
+                tracing::info!("📂 Existing wallet database loaded");
+                w
+            }
+            None => {
+                // Wallet doesn't exist, create it from mnemonic
+                tracing::info!("📝 Wallet database not found, creating from mnemonic...");
+
+                // Create wallet in database
+                let created_wallet =
+                    Wallet::create(external_descriptor.clone(), internal_descriptor.clone())
+                        .network(network)
+                        .create_wallet(&mut conn)?;
+
+                // Drop and reload with extract_keys to ensure we can sign
+                drop(created_wallet);
+
+                Wallet::load()
+                    .descriptor(KeychainKind::External, Some(external_descriptor))
+                    .descriptor(KeychainKind::Internal, Some(internal_descriptor))
+                    .extract_keys()
+                    .check_network(network)
+                    .load_wallet(&mut conn)?
+                    .expect("Wallet we just created must exist")
+            }
+        };
+
+        tracing::info!("✅ BDK wallet loaded");
+
+        // Sync wallet based on network
+        tracing::info!("🔗 Syncing wallet...");
+        if network_str == "regtest" {
+            // Use Bitcoin RPC for regtest
+            use bdk_bitcoind_rpc::Emitter;
+            let mut emitter = Emitter::new(
+                self.bitcoin_client.as_ref(),
+                wallet.latest_checkpoint().clone(),
+                0,
+                std::iter::empty::<Arc<Transaction>>(),
+            );
+
+            while let Some(block_emission) = emitter.next_block()? {
+                wallet.apply_block(&block_emission.block, block_emission.block_height())?;
+            }
+
+            wallet.persist(&mut conn)?;
+        } else {
+            // Use Electrum for other networks
+            use bdk_electrum::electrum_client::ElectrumApi;
+            use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+            let electrum_url = electrum_url
+                .ok_or_else(|| anyhow!("--electrum-url required for network: {}", network_str))?;
+
+            tracing::info!("🔗 Connecting to Electrum: {}", electrum_url);
+
+            let electrum_client = electrum_client::Client::new(electrum_url)?;
+            let electrum = BdkElectrumClient::new(electrum_client);
+
+            tracing::info!("🔍 Scanning blockchain for wallet transactions...");
+
+            let request = wallet.start_full_scan().build();
+            let response = electrum.full_scan(request, 5, 1, false)?;
+
+            wallet.apply_update(response)?;
+            wallet.persist(&mut conn)?;
+        }
+        tracing::info!("✅ Wallet synced");
 
         // Calculate optimal fee rate
         let sat_per_vb = self.calculate_optimal_fee_rate().await?;
@@ -276,152 +388,61 @@ impl TaprootDA {
         let min_taproot_output = exact_reveal_fee.max(dust_threshold);
         let taproot_output_btc = min_taproot_output as f64 / 100_000_000.0; // Convert to BTC
 
-        tracing::info!("🔍 Calculated exact Taproot output: {} sats ({} BTC) for reveal tx needs (dust threshold: {} sats)", min_taproot_output, taproot_output_btc, dust_threshold);
+        tracing::info!("🔍 Calculated exact Taproot output: {} sats for reveal tx needs (dust threshold: {} sats)", min_taproot_output, dust_threshold);
 
-        // Create outputs with the Taproot address
-        // Use modern PSBT approach instead of createrawtransaction + fundrawtransaction
-        let mut outputs = serde_json::Map::new();
-        outputs.insert(
-            taproot_address.to_string(),
-            serde_json::json!(taproot_output_btc), // Calculated amount for reveal tx needs
-        );
-
-        // Get a wallet address for change (not the Taproot address)
-        let change_address_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getnewaddress", &[]);
-
-        let change_address = match change_address_result {
-            Ok(addr) => addr.as_str().unwrap().to_string(),
-            Err(e) => return Err(anyhow!("Failed to get change address: {}", e)),
-        };
-
-        tracing::info!("📍 Using wallet address for change: {}", change_address);
-
-        // Get wallet balance to show total input value
-        let balance_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getbalance", &[]);
-
-        let _total_balance = match balance_result {
-            Ok(balance) => {
-                let btc_balance = balance.as_f64().unwrap();
-                let sats_balance = (btc_balance * 100_000_000.0) as u64;
-                tracing::info!(
-                    "💰 Total wallet balance: {} BTC ({} sats)",
-                    btc_balance,
-                    sats_balance
-                );
-                sats_balance
-            }
-            Err(e) => {
-                tracing::warn!("Failed to get wallet balance: {}", e);
-                0
-            }
-        };
-
-        // Create and fund PSBT in one step using walletcreatefundedpsbt
-        let fund_options = serde_json::json!({
-            "feeRate": sat_per_vb as f64 / 100_000.0, // Convert sat/vB to BTC/kB
-            "changeAddress": change_address
-        });
-
+        // Check wallet balance
+        let balance = wallet.balance();
         tracing::info!(
-            "💰 Using walletcreatefundedpsbt for commit with fee rate: {} sat/vB",
-            sat_per_vb
-        );
-        tracing::info!(
-            "🔍 Fund options: {}",
-            serde_json::to_string_pretty(&fund_options).unwrap_or_default()
+            "💰 Wallet balance: {} sats (confirmed: {})",
+            balance.total().to_sat(),
+            balance.confirmed.to_sat()
         );
 
-        let funded_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "walletcreatefundedpsbt",
-            &[
-                serde_json::json!([]),
-                serde_json::json!(outputs),
-                serde_json::json!(0),
-                serde_json::json!(fund_options),
-            ], // inputs, outputs, locktime, options
+        // Build commit transaction using BDK
+        tracing::info!("🔨 Building commit transaction with BDK...");
+
+        let mut tx_builder = wallet.build_tx();
+
+        // Set fee rate
+        let fee_rate = FeeRate::from_sat_per_vb(sat_per_vb).expect("valid fee rate");
+        tx_builder.fee_rate(fee_rate);
+
+        // Add Taproot output
+        tx_builder.add_recipient(
+            taproot_address.script_pubkey(),
+            Amount::from_sat(min_taproot_output),
         );
 
-        let funded_psbt = match funded_result {
-            Ok(result) => {
-                let psbt = result["psbt"].as_str().unwrap().to_string();
-                let fee = result["fee"].as_f64().unwrap() * 100_000_000.0; // Convert to sats
-                tracing::info!("💰 Wallet created funded PSBT, fee: {} sats", fee as u64);
-                tracing::debug!("🔍 Funded PSBT: {}", psbt);
-                psbt
-            }
-            Err(e) => return Err(anyhow!("Failed to create funded PSBT: {}", e)),
-        };
+        // Build and sign PSBT
+        let mut psbt = tx_builder.finish()?;
 
-        // Get the actual transaction to show input values
-        let tx_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
-            .call("decodepsbt", &[serde_json::json!(funded_psbt)]);
+        tracing::info!("📝 Commit transaction built, signing...");
 
-        if let Ok(tx_data) = tx_result {
-            if let Some(inputs) = tx_data["inputs"].as_array() {
-                let mut total_input_value = 0u64;
-                for input in inputs {
-                    if let Some(prevout) = input["prevout"].as_object() {
-                        if let Some(value) = prevout["value"].as_f64() {
-                            total_input_value += (value * 100_000_000.0) as u64;
-                        }
-                    }
-                }
-                tracing::info!(
-                    "📊 Total input value used in commit transaction: {} sats",
-                    total_input_value
-                );
-            }
+        #[allow(deprecated)]
+        let finalized = wallet.sign(&mut psbt, bdk_wallet::SignOptions::default())?;
+
+        if !finalized {
+            use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+            use bdk_wallet::miniscript::psbt::PsbtExt;
+            psbt.finalize_mut(&Secp256k1::new())
+                .map_err(|e| anyhow!("Failed to finalize commit PSBT: {:?}", e))?;
         }
 
-        // Now process the funded PSBT to sign it
-        tracing::info!("🔍 Processing funded PSBT for signing");
+        // Extract commit transaction
+        let commit_tx = psbt
+            .extract_tx()
+            .map_err(|e| anyhow!("Failed to extract commit transaction: {:?}", e))?;
+        let commit_tx_hex = hex::encode(bitcoin::consensus::serialize(&commit_tx));
 
-        let processed_result: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "walletprocesspsbt",
-            &[serde_json::json!(funded_psbt), serde_json::json!(true)], // psbt, sign=true
-        );
+        tracing::info!("✅ Commit transaction signed");
 
-        let processed_psbt = match processed_result {
-            Ok(result) => {
-                let psbt = result["psbt"].as_str().unwrap().to_string();
-                let complete = result["complete"].as_bool().unwrap_or(false);
-                tracing::info!(
-                    "💰 Wallet processed PSBT successfully, complete: {}",
-                    complete
-                );
-                tracing::debug!(
-                    "🔍 Processed PSBT result: {}",
-                    serde_json::to_string_pretty(&result).unwrap_or_default()
-                );
-                psbt
-            }
-            Err(e) => return Err(anyhow!("Failed to process PSBT: {}", e)),
-        };
-
-        // Finalize the PSBT into a raw transaction
-        let finalize_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
-            .call("finalizepsbt", &[serde_json::json!(processed_psbt)]);
-
-        let funded_tx = match finalize_result {
-            Ok(result) => {
-                let hex = result["hex"].as_str().unwrap().to_string();
-                let complete = result["complete"].as_bool().unwrap();
-                tracing::info!("💰 PSBT finalized successfully, complete: {}", complete);
-                tracing::debug!("🔍 Finalized transaction: {}", hex);
-                if !complete {
-                    return Err(anyhow!("PSBT finalization incomplete"));
-                }
-                hex
-            }
-            Err(e) => return Err(anyhow!("Failed to finalize PSBT: {}", e)),
-        };
-
-        // No need to sign - walletprocesspsbt already signed the transaction
-        let commit_tx_hex = funded_tx;
+        // Mark transaction as spent in wallet
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        wallet.apply_unconfirmed_txs([(commit_tx.clone(), now)]);
+        wallet.persist(&mut conn)?;
 
         // Now immediately create a reveal transaction that spends the Taproot output
         tracing::info!("🔍 Creating reveal transaction to immediately expose Core Lane data...");

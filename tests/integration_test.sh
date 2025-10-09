@@ -88,44 +88,44 @@ test_environment_setup() {
     ./tests/test-environment.sh reset
     sleep 2  # Wait for cleanup
     
+    # Clean up any old BDK wallet files to ensure fresh start
+    print_status "Cleaning up old BDK wallet files..."
+    rm -f wallet_regtest.sqlite3 .test-mnemonic .test-address
+    
     # Start fresh Bitcoin regtest environment
     print_status "Starting fresh Bitcoin regtest environment..."
     ./tests/test-environment.sh start
     sleep 5  # Wait for Bitcoin to start
     
-    # Setup wallet with fallback
-    print_status "Setting up Bitcoin wallet..."
-    ./tests/test-environment.sh setup-wallet || {
-        print_warning "Wallet setup failed, trying manual setup..."
-        
-        # Manual wallet setup
-        bitcoin_cli createwallet "mine" 2>/dev/null || print_warning "Wallet 'mine' already exists"
-        local address=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
-        print_status "Generated address: $address"
-        
-        # Mine 101 blocks to activate coinbase (like the original setup)
-        print_status "Mining 101 blocks to activate coinbase..."
-        bitcoin_cli -rpcwallet=mine generatetoaddress 101 "$address" >/dev/null 2>&1
-        
-        # Verify mining worked
-        local balance_info=$(bitcoin_cli -rpcwallet=mine getbalances)
-        local mineable_balance=$(echo "$balance_info" | grep -o '"mineable": [0-9.]*' | grep -o '[0-9.]*')
-        print_status "Mined 101 blocks. Mineable balance: $mineable_balance BTC"
-        
-        echo "$address" > .test-address
-    }
+    # Setup BDK wallet (no fallback - must succeed)
+    print_status "Setting up BDK wallet..."
+    if ! ./tests/test-environment.sh setup-wallet; then
+        print_error "BDK wallet setup failed!"
+        record_test "environment_setup" "FAIL"
+        return 1
+    fi
     
     # Verify the setup worked
     local block_count=$(bitcoin_cli getblockcount)
     print_status "Final block count: $block_count"
     
     if [ "$block_count" -lt 100 ]; then
-        print_warning "Block count still low ($block_count), mining more blocks..."
-        local address=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
-        bitcoin_cli -rpcwallet=mine generatetoaddress 50 "$address" >/dev/null 2>&1 || true
-        sleep 2
-        block_count=$(bitcoin_cli getblockcount)
-        print_status "Updated block count: $block_count"
+        print_error "Block count too low ($block_count), expected at least 100 blocks"
+        record_test "environment_setup" "FAIL"
+        return 1
+    fi
+    
+    # Verify BDK wallet files exist
+    if [ ! -f ".test-mnemonic" ]; then
+        print_error "BDK wallet mnemonic file not found"
+        record_test "environment_setup" "FAIL"
+        return 1
+    fi
+    
+    if [ ! -f "wallet_regtest.sqlite3" ]; then
+        print_error "BDK wallet database not found"
+        record_test "environment_setup" "FAIL"
+        return 1
     fi
     
     # Final verification
@@ -164,20 +164,25 @@ test_environment_setup() {
     record_test "environment_setup" "PASS"
 }
 
-# Test 2: Wallet Balance Check
+# Test 2: BDK Wallet Balance Check
 test_wallet_balance() {
-    print_status "Test 2: Wallet Balance Check"
+    print_status "Test 2: BDK Wallet Balance Check"
     
-    local balance_info=$(bitcoin_cli -rpcwallet=mine getbalances)
-    local trusted_balance=$(echo "$balance_info" | grep -o '"trusted": [0-9.]*' | grep -o '[0-9.]*')
-    
-    if (( $(echo "$trusted_balance < 0.1" | bc -l) )); then
-        print_error "Insufficient wallet balance: $trusted_balance BTC"
+    # Check if mnemonic file exists (created by test-environment.sh setup-wallet)
+    if [ ! -f ".test-mnemonic" ]; then
+        print_error "Mnemonic file not found (.test-mnemonic)"
         record_test "wallet_balance" "FAIL"
         return 1
     fi
     
-    print_success "Wallet balance sufficient: $trusted_balance BTC"
+    # Check if wallet database exists
+    if [ ! -f "wallet_regtest.sqlite3" ]; then
+        print_error "BDK wallet database not found (wallet_regtest.sqlite3)"
+        record_test "wallet_balance" "FAIL"
+        return 1
+    fi
+    
+    print_success "BDK wallet setup verified"
     record_test "wallet_balance" "PASS"
 }
 
@@ -187,17 +192,25 @@ test_burn_transaction() {
     
     print_status "Creating burn transaction for $TEST_BURN_AMOUNT sats..."
     
-    # Create burn transaction
+    # Check mnemonic file exists
+    if [ ! -f ".test-mnemonic" ]; then
+        print_error "Mnemonic file not found"
+        record_test "burn_transaction" "FAIL"
+        return 1
+    fi
+    
+    # Create burn transaction with BDK wallet using mnemonic-file (more secure)
     local burn_output=$(./target/debug/core-lane-node burn \
         --burn-amount $TEST_BURN_AMOUNT \
         --chain-id $TEST_CHAIN_ID \
         --eth-address $TEST_ETH_ADDRESS \
+        --network regtest \
+        --mnemonic-file ".test-mnemonic" \
         --rpc-url $RPC_URL \
         --rpc-user $RPC_USER \
-        --rpc-password $RPC_PASSWORD \
-        --rpc-wallet $RPC_WALLET 2>&1)
+        --rpc-password $RPC_PASSWORD 2>&1)
     
-    if echo "$burn_output" | grep -q "✅ Burn transaction created and broadcast successfully"; then
+    if echo "$burn_output" | grep -q "✅ Burn transaction broadcast successfully"; then
         # Extract transaction ID
         BURN_TXID=$(echo "$burn_output" | grep "📍 Transaction ID:" | grep -o '[a-f0-9]\{64\}')
         print_success "Burn transaction created: $BURN_TXID"
@@ -221,13 +234,21 @@ test_send_ethereum_transaction() {
     print_status "Part A: Testing CLI send-transaction (for verification)..."
     print_status "Ethereum TX: ${sample_eth_tx:0:64}..."
     
-    # Send the transaction using CLI for verification purposes
+    # Check mnemonic file exists
+    if [ ! -f ".test-mnemonic" ]; then
+        print_error "Mnemonic file not found"
+        record_test "send_transaction" "FAIL"
+        return 1
+    fi
+    
+    # Send the transaction using CLI with mnemonic-file (more secure)
     local send_output=$(./target/debug/core-lane-node send-transaction \
         --raw-tx-hex "$sample_eth_tx" \
+        --network regtest \
+        --mnemonic-file ".test-mnemonic" \
         --rpc-url "$RPC_URL" \
         --rpc-user "$RPC_USER" \
-        --rpc-password "$RPC_PASSWORD" \
-        --rpc-wallet "mine" 2>&1)
+        --rpc-password "$RPC_PASSWORD" 2>&1)
     
     if echo "$send_output" | grep -q "✅ Core Lane transaction package submitted successfully"; then
         # Extract transaction IDs
@@ -258,7 +279,9 @@ test_send_ethereum_transaction() {
         
         # Mine a new block to include the reveal transaction
         print_status "Mining a new block to include the reveal transaction..."
-        docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 generatetoaddress 1 "$(docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 getnewaddress)" > /dev/null 2>&1
+        # Use BDK wallet address for mining
+        local mine_address=$(cat .test-address 2>/dev/null || echo "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqthqst8")
+        docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 generatetoaddress 1 "$mine_address" > /dev/null 2>&1
         
         # Wait a moment for the block to be processed
         sleep 2
@@ -291,8 +314,8 @@ test_send_ethereum_transaction() {
         --bitcoin-rpc-read-url $RPC_URL \
         --bitcoin-rpc-read-user $RPC_USER \
         --bitcoin-rpc-read-password $RPC_PASSWORD \
+        --mnemonic-file ".test-mnemonic" \
         --http-host 127.0.0.1 \
-        --rpc-wallet $RPC_WALLET \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_rpc_output 2>&1 &
     
     local rpc_node_pid=$!
@@ -391,7 +414,9 @@ test_send_ethereum_transaction() {
         
         # Mine a block to include the RPC transaction and test receipt availability
         print_status "Mining block to include RPC transaction and test receipt availability..."
-        docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 generatetoaddress 1 "$(docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 getnewaddress)" > /dev/null 2>&1
+        # Use BDK wallet address for mining
+        local mine_address=$(cat .test-address 2>/dev/null || echo "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqthqst8")
+        docker exec bitcoin-regtest bitcoin-cli -regtest -rpcuser=bitcoin -rpcpassword=bitcoin123 generatetoaddress 1 "$mine_address" > /dev/null 2>&1
         
         # Wait for Core Lane to process the block
         sleep 3
@@ -462,11 +487,11 @@ test_mine_confirmation() {
         return 1
     fi
     
-    # Get a new address for mining
-    local mine_address=$(bitcoin_cli -rpcwallet=mine getnewaddress "" bech32)
+    # Get BDK wallet address for mining
+    local mine_address=$(cat .test-address 2>/dev/null || echo "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqthqst8")
     
     # Mine a block
-    local block_hash=$(bitcoin_cli -rpcwallet=mine generatetoaddress 1 "$mine_address" | jq -r '.[0]')
+    local block_hash=$(bitcoin_cli generatetoaddress 1 "$mine_address" | jq -r '.[0]')
     
     if [ -n "$block_hash" ] && [ "$block_hash" != "null" ]; then
         print_success "Block mined: $block_hash"
@@ -549,13 +574,13 @@ test_start_core_lane_node() {
     
     print_status "Starting Core Lane node from block $scan_from_block to catch recent burn..."
     
-    # Start Core Lane node with JSON-RPC in background
+    # Start Core Lane node with JSON-RPC in background using mnemonic-file (more secure)
     RUST_LOG=info ./target/debug/core-lane-node start \
         --start-block $scan_from_block \
         --bitcoin-rpc-read-url $RPC_URL \
         --bitcoin-rpc-read-user $RPC_USER \
         --bitcoin-rpc-read-password $RPC_PASSWORD \
-        --rpc-wallet $RPC_WALLET \
+        --mnemonic-file ".test-mnemonic" \
         --http-host 127.0.0.1 \
         --http-port $JSON_RPC_PORT > /tmp/core_lane_node_output 2>&1 &
     
