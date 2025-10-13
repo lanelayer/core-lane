@@ -1,12 +1,24 @@
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::U256;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 
 /// Core Lane account structure
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreLaneAccount {
     pub balance: U256,
     pub nonce: U256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleCoreLaneAccount {
+    pub original: Option<CoreLaneAccount>,
+    pub info: CoreLaneAccount,
+}
+
+impl BundleCoreLaneAccount {
+    pub fn new(original: Option<CoreLaneAccount>, info: CoreLaneAccount) -> Self {
+        Self { original, info }
+    }
 }
 
 impl CoreLaneAccount {
@@ -49,64 +61,5 @@ impl CoreLaneAccount {
             .checked_sub(amount)
             .ok_or_else(|| anyhow!("Balance underflow"))?;
         Ok(())
-    }
-}
-
-/// Account manager for Core Lane
-#[derive(Debug, Clone)]
-pub struct AccountManager {
-    accounts: HashMap<Address, CoreLaneAccount>,
-}
-
-impl AccountManager {
-    pub fn new() -> Self {
-        Self {
-            accounts: HashMap::new(),
-        }
-    }
-
-    pub fn get_account(&self, address: Address) -> Option<&CoreLaneAccount> {
-        self.accounts.get(&address)
-    }
-
-    pub fn get_account_mut(&mut self, address: Address) -> &mut CoreLaneAccount {
-        self.accounts
-            .entry(address)
-            .or_insert_with(CoreLaneAccount::new)
-    }
-
-    pub fn get_balance(&self, address: Address) -> U256 {
-        self.accounts
-            .get(&address)
-            .map(|acc| acc.balance)
-            .unwrap_or(U256::ZERO)
-    }
-
-    pub fn get_nonce(&self, address: Address) -> U256 {
-        self.accounts
-            .get(&address)
-            .map(|acc| acc.nonce)
-            .unwrap_or(U256::ZERO)
-    }
-
-    pub fn set_balance(&mut self, address: Address, balance: U256) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.balance = balance;
-        Ok(())
-    }
-
-    pub fn add_balance(&mut self, address: Address, amount: U256) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.add_balance(amount)
-    }
-
-    pub fn sub_balance(&mut self, address: Address, amount: U256) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.sub_balance(amount)
-    }
-
-    pub fn increment_nonce(&mut self, address: Address) -> Result<()> {
-        let account = self.get_account_mut(address);
-        account.increment_nonce()
     }
 }

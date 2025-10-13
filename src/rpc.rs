@@ -459,7 +459,7 @@ impl RpcServer {
         let state = state.state.lock().await;
 
         // Look for the transaction by calculating hash from raw data
-        for (index, stored_tx) in state.transactions.iter().enumerate() {
+        for (index, stored_tx) in state.account_manager.get_transactions().iter().enumerate() {
             let current_tx_hash = format!(
                 "0x{}",
                 hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -704,7 +704,7 @@ impl RpcServer {
         let state = state.state.lock().await;
 
         // Look for the transaction receipt
-        if let Some(receipt) = state.transaction_receipts.get(&format!("0x{}", tx_hash)) {
+        if let Some(receipt) = state.account_manager.get_receipt(&format!("0x{}", tx_hash)) {
             // Found the receipt, return its details
             let mut result = serde_json::Map::new();
             result.insert(
@@ -815,7 +815,9 @@ impl RpcServer {
                 // Get transaction hash from block
                 if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                     // Find the actual transaction data
-                    for (_stored_index, stored_tx) in state.transactions.iter().enumerate() {
+                    for (_stored_index, stored_tx) in
+                        state.account_manager.get_transactions().iter().enumerate()
+                    {
                         let current_tx_hash = format!(
                             "0x{}",
                             hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1113,7 +1115,9 @@ impl RpcServer {
             // Get transaction hash from block
             if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                 // Find the actual transaction data
-                for (_stored_index, stored_tx) in state.transactions.iter().enumerate() {
+                for (_stored_index, stored_tx) in
+                    state.account_manager.get_transactions().iter().enumerate()
+                {
                     let current_tx_hash = format!(
                         "0x{}",
                         hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1799,7 +1803,7 @@ impl RpcServer {
             Some(IntentCall::IsIntentSolved { intent_id }) => {
                 info!("IsIntentSolved: intent_id = {}", intent_id);
                 let state_guard = state.state.lock().await;
-                match state_guard.intents.get(&intent_id) {
+                match state_guard.account_manager.get_intent(&intent_id) {
                     Some(intent) if matches!(intent.status, IntentStatus::Solved) => {
                         ret_bytes.extend_from_slice(&{
                             let mut res = [0u8; 32];
@@ -1815,7 +1819,7 @@ impl RpcServer {
             Some(IntentCall::ValueStoredInIntent { intent_id }) => {
                 info!("ValueStoredInIntent: intent_id = {}", intent_id);
                 let state_guard = state.state.lock().await;
-                let value_u256: U256 = match state_guard.intents.get(&intent_id) {
+                let value_u256: U256 = match state_guard.account_manager.get_intent(&intent_id) {
                     Some(intent) => U256::from(intent.value),
                     None => U256::ZERO,
                 };
@@ -1826,7 +1830,7 @@ impl RpcServer {
                 info!("IntentLocker: intent_id = {}", intent_id);
                 let state_guard = state.state.lock().await;
                 let mut buf = [0u8; 32];
-                if let Some(intent) = state_guard.intents.get(&intent_id) {
+                if let Some(intent) = state_guard.account_manager.get_intent(&intent_id) {
                     if let IntentStatus::Locked(addr) = intent.status {
                         let addr_bytes = addr.as_slice();
                         buf[12..].copy_from_slice(addr_bytes);

@@ -302,14 +302,14 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentStatus {
     Submitted,
     Locked(Address),
     Solved,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intent {
     pub data: Bytes,
     pub value: u64,

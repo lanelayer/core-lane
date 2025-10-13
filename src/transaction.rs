@@ -1,4 +1,5 @@
 use crate::intents::{decode_intent_calldata, Intent, IntentCall, IntentData, IntentStatus};
+use crate::state::BundleStateManager;
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
@@ -69,11 +70,10 @@ pub struct ExecutionResult {
 pub fn execute_transaction(
     tx: &TxEnvelope,
     sender: Address,
-    //account_manager: &mut crate::account::AccountManager,
-    //intents: &mut HashMap<B256, (Bytes, u64)>,
+    bundle_state: &mut BundleStateManager,
     state: &mut CoreLaneState,
 ) -> Result<ExecutionResult> {
-    execute_transfer(tx, sender, state)
+    execute_transfer(tx, sender, bundle_state, state)
 }
 
 /// Get gas limit from transaction
@@ -140,10 +140,32 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 fn execute_transfer(
     tx: &TxEnvelope,
     sender: Address,
+    bundle_state: &mut BundleStateManager,
     state: &mut CoreLaneState,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
+
+    // Validate nonce to prevent replay attacks and ensure transaction ordering
+    let tx_nonce = get_transaction_nonce(tx);
+    let expected_nonce = bundle_state.get_nonce(&state.account_manager, sender);
+
+    if U256::from(tx_nonce) != expected_nonce {
+        return Ok(ExecutionResult {
+            success: false,
+            gas_used,
+            gas_refund: U256::ZERO,
+            output: Bytes::new(),
+            logs: vec![format!(
+                "Invalid nonce: expected {}, got {}",
+                expected_nonce, tx_nonce
+            )],
+            error: Some(format!(
+                "Invalid nonce: expected {}, got {}",
+                expected_nonce, tx_nonce
+            )),
+        });
+    }
 
     let to = match get_transaction_to(tx) {
         Some(addr) => addr,
@@ -176,7 +198,7 @@ fn execute_transfer(
         match decode_intent_calldata(&input) {
             Some(IntentCall::StoreBlob { data, .. }) => {
                 let blob_hash = keccak256(&data);
-                if state.stored_blobs.contains(&blob_hash) {
+                if bundle_state.contains_blob(&state.account_manager, &blob_hash) {
                     return Ok(ExecutionResult {
                         success: true,
                         gas_used,
@@ -186,8 +208,17 @@ fn execute_transfer(
                         error: None,
                     });
                 }
-                state.stored_blobs.insert(blob_hash);
-                let _ = state.account_manager.increment_nonce(sender);
+                bundle_state.insert_blob(blob_hash, data.clone());
+                if let Err(e) = bundle_state.increment_nonce(&state.account_manager, sender) {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec![format!("Failed to increment nonce: {}", e)],
+                        error: Some(e.to_string()),
+                    });
+                }
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -202,7 +233,7 @@ fn execute_transfer(
                 extra_data,
                 ..
             }) => {
-                if !state.stored_blobs.contains(&blob_hash) {
+                if !bundle_state.contains_blob(&state.account_manager, &blob_hash) {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -213,7 +244,7 @@ fn execute_transfer(
                     });
                 }
 
-                if state.account_manager.get_balance(sender) < value {
+                if bundle_state.get_balance(&state.account_manager, sender) < value {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -228,11 +259,11 @@ fn execute_transfer(
                 preimage.extend_from_slice(blob_hash.as_slice());
                 preimage.extend_from_slice(&extra_data);
 
-                state.account_manager.sub_balance(sender, value)?;
-                state.account_manager.increment_nonce(sender)?;
+                bundle_state.sub_balance(&state.account_manager, sender, value)?;
+                bundle_state.increment_nonce(&state.account_manager, sender)?;
                 let value_u64: u64 = value.try_into().unwrap();
                 let intent_id = calculate_intent_id(sender, nonce, Bytes::from(preimage));
-                state.intents.insert(
+                bundle_state.insert_intent(
                     intent_id,
                     Intent {
                         data: Bytes::from(extra_data),
@@ -254,7 +285,7 @@ fn execute_transfer(
             }
             Some(IntentCall::Intent { intent_data, .. }) => {
                 // Explicit intent submission via ABI: use the intent payload for ID
-                if state.account_manager.get_balance(sender) < value {
+                if bundle_state.get_balance(&state.account_manager, sender) < value {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -264,12 +295,12 @@ fn execute_transfer(
                         error: Some("Insufficient balance".to_string()),
                     });
                 }
-                state.account_manager.sub_balance(sender, value)?;
-                state.account_manager.increment_nonce(sender)?;
+                bundle_state.sub_balance(&state.account_manager, sender, value)?;
+                bundle_state.increment_nonce(&state.account_manager, sender)?;
                 let value_u64: u64 = value.try_into().unwrap_or(u64::MAX);
                 let intent_id =
                     calculate_intent_id(sender, nonce, Bytes::from(intent_data.clone()));
-                state.intents.insert(
+                bundle_state.insert_intent(
                     intent_id,
                     Intent {
                         data: Bytes::from(intent_data),
@@ -287,7 +318,7 @@ fn execute_transfer(
                 });
             }
             Some(IntentCall::IsIntentSolved { intent_id }) => {
-                let solved = match state.intents.get(&intent_id) {
+                let solved = match bundle_state.get_intent(&state.account_manager, &intent_id) {
                     Some(intent) => matches!(intent.status, IntentStatus::Solved),
                     None => false,
                 };
@@ -305,11 +336,24 @@ fn execute_transfer(
                 });
             }
             Some(IntentCall::LockIntentForSolving { intent_id, .. }) => {
-                if let Some(intent) = state.intents.get_mut(&intent_id) {
+                if let Some(intent) =
+                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                {
                     match intent.status {
                         IntentStatus::Submitted => {
                             intent.status = IntentStatus::Locked(sender);
-                            let _ = state.account_manager.increment_nonce(sender);
+                            if let Err(e) =
+                                bundle_state.increment_nonce(&state.account_manager, sender)
+                            {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec![format!("Failed to increment nonce: {}", e)],
+                                    error: Some(e.to_string()),
+                                });
+                            }
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
@@ -356,7 +400,7 @@ fn execute_transfer(
                     data[..8].try_into().expect("data must be at least 8 bytes"),
                 );
 
-                if let Some(intent) = state.intents.get(&intent_id) {
+                if let Some(intent) = bundle_state.get_intent(&state.account_manager, &intent_id) {
                     if !matches!(intent.status, IntentStatus::Locked(_)) {
                         return Ok(ExecutionResult {
                             success: false,
@@ -380,12 +424,46 @@ fn execute_transfer(
 
                 match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
                     Ok(true) => {
-                        if let Some(intent) = state.intents.get_mut(&intent_id) {
-                            state
-                                .account_manager
-                                .add_balance(sender, U256::from(intent.value))?;
+                        // Extract intent value first to avoid borrow checker issues
+                        let intent_value = if let Some(intent) =
+                            bundle_state.get_intent(&state.account_manager, &intent_id)
+                        {
+                            intent.value
+                        } else {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["solveIntent: intent disappeared".to_string()],
+                                error: Some("Intent disappeared".to_string()),
+                            });
+                        };
+
+                        // Add balance using the extracted value
+                        bundle_state.add_balance(
+                            &state.account_manager,
+                            sender,
+                            U256::from(intent_value),
+                        )?;
+
+                        // Now update the intent status
+                        if let Some(intent) =
+                            bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                        {
                             intent.status = IntentStatus::Solved;
-                            let _ = state.account_manager.increment_nonce(sender);
+                            if let Err(e) =
+                                bundle_state.increment_nonce(&state.account_manager, sender)
+                            {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec![format!("Failed to increment nonce: {}", e)],
+                                    error: Some(e.to_string()),
+                                });
+                            }
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
@@ -439,7 +517,7 @@ fn execute_transfer(
         }
     }
 
-    if state.account_manager.get_balance(sender) < value {
+    if bundle_state.get_balance(&state.account_manager, sender) < value {
         return Ok(ExecutionResult {
             success: false,
             gas_used,
@@ -450,9 +528,9 @@ fn execute_transfer(
         });
     }
 
-    state.account_manager.sub_balance(sender, value)?;
-    state.account_manager.add_balance(to, value)?;
-    state.account_manager.increment_nonce(sender)?;
+    bundle_state.sub_balance(&state.account_manager, sender, value)?;
+    bundle_state.add_balance(&state.account_manager, to, value)?;
+    bundle_state.increment_nonce(&state.account_manager, sender)?;
 
     Ok(ExecutionResult {
         success: true,
@@ -484,10 +562,9 @@ fn verify_intent_fill_on_bitcoin(
 
     let network = bitcoin::Network::Regtest;
     let intent = state
-        .intents
-        .get(&intent_id)
-        .ok_or_else(|| anyhow!("Intent not found for verification"))
-        .unwrap();
+        .account_manager
+        .get_intent(&intent_id)
+        .ok_or_else(|| anyhow!("Intent not found for verification"))?;
 
     let cbor_intent = IntentData::from_cbor(&intent.data)?;
     let fill = cbor_intent.parse_anchor_bitcoin_fill()?;

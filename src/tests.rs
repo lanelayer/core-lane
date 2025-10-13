@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::AccountManager;
+    use crate::state::{BundleStateManager, StateManager};
     use alloy_consensus::{TxEnvelope, TxLegacy};
     use alloy_primitives::{Address, Bytes, U256};
     use std::str::FromStr;
@@ -88,7 +88,7 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::account::AccountManager;
+    use crate::state::{BundleStateManager, StateManager};
     use alloy_primitives::{Address, U256};
     use std::str::FromStr;
 
@@ -119,16 +119,22 @@ mod integration_tests {
 
     #[test]
     fn test_account_state_consistency() {
-        let mut account_manager = AccountManager::new();
+        let mut state_manager = StateManager::new();
+        let mut bundle_state = BundleStateManager::new();
         let address = Address::from_str(TEST_ETH_ADDRESS).unwrap();
 
-        // Test that account state remains consistent
-        account_manager
-            .add_balance(address, U256::from(1000u64))
+        // Test that account state remains consistent using bundle state
+        bundle_state
+            .add_balance(&state_manager, address, U256::from(1000u64))
             .unwrap();
-        account_manager.increment_nonce(address).unwrap();
+        bundle_state
+            .increment_nonce(&state_manager, address)
+            .unwrap();
 
-        let account = account_manager.get_account(address).unwrap();
+        // Apply changes to state manager
+        state_manager.apply_changes(bundle_state);
+
+        let account = state_manager.get_account(address).unwrap();
         assert_eq!(account.balance, U256::from(1000u64));
         assert_eq!(account.nonce, U256::from(1u64));
     }
