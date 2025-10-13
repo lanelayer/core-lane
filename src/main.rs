@@ -25,19 +25,20 @@ mod bitcoin_cache_rpc;
 mod block;
 mod intents;
 mod rpc;
+mod state;
 mod taproot_da;
 mod transaction;
 
 #[cfg(test)]
 mod tests;
 
-use account::AccountManager;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
 use bitcoin_cache_rpc::BitcoinCacheRpcServer;
 use intents::{create_anchor_bitcoin_fill_intent, Intent};
 use rpc::RpcServer;
+use state::{BundleStateManager, StateManager, StoredTransaction, TransactionReceipt};
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
@@ -239,30 +240,6 @@ enum Commands {
 }
 
 #[derive(Debug, Clone)]
-struct TransactionReceipt {
-    transaction_hash: String,
-    block_number: u64,
-    transaction_index: u64,
-    from: String,
-    to: Option<String>,
-    cumulative_gas_used: String,
-    gas_used: String,
-    contract_address: Option<String>,
-    logs: Vec<String>,
-    status: String,
-    effective_gas_price: String,
-    tx_type: String,
-    logs_bloom: String,
-}
-
-#[derive(Debug, Clone)]
-struct StoredTransaction {
-    envelope: TxEnvelope,
-    raw_data: Vec<u8>, // Raw transaction data for hash calculation
-    block_number: u64,
-}
-
-#[derive(Debug, Clone)]
 struct CoreLaneBlock {
     number: u64,
     hash: B256,
@@ -396,18 +373,14 @@ impl CoreLaneBlock {
 
 #[derive(Debug, Clone)]
 struct CoreLaneState {
-    account_manager: AccountManager,
-    transactions: Vec<StoredTransaction>, // Store both envelope and raw data
-    transaction_receipts: HashMap<String, TransactionReceipt>, // Store transaction receipts
+    account_manager: StateManager,
     last_processed_block: u64,
     blocks: HashMap<u64, CoreLaneBlock>,  // Block number -> Block
     block_hashes: HashMap<B256, u64>,     // Block hash -> Block number
     current_block: Option<CoreLaneBlock>, // Current block being built
     genesis_block: CoreLaneBlock,         // Genesis block
-    intents: HashMap<B256, Intent>,
-    bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
-    bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
-    stored_blobs: HashSet<B256>,
+    bitcoin_client_read: Arc<Client>,     // Client for reading blockchain data
+    bitcoin_client_write: Arc<Client>,    // Client for writing/wallet operations
 }
 
 impl CoreLaneState {
@@ -441,18 +414,14 @@ impl CoreLaneNode {
         block_hashes.insert(genesis_hash, 0);
 
         let state = Arc::new(Mutex::new(CoreLaneState {
-            account_manager: AccountManager::new(),
-            transactions: Vec::new(),
-            transaction_receipts: HashMap::new(),
+            account_manager: StateManager::new(),
             last_processed_block: 0,
             blocks,
             block_hashes,
             current_block: None,
             genesis_block,
-            intents: HashMap::new(),
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
-            stored_blobs: HashSet::new(),
         }));
 
         Self {
@@ -525,9 +494,10 @@ impl CoreLaneNode {
         state.blocks.insert(new_block.number, new_block.clone());
         state.block_hashes.insert(new_block.hash, new_block.number);
 
-        for (stored_tx, receipt, tx_hash) in transactions.clone() {
-            state.transactions.push(stored_tx);
-            state.transaction_receipts.insert(tx_hash, receipt);
+        // Transactions and receipts are already in bundle state and will be applied via apply_changes
+        // Just need to update block metadata with transaction hashes
+        for (_stored_tx, _receipt, tx_hash) in transactions.iter() {
+            // Transaction hashes already added to new_block in the loop above
         }
 
         info!(
@@ -612,15 +582,18 @@ impl CoreLaneNode {
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
 
+        // Create a single bundle state manager for the entire block
+        let mut bundle_state = state::BundleStateManager::new();
+
         if let Some(block_origin) = new_block_clone.block_origin {
             debug!("🔥 Phase 1: Processing burns...");
+            let state = self.state.lock().await;
             for burn in block_origin.burns.iter() {
-                let mut state = self.state.lock().await;
                 info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
-                state
-                    .account_manager
-                    .add_balance(burn.address, burn.amount)?;
+                bundle_state.add_balance(&state.account_manager, burn.address, burn.amount)?;
             }
+            drop(state);
+
             let mut tx_count = 0;
             for bundle in block_origin.bundles.iter() {
                 if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
@@ -628,9 +601,14 @@ impl CoreLaneNode {
                     // skip this bundle because it's not valid for this block
                     continue;
                 }
-                for (tx_index, tx) in bundle.transactions.iter().enumerate() {
+                for (_tx_index, tx) in bundle.transactions.iter().enumerate() {
                     let tx = self
-                        .process_core_lane_transaction(tx, new_block.number, tx_count)
+                        .process_core_lane_transaction(
+                            &mut bundle_state,
+                            tx,
+                            new_block.number,
+                            tx_count,
+                        )
                         .await;
                     if let Some((stored_tx, receipt, tx_hash)) = tx {
                         core_lane_transactions.push((stored_tx, receipt, tx_hash));
@@ -639,71 +617,81 @@ impl CoreLaneNode {
                 }
             }
         }
+
+        // Apply all state changes atomically at the end of block processing
+        {
+            let mut state = self.state.lock().await;
+            state.account_manager.apply_changes(bundle_state);
+        }
+
         // Finalize the Core Lane block
         self.finalize_current_block(core_lane_transactions, new_block)
             .await?;
-        // Phase 1: Process ALL Bitcoin burns first to mint Core Lane tokens
 
         Ok(())
     }
 
     async fn process_core_lane_transaction(
         &self,
+        bundle_state: &mut state::BundleStateManager,
         tx: &(TxEnvelope, Address, Vec<u8>),
         block_number: u64,
         tx_number: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let gas_price = U256::from(214285714u64);
-        // charge gas fee first, we return unused gas later
-        {
-            let mut state = self.state.lock().await;
-            //  Transaction size ≈ 150 byte
-            // Fee rate = 3 sats/vbyte
-            // Conversion rate: 1 sat = 10¹⁰ wei
-            // Gas cost for comparable tx: 21,000 gas = 150 bytes
-            //
-            if tx.0.is_eip1559() {
-                if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
-                    warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
-                    return None;
-                }
-            } else if tx.0.is_legacy() {
-                if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
-                    warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
-                    return None;
-                }
-            } else {
-                warn!("      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}", tx.0);
+
+        let mut state = self.state.lock().await;
+
+        //  Transaction size ≈ 150 byte
+        // Fee rate = 3 sats/vbyte
+        // Conversion rate: 1 sat = 10¹⁰ wei
+        // Gas cost for comparable tx: 21,000 gas = 150 bytes
+        //
+        if tx.0.is_eip1559() {
+            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
+                warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
                 return None;
             }
-            let gas_fee =
-                gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
-            if let Err(e) = state.account_manager.sub_balance(tx.1, gas_fee) {
-                warn!(
-                    "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
-                    e
-                );
+        } else if tx.0.is_legacy() {
+            if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
+                warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
                 return None;
-            } else {
-                info!("      💰 Charged gas fee: {} wei", gas_fee);
             }
+        } else {
+            warn!(
+                "      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}",
+                tx.0
+            );
+            return None;
         }
 
-        let _execution_result = {
-            let mut state = self.state.lock().await;
-            execute_transaction(&tx.0, tx.1, &mut state)
-        };
+        // Charge gas fee first from bundle state
+        let gas_fee = gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
+        if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
+            warn!(
+                "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
+                e
+            );
+            return None;
+        } else {
+            info!("      💰 Charged gas fee: {} wei", gas_fee);
+        }
+
+        // Execute transaction with bundle state
+        let _execution_result = execute_transaction(&tx.0, tx.1, bundle_state, &mut state);
 
         // XXX add gas refund later
 
-        // Store the transaction with both envelope and raw data
-        let state = self.state.lock().await;
+        // Read balance after execution
+        let final_balance = bundle_state.get_balance(&state.account_manager, tx.1);
+
+        // Store the transaction with both envelope and raw data in bundle state
         let stored_tx = StoredTransaction {
             envelope: tx.0.clone(),
             raw_data: tx.2.clone(),
             block_number: block_number,
         };
-        // Create and store transaction receipt
+        // Create and store transaction receipt in bundle state
         let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
 
         let receipt = TransactionReceipt {
@@ -728,12 +716,15 @@ impl CoreLaneNode {
             logs_bloom: format!("0x{}", hex::encode(vec![0u8; 256])),
         };
 
+        // Store in bundle state
+        bundle_state.add_transaction(stored_tx.clone());
+        bundle_state.add_receipt(tx_hash.clone(), receipt.clone());
+
         // Print account balances after execution
-        debug!(
-            "   💰 Account balance after execution: {}",
-            state.account_manager.get_balance(tx.1)
-        );
-        Some((stored_tx.clone(), receipt.clone(), tx_hash.clone()))
+        debug!("   💰 Account balance after execution: {}", final_balance);
+
+        drop(state); // Release lock
+        Some((stored_tx, receipt, tx_hash))
     }
 
     async fn send_transaction_to_da(
