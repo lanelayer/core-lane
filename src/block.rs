@@ -43,6 +43,7 @@ pub struct CoreLaneBlockParsed {
     pub anchor_block_hash: Vec<u8>,
     pub anchor_block_timestamp: u64,
     pub anchor_block_height: u64,
+    pub parent_hash: Vec<u8>,
 }
 
 impl CoreLaneBlockParsed {
@@ -50,6 +51,7 @@ impl CoreLaneBlockParsed {
         anchor_block_hash: Vec<u8>,
         anchor_block_timestamp: u64,
         anchor_block_height: u64,
+        parent_hash: Vec<u8>,
     ) -> Self {
         Self {
             bundles: Vec::new(),
@@ -57,6 +59,7 @@ impl CoreLaneBlockParsed {
             anchor_block_hash,
             anchor_block_timestamp,
             anchor_block_height,
+            parent_hash,
         }
     }
 

@@ -32,12 +32,23 @@ pub fn process_bitcoin_block(
     );
 
     let bitcoin_block_hash = hash.to_string();
+    let bitcoin_block_hash_bytes = bitcoin_block_hash.as_bytes().to_vec(); // Store hex string as bytes for now
     let bitcoin_block_timestamp = block.header.time as u64;
 
+    // Get parent hash
+    let parent_hash = if height > 0 {
+        let parent_hash = bitcoin_client.get_block_hash(height - 1)?;
+        parent_hash.to_string().as_bytes().to_vec()
+    } else {
+        // Genesis block has no parent
+        Vec::new()
+    };
+
     let mut core_lane_block = CoreLaneBlockParsed::new(
-        bitcoin_block_hash.as_bytes().to_vec(),
+        bitcoin_block_hash_bytes,
         bitcoin_block_timestamp,
         height,
+        parent_hash,
     );
 
     for (tx_index, tx) in block.txdata.iter().enumerate() {

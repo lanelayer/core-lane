@@ -309,6 +309,8 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
 )]
+#[repr(u8)]
+#[borsh(use_discriminant = true)]
 pub enum IntentStatus {
     Submitted,
     Locked(Address),
