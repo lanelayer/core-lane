@@ -58,21 +58,21 @@ bitcoin_cli() {
 # Function to start Bitcoin regtest
 start_bitcoin() {
     print_status "Starting Bitcoin regtest network..."
-    
+
     # Create data directory
     mkdir -p "$BITCOIN_DATA_DIR"
-    
+
     # Pull Bitcoin Core image if not exists
-    if ! docker images | grep -q "bitcoin/bitcoin.*29.0"; then
-        print_status "Pulling Bitcoin Core 29.0 image..."
-        docker pull bitcoin/bitcoin:29.0
+    if ! docker images | grep -q "bitcoin/bitcoin.*30.0"; then
+        print_status "Pulling Bitcoin Core 30.0 image..."
+        docker pull bitcoin/bitcoin:30.0
     fi
-    
+
     # Start Bitcoin container
     docker run --rm -d --name $BITCOIN_CONTAINER \
         -p 18443:18443 -p 18444:18444 \
         -v "$BITCOIN_DATA_DIR:/bitcoin/.bitcoin" \
-        bitcoin/bitcoin:29.0 \
+        bitcoin/bitcoin:30.0 \
         -regtest \
         -fallbackfee=0.0002 \
         -maxtxfee=1.0 \
@@ -83,17 +83,17 @@ start_bitcoin() {
         -rpcallowip=0.0.0.0/0 \
         -rpcbind=0.0.0.0 \
         -txindex=1
-    
+
     # Wait for Bitcoin to start
     print_status "Waiting for Bitcoin to start..."
     sleep 5
-    
+
     # Wait for RPC to be ready
     while ! bitcoin_cli getblockchaininfo > /dev/null 2>&1; do
         print_status "Waiting for Bitcoin RPC to be ready..."
         sleep 2
     done
-    
+
     print_success "Bitcoin regtest network started!"
 }
 
@@ -112,52 +112,52 @@ stop_bitcoin() {
 reset_bitcoin() {
     print_status "Resetting Bitcoin regtest network..."
     stop_bitcoin
-    
+
     if [ -d "$BITCOIN_DATA_DIR" ]; then
         print_status "Removing Bitcoin data directory..."
         rm -rf "$BITCOIN_DATA_DIR"
     fi
-    
+
     print_success "Bitcoin regtest network reset!"
 }
 
 # Function to setup wallet and mine initial blocks
 setup_wallet() {
     print_status "Setting up BDK wallet..."
-    
+
     # Check if core-lane-node is built
     if [ ! -f "target/debug/core-lane-node" ]; then
         print_status "Building Core Lane node (debug)..."
         cargo build
     fi
-    
+
     # Clean up any existing wallet
     rm -f wallet_regtest.sqlite3
     rm -f .test-address .test-mnemonic
-    
+
     # Create BDK wallet
     print_status "Creating BDK wallet..."
     MNEMONIC=$(./target/debug/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
-    
+
     if [ -z "$MNEMONIC" ]; then
         print_error "Failed to create BDK wallet"
         return 1
     fi
-    
+
     print_success "BDK wallet created"
     echo "$MNEMONIC" > .test-mnemonic
     print_status "Mnemonic saved to: .test-mnemonic"
-    
+
     # Get new address from BDK wallet
     ADDRESS=$(./target/debug/core-lane-node --plain get-address --network regtest 2>/dev/null)
     print_status "Generated BDK address: $ADDRESS"
-    
+
     # Mine 101 blocks to activate coinbase
     print_status "Mining 101 blocks to activate coinbase..."
     bitcoin_cli generatetoaddress 101 "$ADDRESS" > /dev/null
-    
+
     print_success "Mined 101 blocks to BDK wallet"
-    
+
     echo "$ADDRESS" > .test-address
     print_status "Test address saved to .test-address"
 }
@@ -173,12 +173,12 @@ build_core_lane() {
 # Function to test Core Lane connection
 test_core_lane_connection() {
     print_status "Testing Core Lane connection to Bitcoin..."
-    
+
     if [ ! -f "target/debug/core-lane-node" ]; then
         print_error "Core Lane node not built. Run 'build' first."
         return 1
     fi
-    
+
     # Test connection by checking if we can connect to Bitcoin
     print_status "Connection test: Starting Core Lane node briefly..."
     timeout 5 ./target/debug/core-lane-node start \
@@ -186,27 +186,27 @@ test_core_lane_connection() {
         --bitcoin-rpc-read-user "$RPC_USER" \
         --bitcoin-rpc-read-password "$RPC_PASSWORD" \
         --http-port 18545 || true
-    
+
     print_success "Core Lane connection test completed!"
 }
 
 # Function to create test burn transaction
 create_test_burn() {
     print_status "Creating test Bitcoin burn transaction..."
-    
+
     if [ ! -f ".test-address" ]; then
         print_error "No test address found. Run 'setup-wallet' first."
         return 1
     fi
-    
+
     ADDRESS=$(cat .test-address)
-    
+
     # Check if Core Lane is built
     if [ ! -f "target/debug/core-lane-node" ]; then
         print_error "Core Lane node not built. Run 'build' first."
         return 1
     fi
-    
+
     print_status "Test address: $ADDRESS"
     print_status "To create a burn transaction, you just need an Ethereum address!"
     echo
@@ -232,7 +232,7 @@ create_test_burn() {
 # Function to show status
 show_status() {
     print_status "=== Core Lane Test Environment Status ==="
-    
+
     echo
     print_status "Bitcoin Container:"
     if is_bitcoin_running; then
@@ -240,7 +240,7 @@ show_status() {
         echo "  Container: $BITCOIN_CONTAINER"
         echo "  RPC URL: $RPC_URL"
         echo "  RPC User: $RPC_USER"
-        
+
         # Get blockchain info
         if bitcoin_cli getblockchaininfo > /dev/null 2>&1; then
             BLOCKS=$(bitcoin_cli getblockcount)
@@ -249,7 +249,7 @@ show_status() {
     else
         print_error "✗ Not running"
     fi
-    
+
     echo
     print_status "Core Lane:"
     if [ -f "target/debug/core-lane-node" ]; then
@@ -257,7 +257,7 @@ show_status() {
     else
         print_error "✗ Not built"
     fi
-    
+
     echo
     print_status "Test Data:"
     if [ -f ".test-address" ]; then

@@ -63,15 +63,15 @@ start_bitcoin() {
 
     mkdir -p "$BITCOIN_DATA_DIR"
 
-    if ! docker images | grep -q "bitcoin/bitcoin.*29.0"; then
-        print_status "Pulling Bitcoin Core 29.0 image..."
-        docker pull bitcoin/bitcoin:29.0
+    if ! docker images | grep -q "bitcoin/bitcoin.*30.0"; then
+        print_status "Pulling Bitcoin Core 30.0 image..."
+        docker pull bitcoin/bitcoin:30.0
     fi
 
     docker run --rm -d --name $BITCOIN_CONTAINER \
         -p 18443:18443 -p 18444:18444 \
         -v "$BITCOIN_DATA_DIR:/bitcoin/.bitcoin" \
-        bitcoin/bitcoin:29.0 \
+        bitcoin/bitcoin:30.0 \
         -regtest \
         -fallbackfee=0.0002 \
         -maxtxfee=1.0 \
@@ -110,7 +110,7 @@ setup_bdk_wallet() {
 
     # Create BDK wallet and capture mnemonic
     local mnemonic=$(./target/debug/core-lane-node --plain create-wallet --network regtest 2>/dev/null)
-    
+
     if [ -z "$mnemonic" ]; then
         print_error "Failed to create BDK wallet"
         return 1
@@ -119,7 +119,7 @@ setup_bdk_wallet() {
     # Save mnemonic to file
     mkdir -p .dev-wallets
     echo "$mnemonic" > .dev-wallets/mnemonic_regtest.txt
-    
+
     print_success "BDK wallet created"
     print_status "Mnemonic saved to: .dev-wallets/mnemonic_regtest.txt"
     print_status "Mnemonic: $mnemonic"
@@ -401,7 +401,7 @@ start_dev_environment() {
 
     # Setup BDK wallet (used for mining and Core Lane operations)
     setup_bdk_wallet
-    
+
     start_core_lane_node
 
 
