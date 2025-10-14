@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, U256};
 use bitcoin::{
+    hashes::Hash,
     opcodes::{
         all::{OP_ENDIF, OP_IF, OP_RETURN},
         OP_FALSE, OP_TRUE,
@@ -32,13 +33,14 @@ pub fn process_bitcoin_block(
     );
 
     let bitcoin_block_hash = hash.to_string();
-    let bitcoin_block_hash_bytes = bitcoin_block_hash.as_bytes().to_vec(); // Store hex string as bytes for now
+    let bitcoin_block_hash_bytes: Vec<u8> = hash.as_raw_hash().to_byte_array().to_vec(); // Store raw 32-byte hash
     let bitcoin_block_timestamp = block.header.time as u64;
 
     // Get parent hash
     let parent_hash = if height > 0 {
         let parent_hash = bitcoin_client.get_block_hash(height - 1)?;
-        parent_hash.to_string().as_bytes().to_vec()
+        let parent_hash_bytes: Vec<u8> = parent_hash.as_raw_hash().to_byte_array().to_vec(); // Store raw 32-byte hash
+        parent_hash_bytes
     } else {
         // Genesis block has no parent
         Vec::new()

@@ -374,14 +374,15 @@ impl CoreLaneBlock {
 #[derive(Debug, Clone)]
 struct CoreLaneState {
     account_manager: StateManager,
-    last_processed_block: u64,
-    blocks: HashMap<u64, CoreLaneBlock>,  // Block number -> Block
-    block_hashes: HashMap<B256, u64>,     // Block hash -> Block number
-    height_to_hash: HashMap<u64, B256>,   // Block height -> Block hash (for reorg detection)
-    current_block: Option<CoreLaneBlock>, // Current block being built
-    genesis_block: CoreLaneBlock,         // Genesis block
-    bitcoin_client_read: Arc<Client>,     // Client for reading blockchain data
-    bitcoin_client_write: Arc<Client>,    // Client for writing/wallet operations
+    last_processed_bitcoin_height: Option<u64>,
+    blocks: HashMap<u64, CoreLaneBlock>, // Block number -> Block
+    block_hashes: HashMap<B256, u64>,    // Block hash -> Block number
+    bitcoin_height_to_hash: HashMap<u64, B256>, // Bitcoin height -> Bitcoin block hash (for reorg detection)
+    bitcoin_height_to_core_block: HashMap<u64, u64>, // Bitcoin height -> Core Lane block number
+    current_block: Option<CoreLaneBlock>,       // Current block being built
+    genesis_block: CoreLaneBlock,               // Genesis block
+    bitcoin_client_read: Arc<Client>,           // Client for reading blockchain data
+    bitcoin_client_write: Arc<Client>,          // Client for writing/wallet operations
 }
 
 impl CoreLaneState {
@@ -391,6 +392,129 @@ impl CoreLaneState {
 
     pub fn bitcoin_client_write(&self) -> Arc<Client> {
         self.bitcoin_client_write.clone()
+    }
+
+    /// Rollback state to the specified Core Lane block number
+    /// This loads the state from disk for the target block and updates tracking maps
+    pub fn rollback_to_block(&mut self, target_block: u64, data_dir: &str) -> Result<()> {
+        info!("🔄 Rolling back state to Core Lane block {}", target_block);
+
+        // Load the state from disk for the target block
+        let loaded_state = {
+            use std::fs;
+            use std::path::Path;
+
+            let blocks_dir = Path::new(data_dir).join("blocks");
+            let block_file = blocks_dir.join(format!("{}", target_block));
+
+            info!("💾 Looking for state file: {}", block_file.display());
+            if !block_file.exists() {
+                return Err(anyhow::anyhow!(
+                    "State file not found for block {}",
+                    target_block
+                ));
+            }
+
+            info!("💾 Reading state file for block {}", target_block);
+            let serialized_state = fs::read(&block_file)?;
+            info!(
+                "💾 Deserializing state for block {} ({} bytes)",
+                target_block,
+                serialized_state.len()
+            );
+
+            match StateManager::borsh_deserialize(&serialized_state) {
+                Ok(state) => {
+                    info!("✅ Successfully loaded state for block {}", target_block);
+                    state
+                }
+                Err(e) => {
+                    error!(
+                        "❌ Failed to deserialize state for block {}: {}",
+                        target_block, e
+                    );
+                    return Err(e.into());
+                }
+            }
+        };
+
+        // Replace the current state with the loaded state
+        info!("🔄 Replacing current state with loaded state");
+        self.account_manager = loaded_state;
+
+        // Resolve the Bitcoin height that corresponds to target_block
+        // We need this because last_processed_bitcoin_height is a Bitcoin height, not a Core Lane block number
+        let bitcoin_height = self
+            .bitcoin_height_to_core_block
+            .iter()
+            .find(|(_, &core_block)| core_block == target_block)
+            .map(|(&btc_height, _)| btc_height)
+            .ok_or_else(|| {
+                anyhow::anyhow!("No Bitcoin height maps to Core Lane block {}", target_block)
+            })?;
+        info!(
+            "🔍 Resolved Core Lane block {} to Bitcoin height {}",
+            target_block, bitcoin_height
+        );
+
+        // Remove all blocks after target_block
+        let blocks_before = self.blocks.len();
+        self.blocks
+            .retain(|&block_num, _| block_num <= target_block);
+        let blocks_after = self.blocks.len();
+        info!(
+            "🗑️  Removed {} blocks (kept {} blocks)",
+            blocks_before - blocks_after,
+            blocks_after
+        );
+
+        // Remove all block hashes after target_block
+        let hashes_before = self.block_hashes.len();
+        self.block_hashes
+            .retain(|_, block_num| *block_num <= target_block);
+        let hashes_after = self.block_hashes.len();
+        info!(
+            "🗑️  Removed {} block hashes (kept {} hashes)",
+            hashes_before - hashes_after,
+            hashes_after
+        );
+
+        // Remove bitcoin_height_to_core_block entries where Core Lane block > target_block
+        // (filter based on VALUES, not keys)
+        let btc_before = self.bitcoin_height_to_core_block.len();
+        self.bitcoin_height_to_core_block
+            .retain(|_, core_block| *core_block <= target_block);
+        let btc_after = self.bitcoin_height_to_core_block.len();
+        info!(
+            "🗑️  Removed {} bitcoin height mappings (kept {} mappings)",
+            btc_before - btc_after,
+            btc_after
+        );
+
+        // Remove bitcoin_height_to_hash entries for Bitcoin heights that no longer have
+        // corresponding Core Lane blocks (filter based on whether the Bitcoin height
+        // still maps to a valid Core Lane block)
+        let heights_before = self.bitcoin_height_to_hash.len();
+        self.bitcoin_height_to_hash.retain(|btc_height, _| {
+            self.bitcoin_height_to_core_block
+                .get(btc_height)
+                .map_or(false, |&core_block| core_block <= target_block)
+        });
+        let heights_after = self.bitcoin_height_to_hash.len();
+        info!(
+            "🗑️  Removed {} height mappings (kept {} mappings)",
+            heights_before - heights_after,
+            heights_after
+        );
+
+        // Update last_processed_bitcoin_height to the Bitcoin height (not the Core Lane block number)
+        self.last_processed_bitcoin_height = Some(bitcoin_height);
+
+        info!(
+            "✅ Successfully rolled back to Core Lane block {} (Bitcoin height {})",
+            target_block, bitcoin_height
+        );
+        Ok(())
     }
 }
 
@@ -415,16 +539,21 @@ impl CoreLaneNode {
         blocks.insert(0, genesis_block.clone());
         block_hashes.insert(genesis_hash, 0);
 
-        // Initialize height_to_hash mapping for reorg detection
-        let mut height_to_hash = HashMap::new();
-        height_to_hash.insert(0, genesis_hash);
+        // Initialize bitcoin_height_to_hash mapping for reorg detection
+        // This maps Bitcoin heights to Bitcoin block hashes (not Core Lane hashes)
+        // It will be populated as we process actual Bitcoin blocks
+        let bitcoin_height_to_hash = HashMap::new();
+
+        // Initialize bitcoin_height_to_core_block mapping
+        let mut bitcoin_height_to_core_block = HashMap::new();
 
         let state = Arc::new(Mutex::new(CoreLaneState {
             account_manager: StateManager::new(),
-            last_processed_block: 0,
+            last_processed_bitcoin_height: None,
             blocks,
             block_hashes,
-            height_to_hash,
+            bitcoin_height_to_hash,
+            bitcoin_height_to_core_block,
             current_block: None,
             genesis_block: genesis_block.clone(),
             bitcoin_client_read: bitcoin_client_read.clone(),
@@ -600,7 +729,9 @@ impl CoreLaneNode {
         // Initialize starting block if provided
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
-            state.last_processed_block = block.saturating_sub(1);
+            // Set to Some(block - 1) since we'll add 1 when scanning
+            // This allows --start_block 0 to actually start at 0
+            state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
             info!("Starting from block: {}", block);
         }
 
@@ -624,11 +755,15 @@ impl CoreLaneNode {
         // Get the starting block without holding the lock
         let start_block = {
             let state = self.state.lock().await;
-            if state.last_processed_block == 0 {
-                // First run - start from recent blocks
-                tip.saturating_sub(10)
-            } else {
-                state.last_processed_block + 1
+            match state.last_processed_bitcoin_height {
+                None => {
+                    // First run (no start block specified) - start from recent blocks
+                    tip.saturating_sub(10)
+                }
+                Some(height) => {
+                    // Continue from where we left off
+                    height + 1
+                }
             }
         };
 
@@ -645,17 +780,24 @@ impl CoreLaneNode {
             let bitcoin_block = process_bitcoin_block(self.bitcoin_client_read.clone(), height)?;
 
             match self.process_block(bitcoin_block.clone()).await {
-                Ok(_) => {
-                    // Update the last processed block and height_to_hash mapping
+                Ok(core_lane_block_number) => {
+                    if (core_lane_block_number == 0) {
+                        info!("Scanning again, we encountered a reorg");
+                        break;
+                    }
+                    // Update the last processed block and bitcoin_height_to_hash mapping
                     let mut state = self.state.lock().await;
-                    state.last_processed_block = height;
-                    // anchor_block_hash is hex string as bytes, need to decode to get raw 32 bytes
-                    let hash_hex = String::from_utf8_lossy(&bitcoin_block.anchor_block_hash);
-                    let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
-                        .unwrap_or_else(|_| bitcoin_block.anchor_block_hash.clone());
-                    let block_hash = B256::from_slice(&hash_bytes);
-                    state.height_to_hash.insert(height, block_hash);
-                    debug!("Processed block {} for Core Lane", height);
+                    state.last_processed_bitcoin_height = Some(height);
+                    // anchor_block_hash is now raw 32-byte hash
+                    let block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
+                    state.bitcoin_height_to_hash.insert(height, block_hash);
+                    state
+                        .bitcoin_height_to_core_block
+                        .insert(height, core_lane_block_number); // Bitcoin height -> Core Lane block
+                    debug!(
+                        "Processed Bitcoin block {} -> Core Lane block {}",
+                        height, core_lane_block_number
+                    );
                 }
                 Err(e) => {
                     error!("Error processing block {}: {}", height, e);
@@ -666,43 +808,79 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<()> {
+    async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<u64> {
         // 🔍 REORG DETECTION: Check for blockchain reorganizations
         {
             let state = self.state.lock().await;
             let height = bitcoin_block.anchor_block_height;
 
-            // anchor_block_hash is hex string as bytes, need to decode to get raw 32 bytes
-            let hash_hex = String::from_utf8_lossy(&bitcoin_block.anchor_block_hash);
-            let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
-                .unwrap_or_else(|_| bitcoin_block.anchor_block_hash.clone());
-            let current_hash = B256::from_slice(&hash_bytes);
+            // anchor_block_hash is now raw 32-byte hash
+            let current_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
 
-            // Check if we already have a hash for this height (shouldn't happen in normal operation)
-            if let Some(existing_hash) = state.height_to_hash.get(&height) {
+            // Check if we already have a hash for this height
+            if let Some(existing_hash) = state.bitcoin_height_to_hash.get(&height) {
                 if existing_hash != &current_hash {
-                    panic!(
-                        "🚨 REORG DETECTED! Height {} has different hash. Expected: {:?}, Got: {:?}",
+                    warn!(
+                        "🚨 REORG DETECTED! Height {} has different hash (same-height mismatch). Expected: {}, Got: {}",
                         height, existing_hash, current_hash
                     );
+
+                    // Attempt to recover from reorg
+                    match self.handle_reorg(&state).await {
+                        Ok(fork_core_block) => {
+                            info!("✅ Found fork point at block {}", fork_core_block);
+                            // Drop the state lock before performing rollback
+                            drop(state);
+
+                            // Perform the actual rollback (acquires lock internally)
+                            self.perform_rollback(fork_core_block).await?;
+
+                            info!("🚫 Skipping processing of current block after reorg recovery");
+                            return Ok(0); // Return dummy Core Lane block number since we skipped processing
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to recover from reorg: {}", e);
+                            drop(state);
+                            return Err(e);
+                        }
+                    }
                 }
             }
 
             // Check if the previous height's hash matches this block's parent hash
             if height > 0 && !bitcoin_block.parent_hash.is_empty() {
                 let prev_height = height - 1;
-                if let Some(prev_hash) = state.height_to_hash.get(&prev_height) {
-                    // Decode the parent hash from hex string to bytes for comparison
-                    let parent_hash_hex = String::from_utf8_lossy(&bitcoin_block.parent_hash);
-                    let parent_hash_bytes = hex::decode(parent_hash_hex.trim_start_matches("0x"))
-                        .unwrap_or_else(|_| bitcoin_block.parent_hash.clone());
-                    let expected_parent_hash = B256::from_slice(&parent_hash_bytes);
+                if let Some(prev_hash) = state.bitcoin_height_to_hash.get(&prev_height) {
+                    // parent_hash is now raw 32-byte hash
+                    let expected_parent_hash = B256::from_slice(&bitcoin_block.parent_hash);
 
                     if prev_hash != &expected_parent_hash {
-                        panic!(
-                            "🚨 REORG DETECTED! Height {} parent hash mismatch. Expected: {:?}, Got: {:?}",
+                        warn!(
+                            "🚨 REORG DETECTED! Height {} parent hash mismatch. Expected: {}, Got: {}",
                             height, prev_hash, expected_parent_hash
                         );
+
+                        // Attempt to recover from reorg
+                        match self.handle_reorg(&state).await {
+                            Ok(fork_core_block) => {
+                                info!("✅ Found fork point at block {}", fork_core_block);
+                                // Drop the state lock before performing rollback
+                                drop(state);
+
+                                // Perform the actual rollback (acquires lock internally)
+                                self.perform_rollback(fork_core_block).await?;
+
+                                info!(
+                                    "🚫 Skipping processing of current block after reorg recovery"
+                                );
+                                return Ok(0); // Return dummy Core Lane block number since we skipped processing
+                            }
+                            Err(e) => {
+                                error!("❌ Failed to recover from reorg: {}", e);
+                                drop(state);
+                                return Err(e);
+                            }
+                        }
                     }
                 }
             }
@@ -775,10 +953,11 @@ impl CoreLaneNode {
         }
 
         // Finalize the Core Lane block
+        let core_lane_block_number = new_block.number;
         self.finalize_current_block(core_lane_transactions, new_block)
             .await?;
 
-        Ok(())
+        Ok(core_lane_block_number)
     }
 
     async fn process_core_lane_transaction(
@@ -899,6 +1078,205 @@ impl CoreLaneNode {
                 data_dir,
             )
             .await?;
+        Ok(())
+    }
+
+    /// Find the fork point by comparing our stored Bitcoin hashes with current chain
+    async fn find_fork_point(
+        &self,
+        bitcoin_client: &Arc<Client>,
+        state: &CoreLaneState,
+    ) -> Result<Option<u64>> {
+        use tokio::task;
+
+        // Start from our last processed Bitcoin height and work backwards
+        let mut current_bitcoin_height = match state.last_processed_bitcoin_height {
+            Some(height) => height,
+            None => {
+                error!("❌ Cannot find fork point: no Bitcoin height has been processed yet");
+                return Err(anyhow::anyhow!(
+                    "Cannot find fork point when no blocks have been processed"
+                ));
+            }
+        };
+        let search_limit = 100; // Don't search more than 100 blocks back
+        let mut blocks_checked = 0;
+
+        info!(
+            "🔍 Starting fork point search from Bitcoin height {} (limit: {} blocks)",
+            current_bitcoin_height, search_limit
+        );
+
+        while current_bitcoin_height > 0 && blocks_checked < search_limit {
+            blocks_checked += 1;
+
+            // Check if we have a record for this Bitcoin height
+            if let Some(&core_block) = state
+                .bitcoin_height_to_core_block
+                .get(&current_bitcoin_height)
+            {
+                // Get the Bitcoin hash we stored for this height
+                if let Some(&stored_hash) =
+                    state.bitcoin_height_to_hash.get(&current_bitcoin_height)
+                {
+                    debug!(
+                        "🔍 Checking Bitcoin height {} (Core Lane block {})",
+                        current_bitcoin_height, core_block
+                    );
+
+                    // Get the current Bitcoin hash for this height using spawn_blocking
+                    match task::spawn_blocking({
+                        let client = bitcoin_client.clone();
+                        let height = current_bitcoin_height;
+                        move || client.get_block_hash(height)
+                    })
+                    .await
+                    {
+                        Ok(Ok(current_hash)) => {
+                            let current_hash_bytes: &[u8] = current_hash.as_ref();
+
+                            if stored_hash.as_slice() == current_hash_bytes {
+                                // This height matches - this is the last common ancestor (fork point)
+                                info!("✅ Bitcoin height {} matches stored hash - this is the fork point (last common ancestor)", current_bitcoin_height);
+                                info!(
+                                    "🔍 Fork point found at Bitcoin height {} (Core Lane block {})",
+                                    current_bitcoin_height, core_block
+                                );
+                                return Ok(Some(core_block));
+                            } else {
+                                // Hash mismatch found - continue searching backwards for the fork point
+                                warn!(
+                                    "⚠️  Hash mismatch at Bitcoin height {} (Core Lane block {})",
+                                    current_bitcoin_height, core_block
+                                );
+                                info!(
+                                    "🔍 Hash mismatch: stored={}, current=0x{}",
+                                    stored_hash,
+                                    hex::encode(current_hash_bytes)
+                                );
+                                current_bitcoin_height -= 1;
+                                continue;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                "⚠️  Failed to get block hash for height {}: {}",
+                                current_bitcoin_height, e
+                            );
+                            // Continue searching - maybe this height is not accessible
+                            current_bitcoin_height -= 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            error!(
+                                "❌ Task join error for height {}: {}",
+                                current_bitcoin_height, e
+                            );
+                            // Continue searching
+                            current_bitcoin_height -= 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    debug!(
+                        "🔍 No stored hash for Bitcoin height {}",
+                        current_bitcoin_height
+                    );
+                }
+            } else {
+                debug!(
+                    "🔍 No Core Lane block record for Bitcoin height {}",
+                    current_bitcoin_height
+                );
+            }
+
+            // No record for this height, continue backwards
+            current_bitcoin_height -= 1;
+        }
+
+        // If we reach the limit without finding a mismatch, something is wrong
+        if blocks_checked >= search_limit {
+            warn!(
+                "⚠️  Could not find fork point within {} blocks (searched back to height {})",
+                search_limit, current_bitcoin_height
+            );
+        } else {
+            warn!("⚠️  Could not find fork point, reached height 0");
+        }
+        Ok(None)
+    }
+
+    /// Handle reorg by rolling back to fork point and restarting processing
+    /// NOTE: This method returns the fork point block number for the caller to use
+    /// The caller must DROP the state lock before calling this method's returned closure
+    async fn handle_reorg(&self, state: &CoreLaneState) -> Result<u64> {
+        info!("🔄 Starting reorg recovery...");
+
+        // Find the fork point
+        info!("🔍 Searching for fork point...");
+        let fork_point = self
+            .find_fork_point(&self.bitcoin_client_read, state)
+            .await?;
+        info!("🔍 Fork point search completed");
+
+        match fork_point {
+            Some(fork_core_block) => {
+                info!("🎯 Found fork point at Core Lane block {}", fork_core_block);
+                // Return the fork point - the caller will handle the actual rollback after dropping their lock
+                Ok(fork_core_block)
+            }
+            None => {
+                error!("❌ Could not find fork point for reorg recovery");
+                warn!("💡 This might indicate a deeper issue with the blockchain state");
+                warn!("💡 Consider restarting the node to resync from a known good state");
+                Err(anyhow::anyhow!(
+                    "Unable to determine fork point for reorg recovery"
+                ))
+            }
+        }
+    }
+
+    /// Perform the actual rollback after lock is released
+    async fn perform_rollback(&self, fork_core_block: u64) -> Result<()> {
+        // Rollback state to the fork point
+        info!("💾 Loading state from disk for block {}", fork_core_block);
+        {
+            let mut state_mut = self.state.lock().await;
+            state_mut.rollback_to_block(fork_core_block, &self.data_dir)?;
+        }
+
+        info!(
+            "🔄 Successfully rolled back to Core Lane block {}",
+            fork_core_block
+        );
+
+        // Get the actual Bitcoin height that we'll restart from (the rollback set last_processed_bitcoin_height)
+        let restart_bitcoin_height = {
+            let state = self.state.lock().await;
+            match state.last_processed_bitcoin_height {
+                Some(height) => height + 1,
+                None => {
+                    error!("❌ Rollback succeeded but last_processed_bitcoin_height is None");
+                    return Err(anyhow::anyhow!(
+                        "Invalid state after rollback: last_processed_bitcoin_height is None"
+                    ));
+                }
+            }
+        };
+
+        info!(
+            "🔄 Will restart processing from Bitcoin height {}",
+            restart_bitcoin_height
+        );
+
+        // The scanning loop will detect that last_processed_bitcoin_height has been reset
+        // and automatically restart from the correct point
+        info!("✅ Reorg recovery completed successfully");
+        info!(
+            "🚀 Scanning loop will restart from Bitcoin height {}",
+            restart_bitcoin_height
+        );
+
         Ok(())
     }
 }
