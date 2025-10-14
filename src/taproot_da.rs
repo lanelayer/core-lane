@@ -45,8 +45,8 @@ impl TaprootDA {
         // Calculate fee based on exact size
         let mut reveal_fee = sat_per_vb * exact_tx_size_vb;
 
-        // Ensure reveal transaction meets minimum relay fee requirement (122 sats)
-        let min_relay_fee_sats = 122;
+        // Ensure reveal transaction meets minimum relay fee requirement (16 sats for Bitcoin Core 30.0.0)
+        let min_relay_fee_sats = 16;
         if reveal_fee < min_relay_fee_sats {
             tracing::warn!(
                 "💰 Reveal fee {} sats below minimum relay fee {} sats, adjusting",
@@ -206,8 +206,7 @@ impl TaprootDA {
             }
         };
 
-        // Cap the maximum fee rate to prevent excessive fees
-        let final_sat_per_vb = sat_per_vb.min(10); // Force max 10 sat/vB for testing
+        let final_sat_per_vb = sat_per_vb.max(1).min(10);
         tracing::info!(
             "🔧 FORCED fee rate: {} sat/vB (was {})",
             final_sat_per_vb,
