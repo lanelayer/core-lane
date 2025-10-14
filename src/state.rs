@@ -1,14 +1,16 @@
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
+use alloy_rlp::Decodable;
 use anyhow::Result;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
-use crate::account::{BundleCoreLaneAccount, CoreLaneAccount};
+use crate::account::CoreLaneAccount;
 use crate::intents::Intent;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct TransactionReceipt {
     pub transaction_hash: String,
     pub block_number: u64,
@@ -32,33 +34,60 @@ pub struct StoredTransaction {
     pub block_number: u64,
 }
 
-/// State manager for Core Lane
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StateManager {
-    accounts: HashMap<Address, CoreLaneAccount>,
-    stored_blobs: HashMap<B256, Vec<u8>>,
-    intents: HashMap<B256, Intent>,
-    transactions: Vec<StoredTransaction>,
-    transaction_receipts: HashMap<String, TransactionReceipt>,
+impl BorshSerialize for StoredTransaction {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        // Serialize raw_data and block_number
+        // The envelope can be reconstructed from raw_data
+        BorshSerialize::serialize(&self.raw_data, writer)?;
+        BorshSerialize::serialize(&self.block_number, writer)?;
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl BorshDeserialize for StoredTransaction {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let raw_data: Vec<u8> = borsh::from_reader(reader)?;
+        let block_number: u64 = borsh::from_reader(reader)?;
+
+        // Reconstruct envelope from raw_data
+        let envelope = TxEnvelope::decode(&mut raw_data.as_slice())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        Ok(StoredTransaction {
+            envelope,
+            raw_data,
+            block_number,
+        })
+    }
+}
+
+/// State manager for Core Lane
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct StateManager {
+    accounts: BTreeMap<Address, CoreLaneAccount>,
+    stored_blobs: BTreeMap<B256, Vec<u8>>,
+    intents: BTreeMap<B256, Intent>,
+    transactions: Vec<StoredTransaction>,
+    transaction_receipts: BTreeMap<String, TransactionReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct BundleStateManager {
-    pub accounts: HashMap<Address, BundleCoreLaneAccount>,
-    pub stored_blobs: HashMap<B256, Vec<u8>>,
-    pub intents: HashMap<B256, Intent>,
+    pub accounts: BTreeMap<Address, CoreLaneAccount>,
+    pub stored_blobs: BTreeMap<B256, Vec<u8>>,
+    pub intents: BTreeMap<B256, Intent>,
     pub transactions: Vec<StoredTransaction>,
-    pub transaction_receipts: HashMap<String, TransactionReceipt>,
+    pub transaction_receipts: BTreeMap<String, TransactionReceipt>,
 }
 
 impl BundleStateManager {
     pub fn new() -> Self {
         Self {
-            accounts: HashMap::new(),
-            stored_blobs: HashMap::new(),
-            intents: HashMap::new(),
+            accounts: BTreeMap::new(),
+            stored_blobs: BTreeMap::new(),
+            intents: BTreeMap::new(),
             transactions: Vec::new(),
-            transaction_receipts: HashMap::new(),
+            transaction_receipts: BTreeMap::new(),
         }
     }
 
@@ -114,10 +143,9 @@ impl BundleStateManager {
         original: &'a StateManager,
         address: Address,
     ) -> Option<&'a CoreLaneAccount> {
-        if let Some(account) = self.accounts.get(&address) {
-            return Some(&account.info);
-        }
-        original.get_account(address)
+        self.accounts
+            .get(&address)
+            .or_else(|| original.get_account(address))
     }
 
     pub fn get_account_mut(
@@ -127,46 +155,36 @@ impl BundleStateManager {
     ) -> Option<&mut CoreLaneAccount> {
         // Ensure the account exists in our bundle before getting a mutable reference
         if !self.accounts.contains_key(&address) {
-            let orig = original.get_account(address);
-            let bundle_account = if let Some(orig) = orig {
-                BundleCoreLaneAccount {
-                    original: Some(orig.clone()),
-                    info: orig.clone(),
-                }
-            } else {
-                BundleCoreLaneAccount {
-                    original: None,
-                    info: CoreLaneAccount::new(),
-                }
-            };
-            self.accounts.insert(address, bundle_account);
+            let account = original
+                .get_account(address)
+                .cloned()
+                .unwrap_or_else(CoreLaneAccount::new);
+            self.accounts.insert(address, account);
         }
 
         // Now get the mutable reference (account definitely exists)
-        self.accounts
-            .get_mut(&address)
-            .map(|account| &mut account.info)
+        self.accounts.get_mut(&address)
     }
 
-    fn set_account(&mut self, original: &StateManager, address: Address, account: CoreLaneAccount) {
-        let orig = original.get_account(address).cloned();
-        let bundle_account = BundleCoreLaneAccount {
-            original: orig,
-            info: account,
-        };
-        self.accounts.insert(address, bundle_account);
+    fn set_account(
+        &mut self,
+        _original: &StateManager,
+        address: Address,
+        account: CoreLaneAccount,
+    ) {
+        self.accounts.insert(address, account);
     }
 
     pub fn get_balance(&self, original: &StateManager, address: Address) -> U256 {
         if let Some(account) = self.accounts.get(&address) {
-            return account.info.balance;
+            return account.balance;
         }
         original.get_balance(address)
     }
 
     pub fn get_nonce(&self, original: &StateManager, address: Address) -> U256 {
         if let Some(account) = self.accounts.get(&address) {
-            return account.info.nonce;
+            return account.nonce;
         }
         original.get_nonce(address)
     }
@@ -183,7 +201,7 @@ impl BundleStateManager {
         } else {
             let mut account = CoreLaneAccount::new();
             account.add_balance(amount)?;
-            self.set_account(original, address, account);
+            self.accounts.insert(address, account);
         }
         Ok(())
     }
@@ -210,7 +228,7 @@ impl BundleStateManager {
         } else {
             let mut account = CoreLaneAccount::new();
             account.increment_nonce()?;
-            self.set_account(original, address, account);
+            self.accounts.insert(address, account);
         }
         Ok(())
     }
@@ -226,16 +244,40 @@ impl BundleStateManager {
         bincode::deserialize_from(reader)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize BundleStateManager: {}", e))
     }
+
+    /// Serialize the BundleStateManager to a writer using borsh
+    pub fn borsh_serialize_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
+        borsh::to_writer(writer, self)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh serialize BundleStateManager: {}", e))
+    }
+
+    /// Deserialize a BundleStateManager from a reader using borsh
+    pub fn borsh_deserialize_from_reader<R: std::io::Read>(reader: &mut R) -> Result<Self> {
+        borsh::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize BundleStateManager: {}", e))
+    }
+
+    /// Serialize the BundleStateManager to a byte vector using borsh
+    pub fn borsh_serialize(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(self)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh serialize BundleStateManager: {}", e))
+    }
+
+    /// Deserialize a BundleStateManager from a byte slice using borsh
+    pub fn borsh_deserialize(bytes: &[u8]) -> Result<Self> {
+        borsh::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize BundleStateManager: {}", e))
+    }
 }
 
 impl StateManager {
     pub fn new() -> Self {
         Self {
-            accounts: HashMap::new(),
-            stored_blobs: HashMap::new(),
-            intents: HashMap::new(),
+            accounts: BTreeMap::new(),
+            stored_blobs: BTreeMap::new(),
+            intents: BTreeMap::new(),
             transactions: Vec::new(),
-            transaction_receipts: HashMap::new(),
+            transaction_receipts: BTreeMap::new(),
         }
     }
 
@@ -293,9 +335,9 @@ impl StateManager {
             .unwrap_or(U256::ZERO)
     }
     pub fn apply_changes(&mut self, bundle_state_manager: BundleStateManager) {
-        for (address, bundle_account) in bundle_state_manager.accounts.into_iter() {
+        for (address, account) in bundle_state_manager.accounts.into_iter() {
             tracing::info!("Applying changes for account {}", address);
-            self.set_account(address, bundle_account.info);
+            self.set_account(address, account);
         }
 
         // Apply blob storage changes
@@ -317,5 +359,29 @@ impl StateManager {
         for (tx_hash, receipt) in bundle_state_manager.transaction_receipts.into_iter() {
             self.add_receipt(tx_hash, receipt);
         }
+    }
+
+    /// Serialize the StateManager to a writer using borsh
+    pub fn borsh_serialize_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
+        borsh::to_writer(writer, self)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh serialize StateManager: {}", e))
+    }
+
+    /// Deserialize a StateManager from a reader using borsh
+    pub fn borsh_deserialize_from_reader<R: std::io::Read>(reader: &mut R) -> Result<Self> {
+        borsh::from_reader(reader)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))
+    }
+
+    /// Serialize the StateManager to a byte vector using borsh
+    pub fn borsh_serialize(&self) -> Result<Vec<u8>> {
+        borsh::to_vec(self)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh serialize StateManager: {}", e))
+    }
+
+    /// Deserialize a StateManager from a byte slice using borsh
+    pub fn borsh_deserialize(bytes: &[u8]) -> Result<Self> {
+        borsh::from_slice(bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))
     }
 }

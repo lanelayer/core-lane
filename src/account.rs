@@ -1,24 +1,13 @@
 use alloy_primitives::U256;
 use anyhow::{anyhow, Result};
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Core Lane account structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct CoreLaneAccount {
     pub balance: U256,
     pub nonce: U256,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BundleCoreLaneAccount {
-    pub original: Option<CoreLaneAccount>,
-    pub info: CoreLaneAccount,
-}
-
-impl BundleCoreLaneAccount {
-    pub fn new(original: Option<CoreLaneAccount>, info: CoreLaneAccount) -> Self {
-        Self { original, info }
-    }
 }
 
 impl CoreLaneAccount {

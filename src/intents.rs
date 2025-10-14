@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall};
 use anyhow::Result;
+use borsh::{BorshDeserialize, BorshSerialize};
 use ciborium::de::from_reader;
 use ciborium::into_writer;
 use serde::{Deserialize, Serialize};
@@ -23,13 +24,16 @@ sol! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
 #[repr(u8)]
+#[borsh(use_discriminant = true)]
 pub enum IntentType {
     AnchorBitcoinFill = 1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct IntentData {
     pub intent_type: IntentType,
     pub data: Vec<u8>,
@@ -49,7 +53,7 @@ impl IntentData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct AnchorBitcoinFill {
     pub bitcoin_address: Vec<u8>,
     pub amount: U256,
@@ -302,14 +306,16 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
 pub enum IntentStatus {
     Submitted,
     Locked(Address),
     Solved,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Intent {
     pub data: Bytes,
     pub value: u64,
