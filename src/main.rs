@@ -397,10 +397,11 @@ struct CoreLaneNode {
     bitcoin_client_read: Arc<Client>,
     bitcoin_client_write: Arc<Client>,
     state: Arc<Mutex<CoreLaneState>>,
+    data_dir: String,
 }
 
 impl CoreLaneNode {
-    fn new(bitcoin_client_read: Client, bitcoin_client_write: Client) -> Self {
+    fn new(bitcoin_client_read: Client, bitcoin_client_write: Client, data_dir: String) -> Self {
         let genesis_block = CoreLaneBlock::genesis();
         let genesis_hash = genesis_block.hash;
 
@@ -419,15 +420,21 @@ impl CoreLaneNode {
             blocks,
             block_hashes,
             current_block: None,
-            genesis_block,
+            genesis_block: genesis_block.clone(),
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
         }));
+
+        // Write genesis state to disk
+        if let Err(e) = Self::write_genesis_state(&data_dir) {
+            error!("Failed to write genesis state to disk: {}", e);
+        }
 
         Self {
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
             state,
+            data_dir,
         }
     }
 
@@ -461,7 +468,6 @@ impl CoreLaneNode {
             anchor_block_timestamp,
             block_origin,
         );
-
         // Calculate hash
         new_block.hash = new_block.calculate_hash();
         // Set as current block
@@ -470,6 +476,78 @@ impl CoreLaneNode {
             next_number, latest_number, new_block.timestamp
         );
         Ok(new_block)
+    }
+
+    /// Write the delta (BundleStateManager) to disk
+    fn write_delta_to_disk(
+        &self,
+        block_number: u64,
+        bundle_state: &state::BundleStateManager,
+    ) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        // Create deltas directory if it doesn't exist
+        let deltas_dir = Path::new(&self.data_dir).join("deltas");
+        fs::create_dir_all(&deltas_dir)?;
+
+        // Write the bundle state (delta) using borsh serialization
+        let delta_file = deltas_dir.join(format!("{}", block_number));
+        let serialized_delta = bundle_state.borsh_serialize()?;
+        fs::write(&delta_file, serialized_delta)?;
+
+        info!(
+            "💾 Wrote delta for block {} to {}",
+            block_number,
+            delta_file.display()
+        );
+        Ok(())
+    }
+
+    /// Write the state (StateManager) to disk
+    fn write_state_to_disk(&self, block_number: u64, state_manager: &StateManager) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        // Create blocks directory if it doesn't exist
+        let blocks_dir = Path::new(&self.data_dir).join("blocks");
+        fs::create_dir_all(&blocks_dir)?;
+
+        // Write the full state manager using borsh serialization
+        let block_file = blocks_dir.join(format!("{}", block_number));
+        let serialized_state = state_manager.borsh_serialize()?;
+        fs::write(&block_file, serialized_state)?;
+
+        info!(
+            "💾 Wrote state for block {} to {}",
+            block_number,
+            block_file.display()
+        );
+        Ok(())
+    }
+
+    /// Write the genesis state (block 0) to disk
+    pub fn write_genesis_state(data_dir: &str) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        // Create blocks directory if it doesn't exist
+        let blocks_dir = Path::new(data_dir).join("blocks");
+        fs::create_dir_all(&blocks_dir)?;
+
+        // Create initial empty state for genesis block
+        let genesis_state = StateManager::new();
+
+        // Write the genesis state using borsh serialization
+        let block_file = blocks_dir.join("0");
+        let serialized_state = genesis_state.borsh_serialize()?;
+        fs::write(&block_file, serialized_state)?;
+
+        info!(
+            "💾 Wrote genesis state (block 0) to {}",
+            block_file.display()
+        );
+        Ok(())
     }
 
     async fn finalize_current_block(
@@ -619,9 +697,28 @@ impl CoreLaneNode {
         }
 
         // Apply all state changes atomically at the end of block processing
+        let block_number = new_block.number;
         {
             let mut state = self.state.lock().await;
+
+            // Write the delta (changes) to disk before applying them
+            if let Err(e) = self.write_delta_to_disk(block_number, &bundle_state) {
+                error!(
+                    "Failed to write delta for block {} to disk: {}",
+                    block_number, e
+                );
+            }
+
+            // Apply the changes to the actual state
             state.account_manager.apply_changes(bundle_state);
+
+            // Write the final state to disk after applying changes
+            if let Err(e) = self.write_state_to_disk(block_number, &state.account_manager) {
+                error!(
+                    "Failed to write state for block {} to disk: {}",
+                    block_number, e
+                );
+            }
         }
 
         // Finalize the Core Lane block
@@ -839,7 +936,7 @@ async fn main() -> Result<()> {
             info!("   📖 Read:  {}", bitcoin_rpc_read_url);
             info!("   ✍️  Write: {}/wallet/{}", write_url, rpc_wallet);
 
-            let node = CoreLaneNode::new(read_client, write_client);
+            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone());
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
@@ -1351,7 +1448,7 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(read_client, write_client);
+            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone());
             node.send_transaction_to_da(
                 raw_tx_hex,
                 &mnemonic_str,
