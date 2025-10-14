@@ -224,6 +224,12 @@ start_mining_loop() {
                     bitcoin_cli generatetoaddress 1 "$address" >/dev/null 2>&1
                     local block_count=$(bitcoin_cli getblockcount)
                     print_status "Mined block $block_count (reward to BDK wallet)"
+
+                    # Occasionally trigger a hazardous 5-block reorg (only after block 130, if REORG=1)
+                    if [ "${REORG:-0}" = "1" ] && [ "$block_count" -gt 130 ] && [ $((block_count % 7)) -eq 0 ]; then
+                        print_warning "⚠️  HAZARDOUS ENVIRONMENT: Triggering 5-block reorg at height $block_count..."
+                        trigger_reorg 5
+                    fi
                 else
                     print_warning "Failed to get BDK address, skipping block"
                 fi
@@ -236,6 +242,57 @@ start_mining_loop() {
 
     MINING_PID=$!
     print_success "Mining loop started with PID: $MINING_PID"
+}
+
+# Hazardous environment: trigger a reorg of N blocks
+trigger_reorg() {
+    local reorg_depth="$1"
+
+    print_warning "🔥 HAZARDOUS: Starting $reorg_depth-block reorg..."
+
+    # Get current chain info
+    local current_height=$(bitcoin_cli getblockcount)
+    local current_tip=$(bitcoin_cli getbestblockhash)
+
+    if [ $current_height -lt $((reorg_depth + 10)) ]; then
+        print_warning "Chain too short for $reorg_depth-block reorg, need at least $((reorg_depth + 10)) blocks"
+        return 1
+    fi
+
+    # Choose fork point (reorg_depth blocks back from current tip)
+    local fork_height=$((current_height - reorg_depth))
+    local old_hash=$(bitcoin_cli getblockhash $fork_height)
+
+    print_status "Invalidating block at height $fork_height (hash: ${old_hash:0:8}...)"
+    bitcoin_cli invalidateblock "$old_hash"
+
+    # Wait for rewind to complete
+    while [ "$(bitcoin_cli getblockcount)" -ne $((fork_height - 1)) ]; do
+        sleep 0.1
+    done
+
+    print_status "Chain rewound to height $((fork_height - 1))"
+
+    # Mine a replacement branch that's longer than the original
+    local mining_address=$(./target/debug/core-lane-node --plain get-address --network regtest 2>/dev/null)
+    local blocks_to_mine=$((current_height + 1 - (fork_height - 1)))
+
+    print_status "Mining $blocks_to_mine blocks to create longer replacement branch..."
+    bitcoin_cli generatetoaddress "$blocks_to_mine" "$mining_address" >/dev/null 2>&1
+
+    local new_height=$(bitcoin_cli getblockcount)
+    local new_tip=$(bitcoin_cli getbestblockhash)
+
+    print_warning "✅ HAZARDOUS: $reorg_depth-block reorg complete!"
+    print_status "New chain tip: ${new_tip:0:8}... at height $new_height"
+
+    # Show chain tips to verify reorg
+    local tips=$(bitcoin_cli getchaintips 2>/dev/null | jq -r '.[] | select(.status == "valid-fork") | .height' 2>/dev/null || echo "none")
+    if [ "$tips" != "none" ]; then
+        print_warning "Side chains detected at heights: $tips"
+    fi
+
+    return 0
 }
 
 check_balances() {
@@ -283,16 +340,21 @@ show_usage() {
     echo "Usage: $0 [COMMAND]"
     echo ""
     echo "Commands:"
-    echo "  start     Start the complete development environment"
+    echo "  start     Start the complete development environment (HAZARDOUS MODE)"
     echo "  stop      Stop the development environment"
     echo "  status    Show status of running services"
     echo "  balances  Check Core Lane balances for test addresses"
     echo "  help      Show this help message"
     echo ""
+    echo "⚠️  HAZARDOUS ENVIRONMENT: This development setup can trigger"
+    echo "   5-block reorganizations every 7 blocks (starting after block 130)"
+    echo "   when REORG=1 environment variable is set."
+    echo ""
     echo "Examples:"
-    echo "  $0 start     # Start everything"
-    echo "  $0 stop      # Stop everything"
-    echo "  $0 balances # Check balances"
+    echo "  $0 start                    # Start everything"
+    echo "  REORG=1 $0 start           # Start with hazardous reorgs enabled"
+    echo "  $0 stop                     # Stop everything"
+    echo "  $0 balances                # Check balances"
 }
 
 show_status() {
@@ -367,6 +429,9 @@ start_dev_environment() {
     echo ""
     echo "💰 BDK Wallet mnemonic: .dev-wallets/mnemonic_regtest.txt"
     echo "⛏️  Mining blocks every 10 seconds..."
+    if [ "${REORG:-0}" = "1" ]; then
+        echo "⚠️  HAZARDOUS MODE: 5-block reorganizations every 7 blocks (starting after block 130)"
+    fi
     echo "🛑 Use '$0 stop' to stop the environment"
 }
 

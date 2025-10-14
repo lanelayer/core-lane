@@ -377,6 +377,7 @@ struct CoreLaneState {
     last_processed_block: u64,
     blocks: HashMap<u64, CoreLaneBlock>,  // Block number -> Block
     block_hashes: HashMap<B256, u64>,     // Block hash -> Block number
+    height_to_hash: HashMap<u64, B256>,   // Block height -> Block hash (for reorg detection)
     current_block: Option<CoreLaneBlock>, // Current block being built
     genesis_block: CoreLaneBlock,         // Genesis block
     bitcoin_client_read: Arc<Client>,     // Client for reading blockchain data
@@ -414,11 +415,16 @@ impl CoreLaneNode {
         blocks.insert(0, genesis_block.clone());
         block_hashes.insert(genesis_hash, 0);
 
+        // Initialize height_to_hash mapping for reorg detection
+        let mut height_to_hash = HashMap::new();
+        height_to_hash.insert(0, genesis_hash);
+
         let state = Arc::new(Mutex::new(CoreLaneState {
             account_manager: StateManager::new(),
             last_processed_block: 0,
             blocks,
             block_hashes,
+            height_to_hash,
             current_block: None,
             genesis_block: genesis_block.clone(),
             bitcoin_client_read: bitcoin_client_read.clone(),
@@ -638,11 +644,17 @@ impl CoreLaneNode {
         for height in start_block..=tip {
             let bitcoin_block = process_bitcoin_block(self.bitcoin_client_read.clone(), height)?;
 
-            match self.process_block(bitcoin_block).await {
+            match self.process_block(bitcoin_block.clone()).await {
                 Ok(_) => {
-                    // Update the last processed block
+                    // Update the last processed block and height_to_hash mapping
                     let mut state = self.state.lock().await;
                     state.last_processed_block = height;
+                    // anchor_block_hash is hex string as bytes, need to decode to get raw 32 bytes
+                    let hash_hex = String::from_utf8_lossy(&bitcoin_block.anchor_block_hash);
+                    let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
+                        .unwrap_or_else(|_| bitcoin_block.anchor_block_hash.clone());
+                    let block_hash = B256::from_slice(&hash_bytes);
+                    state.height_to_hash.insert(height, block_hash);
                     debug!("Processed block {} for Core Lane", height);
                 }
                 Err(e) => {
@@ -655,6 +667,47 @@ impl CoreLaneNode {
     }
 
     async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<()> {
+        // 🔍 REORG DETECTION: Check for blockchain reorganizations
+        {
+            let state = self.state.lock().await;
+            let height = bitcoin_block.anchor_block_height;
+
+            // anchor_block_hash is hex string as bytes, need to decode to get raw 32 bytes
+            let hash_hex = String::from_utf8_lossy(&bitcoin_block.anchor_block_hash);
+            let hash_bytes = hex::decode(hash_hex.trim_start_matches("0x"))
+                .unwrap_or_else(|_| bitcoin_block.anchor_block_hash.clone());
+            let current_hash = B256::from_slice(&hash_bytes);
+
+            // Check if we already have a hash for this height (shouldn't happen in normal operation)
+            if let Some(existing_hash) = state.height_to_hash.get(&height) {
+                if existing_hash != &current_hash {
+                    panic!(
+                        "🚨 REORG DETECTED! Height {} has different hash. Expected: {:?}, Got: {:?}",
+                        height, existing_hash, current_hash
+                    );
+                }
+            }
+
+            // Check if the previous height's hash matches this block's parent hash
+            if height > 0 && !bitcoin_block.parent_hash.is_empty() {
+                let prev_height = height - 1;
+                if let Some(prev_hash) = state.height_to_hash.get(&prev_height) {
+                    // Decode the parent hash from hex string to bytes for comparison
+                    let parent_hash_hex = String::from_utf8_lossy(&bitcoin_block.parent_hash);
+                    let parent_hash_bytes = hex::decode(parent_hash_hex.trim_start_matches("0x"))
+                        .unwrap_or_else(|_| bitcoin_block.parent_hash.clone());
+                    let expected_parent_hash = B256::from_slice(&parent_hash_bytes);
+
+                    if prev_hash != &expected_parent_hash {
+                        panic!(
+                            "🚨 REORG DETECTED! Height {} parent hash mismatch. Expected: {:?}, Got: {:?}",
+                            height, prev_hash, expected_parent_hash
+                        );
+                    }
+                }
+            }
+        }
+
         let new_block = self.create_new_block(Some(bitcoin_block)).await?;
 
         let new_block_clone = new_block.clone();
