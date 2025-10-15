@@ -289,6 +289,10 @@ impl StateManager {
         self.stored_blobs.contains_key(blob_hash)
     }
 
+    pub fn get_blob(&self, blob_hash: &B256) -> Option<&Vec<u8>> {
+        self.stored_blobs.get(blob_hash)
+    }
+
     pub fn insert_blob(&mut self, blob_hash: B256, data: Vec<u8>) {
         self.stored_blobs.insert(blob_hash, data);
     }
@@ -360,7 +364,6 @@ impl StateManager {
             self.add_receipt(tx_hash, receipt);
         }
     }
-
     /// Serialize the StateManager to a writer using borsh
     #[allow(dead_code)]
     pub fn borsh_serialize_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
