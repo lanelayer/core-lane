@@ -1,15 +1,11 @@
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::{BundleStateManager, StateManager};
-    use alloy_consensus::{TxEnvelope, TxLegacy};
-    use alloy_primitives::{Address, Bytes, U256};
+mod core_lane_tests {
+    use alloy_primitives::Address;
     use std::str::FromStr;
 
     // Test data
     const TEST_ETH_ADDRESS: &str = "0x1234567890123456789012345678901234567890";
     const TEST_CHAIN_ID: u32 = 1;
-    const TEST_BURN_AMOUNT: u64 = 1000000;
 
     #[test]
     fn test_burn_payload_creation() {
@@ -87,7 +83,6 @@ mod tests {
 // Integration tests
 #[cfg(test)]
 mod integration_tests {
-    use super::*;
     use crate::state::{BundleStateManager, StateManager};
     use alloy_primitives::{Address, U256};
     use std::str::FromStr;

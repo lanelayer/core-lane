@@ -1,16 +1,12 @@
 use crate::intents::{decode_intent_calldata, Intent, IntentCall, IntentData, IntentStatus};
 use crate::state::BundleStateManager;
 use crate::CoreLaneState;
-use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
-use alloy_primitives::B256;
-use alloy_primitives::{keccak256, Address, Bytes, U256};
-use alloy_rlp::Decodable;
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::RpcApi;
 use std::str::FromStr;
-use tracing::{debug, info};
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
 pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
@@ -39,6 +35,7 @@ pub struct CoreLaneAddresses;
 
 impl CoreLaneAddresses {
     /// Burn address: 0x000000000000000000000000000000000000dead
+    #[allow(dead_code)]
     pub fn burn() -> Address {
         Address::from([
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -57,6 +54,7 @@ impl CoreLaneAddresses {
 
 /// Transaction execution result
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ExecutionResult {
     pub success: bool,
     pub gas_used: U256,
@@ -77,6 +75,7 @@ pub fn execute_transaction(
 }
 
 /// Get gas limit from transaction
+#[allow(dead_code)]
 fn get_gas_limit(tx: &TxEnvelope) -> u64 {
     match tx {
         TxEnvelope::Legacy(signed_tx) => signed_tx.tx().gas_limit,
@@ -91,6 +90,7 @@ fn get_gas_limit(tx: &TxEnvelope) -> u64 {
 }
 
 /// Get gas price from transaction
+#[allow(dead_code)]
 fn get_gas_price(tx: &TxEnvelope) -> u64 {
     match tx {
         TxEnvelope::Legacy(signed_tx) => signed_tx.tx().gas_price.try_into().unwrap_or(1000000000),
@@ -588,11 +588,7 @@ fn verify_intent_fill_on_bitcoin(
                 // Check payment output to the expected address with exact amount
                 if out.script_pubkey == dest_script {
                     let out_amount_u256 = U256::from(out.value.to_sat());
-                    if out_amount_u256 == expected_amount_u256 {
-                        has_correct_payment = true;
-                    } else {
-                        has_correct_payment = false;
-                    }
+                    has_correct_payment = out_amount_u256 == expected_amount_u256;
                 } else if out.script_pubkey.is_op_return() {
                     // Check the OP_RETURN output contains the intent id bytes
                     let script = out.script_pubkey.as_bytes();
