@@ -1,12 +1,26 @@
-use crate::intents::{decode_intent_calldata, Intent, IntentCall, IntentData, IntentStatus};
+use crate::cmio::CmioMessage;
+use crate::intents::{
+    decode_intent_calldata, Intent, IntentCall, IntentCommandType, IntentData, IntentStatus,
+};
+use crate::intents::{IntentType, RiscVProgramIntent};
 use crate::state::BundleStateManager;
 use crate::CoreLaneState;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
+use cartesi_machine::machine::Machine;
+use cartesi_machine::types::cmio::CmioResponseReason;
+
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::RpcApi;
+use cartesi_machine::types::cmio::AutomaticReason;
+use cartesi_machine::types::cmio::CmioRequest;
+use cartesi_machine::types::cmio::ManualReason;
+use ciborium::into_writer;
 use std::str::FromStr;
+use tracing::info;
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
 pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
@@ -219,6 +233,25 @@ fn execute_transfer(
                         error: Some(e.to_string()),
                     });
                 }
+                // Build and log the extra_data hex for a RISC-V program intent using this blob
+                let mut blob_hash_bytes = [0u8; 32];
+                blob_hash_bytes.copy_from_slice(blob_hash.as_slice());
+                let riscv_intent = RiscVProgramIntent {
+                    blob_hash: blob_hash_bytes,
+                    extra_data: Vec::new(),
+                };
+                let mut inner_cbor = Vec::new();
+                let _ = into_writer(&riscv_intent, &mut inner_cbor);
+                let intent_data = IntentData {
+                    intent_type: IntentType::RiscVProgram,
+                    data: inner_cbor,
+                };
+                if let Ok(extra_data_bytes) = intent_data.to_cbor() {
+                    info!(
+                        "extra_data_hex for RiscVProgram: 0x{}",
+                        hex::encode(extra_data_bytes)
+                    );
+                }
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -263,14 +296,18 @@ fn execute_transfer(
                 bundle_state.increment_nonce(&state.account_manager, sender)?;
                 let value_u64: u64 = value.try_into().unwrap();
                 let intent_id = calculate_intent_id(sender, nonce, Bytes::from(preimage));
+                info!("Calculated intent id: {:?}", intent_id);
                 bundle_state.insert_intent(
                     intent_id,
                     Intent {
                         data: Bytes::from(extra_data),
                         value: value_u64,
                         status: IntentStatus::Submitted,
+                        last_command: IntentCommandType::Created,
+                        creator: sender,
                     },
                 );
+
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -306,6 +343,8 @@ fn execute_transfer(
                         data: Bytes::from(intent_data),
                         value: value_u64,
                         status: IntentStatus::Submitted,
+                        last_command: IntentCommandType::Created,
+                        creator: sender,
                     },
                 );
                 return Ok(ExecutionResult {
@@ -342,6 +381,7 @@ fn execute_transfer(
                     match intent.status {
                         IntentStatus::Submitted => {
                             intent.status = IntentStatus::Locked(sender);
+                            intent.last_command = IntentCommandType::LockIntentForSolving;
                             if let Err(e) =
                                 bundle_state.increment_nonce(&state.account_manager, sender)
                             {
@@ -383,6 +423,16 @@ fn execute_transfer(
                                 error: Some("Already solved".to_string()),
                             });
                         }
+                        IntentStatus::Cancelled => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["lockIntentForSolving: cancelled".to_string()],
+                                error: Some("Cancelled".to_string()),
+                            });
+                        }
                     }
                 } else {
                     return Ok(ExecutionResult {
@@ -421,15 +471,12 @@ fn execute_transfer(
                         error: Some("Intent not found".to_string()),
                     });
                 }
-
-                match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
-                    Ok(true) => {
-                        // Extract intent value first to avoid borrow checker issues
-                        let intent_value = if let Some(intent) =
-                            bundle_state.get_intent(&state.account_manager, &intent_id)
-                        {
-                            intent.value
-                        } else {
+                // Branch by intent type: AnchorBitcoinFill requires L1 verification, RiscVProgram does not
+                let current_intent =
+                    match bundle_state.get_intent(&state.account_manager, &intent_id) {
+                        Some(i) => i,
+                        None => {
+                            info!("solveIntent: intent disappeared");
                             return Ok(ExecutionResult {
                                 success: false,
                                 gas_used,
@@ -438,71 +485,219 @@ fn execute_transfer(
                                 logs: vec!["solveIntent: intent disappeared".to_string()],
                                 error: Some("Intent disappeared".to_string()),
                             });
-                        };
+                        }
+                    };
+                let cbor_intent = IntentData::from_cbor(&current_intent.data)?;
+                match cbor_intent.intent_type {
+                    IntentType::AnchorBitcoinFill => {
+                        match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
+                            Ok(true) => {
+                                // Extract intent value first to avoid borrow checker issues
+                                let intent_value = bundle_state
+                                    .get_intent(&state.account_manager, &intent_id)
+                                    .ok_or_else(|| anyhow!("Intent disappeared"))?
+                                    .value;
+                                bundle_state.add_balance(
+                                    &state.account_manager,
+                                    sender,
+                                    U256::from(intent_value),
+                                )?;
 
-                        // Add balance using the extracted value
-                        bundle_state.add_balance(
-                            &state.account_manager,
-                            sender,
-                            U256::from(intent_value),
-                        )?;
-
-                        // Now update the intent status
-                        if let Some(intent) =
-                            bundle_state.get_intent_mut(&state.account_manager, &intent_id)
-                        {
-                            intent.status = IntentStatus::Solved;
-                            if let Err(e) =
-                                bundle_state.increment_nonce(&state.account_manager, sender)
-                            {
+                                if let Some(intent) =
+                                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                                {
+                                    intent.status = IntentStatus::Solved;
+                                    intent.last_command = IntentCommandType::SolveIntent;
+                                    if let Err(e) =
+                                        bundle_state.increment_nonce(&state.account_manager, sender)
+                                    {
+                                        return Ok(ExecutionResult {
+                                            success: false,
+                                            gas_used,
+                                            gas_refund: U256::ZERO,
+                                            output: Bytes::new(),
+                                            logs: vec![format!("Failed to increment nonce: {}", e)],
+                                            error: Some(e.to_string()),
+                                        });
+                                    }
+                                    return Ok(ExecutionResult {
+                                        success: true,
+                                        gas_used,
+                                        gas_refund: U256::ZERO,
+                                        output: Bytes::new(),
+                                        logs: vec![
+                                            "Intent solved (Bitcoin L1 proof verified)".to_string()
+                                        ],
+                                        error: None,
+                                    });
+                                }
                                 return Ok(ExecutionResult {
                                     success: false,
                                     gas_used,
                                     gas_refund: U256::ZERO,
                                     output: Bytes::new(),
-                                    logs: vec![format!("Failed to increment nonce: {}", e)],
-                                    error: Some(e.to_string()),
+                                    logs: vec!["solveIntent: intent disappeared".to_string()],
+                                    error: Some("Intent not found".to_string()),
                                 });
                             }
+                            Ok(false) => {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec![
+                                        "solveIntent: L1 fill not found in block".to_string()
+                                    ],
+                                    error: Some("L1 fill not found".to_string()),
+                                });
+                            }
+                            Err(e) => {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec![format!("solveIntent: verifier error: {}", e)],
+                                    error: Some("Verifier error".to_string()),
+                                });
+                            }
+                        }
+                    }
+                    IntentType::RiscVProgram => {
+                        let intent_value = bundle_state
+                            .get_intent(&state.account_manager, &intent_id)
+                            .ok_or_else(|| anyhow!("Intent disappeared"))?
+                            .value;
+                        bundle_state.add_balance(
+                            &state.account_manager,
+                            sender,
+                            U256::from(intent_value),
+                        )?;
+                        if let Some(intent) =
+                            bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                        {
+                            intent.status = IntentStatus::Solved;
+                            intent.last_command = IntentCommandType::SolveIntent;
+                            bundle_state.increment_nonce(&state.account_manager, sender)?;
+                            run_intent_for(bundle_state, state, intent_id)?;
+                        }
+                        return Ok(ExecutionResult {
+                            success: true,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["Intent solved (program executed)".to_string()],
+                            error: None,
+                        });
+                    }
+                }
+            }
+            Some(IntentCall::CancelIntent { intent_id, .. }) => {
+                let (creator, value) = {
+                    if let Some(intent) =
+                        bundle_state.get_intent(&state.account_manager, &intent_id)
+                    {
+                        if matches!(intent.status, IntentStatus::Solved) {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["cancelIntent: already solved".to_string()],
+                                error: Some("Already solved".to_string()),
+                            });
+                        }
+                        if intent.creator != sender {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["cancelIntent: not creator".to_string()],
+                                error: Some("Not creator".to_string()),
+                            });
+                        }
+                        (intent.creator, intent.value)
+                    } else {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["cancelIntent: intent not found".to_string()],
+                            error: Some("Intent not found".to_string()),
+                        });
+                    }
+                };
+                {
+                    let intent = bundle_state
+                        .get_intent_mut(&state.account_manager, &intent_id)
+                        .unwrap();
+
+                    intent.status = IntentStatus::Cancelled;
+                    intent.last_command = IntentCommandType::CancelIntent;
+                }
+                bundle_state.add_balance(&state.account_manager, creator, U256::from(value))?;
+                bundle_state.increment_nonce(&state.account_manager, sender)?;
+
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec!["Intent canceled".to_string()],
+                    error: None,
+                });
+            }
+            Some(IntentCall::CancelIntentLock { intent_id, .. }) => {
+                if let Some(intent) =
+                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                {
+                    match intent.status {
+                        IntentStatus::Locked(locker) => {
+                            if locker != sender {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec!["cancelIntentLock: not current locker".to_string()],
+                                    error: Some("Not locker".to_string()),
+                                });
+                            }
+                            intent.status = IntentStatus::Submitted;
+                            intent.last_command = IntentCommandType::CancelIntentLock;
+                            bundle_state.increment_nonce(&state.account_manager, sender)?;
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
                                 gas_refund: U256::ZERO,
                                 output: Bytes::new(),
-                                logs: vec!["Intent solved (Bitcoin L1 proof verified)".to_string()],
+                                logs: vec!["Intent lock canceled".to_string()],
                                 error: None,
                             });
                         }
-                        return Ok(ExecutionResult {
-                            success: false,
-                            gas_used,
-                            gas_refund: U256::ZERO,
-                            output: Bytes::new(),
-                            logs: vec!["solveIntent: intent disappeared".to_string()],
-                            error: Some("Intent not found".to_string()),
-                        });
-                    }
-                    Ok(false) => {
-                        return Ok(ExecutionResult {
-                            success: false,
-                            gas_used,
-                            gas_refund: U256::ZERO,
-                            output: Bytes::new(),
-                            logs: vec!["solveIntent: L1 fill not found in block".to_string()],
-                            error: Some("L1 fill not found".to_string()),
-                        });
-                    }
-                    Err(e) => {
-                        return Ok(ExecutionResult {
-                            success: false,
-                            gas_used,
-                            gas_refund: U256::ZERO,
-                            output: Bytes::new(),
-                            logs: vec![format!("solveIntent: verifier error: {}", e)],
-                            error: Some("Verifier error".to_string()),
-                        });
+                        _ => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["cancelIntentLock: not locked".to_string()],
+                                error: Some("Not locked".to_string()),
+                            });
+                        }
                     }
                 }
+                return Ok(ExecutionResult {
+                    success: false,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec!["cancelIntentLock: intent not found".to_string()],
+                    error: Some("Intent not found".to_string()),
+                });
             }
             _ => {
                 return Ok(ExecutionResult {
@@ -565,7 +760,6 @@ fn verify_intent_fill_on_bitcoin(
         .account_manager
         .get_intent(&intent_id)
         .ok_or_else(|| anyhow!("Intent not found for verification"))?;
-
     let cbor_intent = IntentData::from_cbor(&intent.data)?;
     let fill = cbor_intent.parse_anchor_bitcoin_fill()?;
     let dest_script = {
@@ -608,4 +802,93 @@ fn verify_intent_fill_on_bitcoin(
         }
     }
     Ok(false)
+}
+
+fn run_intent_with_image(state: &mut CoreLaneState, program_blob: Option<Vec<u8>>) -> Result<()> {
+    let mut machine = Machine::create(
+        &MachineConfig::new_with_ram(RAMConfig {
+            length: 134217728,
+            image_filename: "".into(),
+        }),
+        &RuntimeConfig::default(),
+    )?;
+
+    let opensbi = include_bytes!("../opensbi.bin");
+
+    machine.write_memory(0x8000_0000u64, opensbi.as_ref())?;
+    machine.write_memory(0x8020_0000u64, program_blob.unwrap().as_ref())?;
+
+    loop {
+        let reason = machine.run(u64::MAX)?;
+        if reason == 1 {
+            break;
+        }
+        match machine.receive_cmio_request() {
+            Ok(req) => {
+                info!("Handling CMIO request: {:?}", req);
+                let data = match req {
+                    CmioRequest::Automatic(AutomaticReason::TxOutput { data }) => data,
+                    CmioRequest::Manual(ManualReason::GIO { data, .. }) => data,
+                    _ => {
+                        let _ = machine.send_cmio_response(CmioResponseReason::Advance, &[]);
+                        continue;
+                    }
+                };
+                info!("Handling CMIO data: {:?}", data);
+
+                if let Ok(msg) = CmioMessage::from_bytes(&data) {
+                    if let CmioMessage::Exit { code: _ } = msg {
+                        machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                        break;
+                    }
+                    info!("Handling CMIO query: {:?}", msg);
+                    let response = state.handle_cmio_query(msg);
+                    let resp_bytes = response
+                        .map(|r| r.to_bytes().unwrap_or_default())
+                        .unwrap_or_default();
+                    machine.send_cmio_response(CmioResponseReason::Advance, &resp_bytes)?;
+                    // keep running until Exit
+                    continue;
+                } else {
+                    machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    let _ = machine.run(u64::MAX)?;
+
+    Ok(())
+}
+
+fn run_intent_for(
+    bundle_state: &mut BundleStateManager,
+    state: &mut CoreLaneState,
+    intent_id: B256,
+) -> Result<()> {
+    let mut program_blob: Option<Vec<u8>> = None;
+    if let Some(intent) = bundle_state.get_intent(&state.account_manager, &intent_id) {
+        if let Ok(intent_data) = IntentData::from_cbor(&intent.data) {
+            if intent_data.intent_type == crate::intents::IntentType::RiscVProgram {
+                if let Ok(prog) = intent_data.parse_riscv_program() {
+                    let blob_hash = B256::from_slice(&prog.blob_hash);
+                    if let Some(bytes) = state.account_manager.get_blob(&blob_hash) {
+                        bundle_state.insert_blob(blob_hash, bytes.clone());
+                        program_blob = Some(bytes.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    if program_blob.is_none() {
+        return Err(anyhow::anyhow!(
+            "Program blob not found for intent {:?}",
+            intent_id
+        ));
+    }
+    run_intent_with_image(state, program_blob)?;
+    Ok(())
 }

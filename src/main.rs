@@ -1,8 +1,22 @@
+use crate::intents::IntentSystem;
+use alloy_consensus::{SignableTransaction, TxEip1559};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_primitives::TxKind;
+use alloy_primitives::{hex, Address, Bytes, B256, U256};
+use alloy_provider::Provider;
+use alloy_provider::ProviderBuilder;
+use alloy_rpc_types::TransactionRequest;
+use alloy_signer::Signer;
+use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::SolCall;
 use anyhow::Result;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
+use reqwest::Url;
 use serde_json::{self, json};
 use std::collections::HashMap;
+use std::fs;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -13,6 +27,7 @@ mod account;
 mod bitcoin_block;
 mod bitcoin_cache_rpc;
 mod block;
+mod cmio;
 mod intents;
 mod rpc;
 mod state;
@@ -23,8 +38,8 @@ mod transaction;
 mod tests;
 
 use alloy_consensus::TxEnvelope;
-use alloy_primitives::{Address, B256, U256};
 use bitcoin_cache_rpc::BitcoinCacheRpcServer;
+use cmio::CmioMessage;
 use intents::create_anchor_bitcoin_fill_intent;
 use rpc::RpcServer;
 use state::{StateManager, StoredTransaction, TransactionReceipt};
@@ -32,6 +47,19 @@ use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
 use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
+
+fn parse_b256(hex_input: &str) -> Option<B256> {
+    let raw = hex_input.trim_start_matches("0x");
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut buf = [0u8; 32];
+    if hex::decode_to_slice(raw, &mut buf).is_ok() {
+        Some(B256::from_slice(&buf))
+    } else {
+        None
+    }
+}
 
 /// Helper function to construct wallet database path
 fn wallet_db_path(data_dir: &str, network: &str) -> String {
@@ -90,6 +118,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    StoreBlob {
+        #[arg(long, default_value = "http://127.0.0.1:8546")]
+        rpc_url: String,
+        #[arg(long, default_value = "0x0000000000000000000000000000000000000045")]
+        contract: String,
+        #[arg(long)]
+        private_key: String,
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        max_fee_per_gas: Option<u128>,
+        #[arg(long, default_value = "0")]
+        max_priority_fee_per_gas: u128,
+    },
+
     Start {
         /// Bitcoin RPC URL for reading blockchain data
         #[arg(long, default_value = "http://127.0.0.1:18443")]
@@ -336,6 +379,10 @@ impl CoreLaneBlock {
             "timestamp": format!("0x{:x}", self.timestamp),
             "gasUsed": format!("0x{:x}", self.gas_used),
             "gasLimit": format!("0x{:x}", self.gas_limit),
+            "baseFeePerGas": match self.base_fee_per_gas {
+                Some(fee) => serde_json::Value::String(format!("0x{:x}", fee)),
+                None => serde_json::Value::Null,
+            },
             "difficulty": format!("0x{:x}", self.difficulty),
             "totalDifficulty": format!("0x{:x}", self.total_difficulty),
             "extraData": format!("0x{}", hex::encode(&self.extra_data)),
@@ -366,8 +413,8 @@ struct CoreLaneState {
     bitcoin_height_to_hash: HashMap<u64, B256>, // Bitcoin height -> Bitcoin block hash (for reorg detection)
     bitcoin_height_to_core_block: HashMap<u64, u64>, // Bitcoin height -> Core Lane block number
     current_block: Option<CoreLaneBlock>,       // Current block being built
-    genesis_block: CoreLaneBlock,               // Genesis block
-    bitcoin_client_read: Arc<Client>,           // Client for reading blockchain data
+    genesis_block: CoreLaneBlock,
+    bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
     #[allow(dead_code)]
     bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
 }
@@ -380,6 +427,114 @@ impl CoreLaneState {
     #[allow(dead_code)]
     pub fn bitcoin_client_write(&self) -> Arc<Client> {
         self.bitcoin_client_write.clone()
+    }
+
+    pub fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage> {
+        match message {
+            CmioMessage::QueryCommandType { intent_id } => {
+                let intent_id_b256 = match parse_b256(&intent_id) {
+                    Some(id) => id,
+                    None => {
+                        warn!(
+                            "Invalid intent_id for QueryCommandType (expect 32-byte hex): {:?}",
+                            intent_id
+                        );
+                        return None;
+                    }
+                };
+                self.account_manager
+                    .get_intent(&intent_id_b256)
+                    .map(|intent| CmioMessage::CommandTypeResponse {
+                        command_type: intent.last_command,
+                        success: true,
+                    })
+            }
+            CmioMessage::ReadIntentData { intent_id } => {
+                let intent_id_b256 = match parse_b256(&intent_id) {
+                    Some(id) => id,
+                    None => {
+                        warn!(
+                            "Invalid intent_id for ReadIntentData (expect 32-byte hex): {:?}",
+                            intent_id
+                        );
+                        return Some(CmioMessage::IntentDataResponse {
+                            data_hex: "0x".to_string(),
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(intent) = self.account_manager.get_intent(&intent_id_b256) {
+                    Some(CmioMessage::IntentDataResponse {
+                        data_hex: format!("0x{}", hex::encode(&intent.data)),
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::IntentDataResponse {
+                        data_hex: "0x".to_string(),
+                        success: false,
+                    })
+                }
+            }
+            CmioMessage::ReadBlobInfo { blob_hash_hex } => {
+                let blob_hash = match parse_b256(&blob_hash_hex) {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            "Invalid blob_hash_hex for ReadBlobInfo (expect 32-byte hex): {:?}",
+                            blob_hash_hex
+                        );
+                        return Some(CmioMessage::BlobInfoResponse {
+                            length: 0,
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(data) = self.account_manager.get_blob(&blob_hash) {
+                    Some(CmioMessage::BlobInfoResponse {
+                        length: data.len() as u64,
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::BlobInfoResponse {
+                        length: 0,
+                        success: false,
+                    })
+                }
+            }
+
+            CmioMessage::ReadBlob { blob_hash_hex } => {
+                let blob_hash = match parse_b256(&blob_hash_hex) {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            "Invalid blob_hash_hex for ReadBlob (expect 32-byte hex): {:?}",
+                            blob_hash_hex
+                        );
+                        return Some(CmioMessage::BlobResponse {
+                            data_hex: "0x".to_string(),
+                            success: false,
+                        });
+                    }
+                };
+                if let Some(data) = self.account_manager.get_blob(&blob_hash) {
+                    Some(CmioMessage::BlobResponse {
+                        data_hex: format!("0x{}", hex::encode(data)),
+                        success: true,
+                    })
+                } else {
+                    Some(CmioMessage::BlobResponse {
+                        data_hex: "0x".to_string(),
+                        success: false,
+                    })
+                }
+            }
+            CmioMessage::Log { message } => {
+                tracing::info!(target = "cmio", "CM LOG: {}", message);
+                None
+            }
+            CmioMessage::Exit { .. } => None,
+            _ => None,
+        }
     }
 
     /// Rollback state to the specified Core Lane block number
@@ -1283,6 +1438,66 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
+        Commands::StoreBlob {
+            rpc_url,
+            contract,
+            private_key,
+            file,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        } => {
+            let to = Address::from_str(contract)?;
+            let data_bytes = fs::read(file)?;
+            let value_u256 = parse_u256_dec_or_hex("0")?;
+
+            let calldata: Bytes = IntentSystem::storeBlobCall {
+                data: data_bytes.into(),
+                expiryTime: parse_u256_dec_or_hex("0")?,
+            }
+            .abi_encode()
+            .into();
+
+            let url = Url::parse(rpc_url)?;
+            let provider = ProviderBuilder::new().connect_http(url);
+            let wallet: PrivateKeySigner = private_key.parse()?;
+            let sender = wallet.address();
+            let chain_id = provider.get_chain_id().await?;
+
+            let nonce_u64 = provider.get_transaction_count(sender).await? as u64;
+
+            let req = TransactionRequest {
+                from: Some(sender),
+                to: Some(TxKind::Call(to)),
+                input: calldata.clone().into(),
+                value: Some(value_u256),
+                ..Default::default()
+            };
+
+            let gas_limit = provider.estimate_gas(req.clone()).await?;
+            let base_gas_price = provider.get_gas_price().await?;
+            let max_fee_u128 = max_fee_per_gas.unwrap_or_else(|| base_gas_price);
+
+            let tx = TxEip1559 {
+                chain_id,
+                nonce: nonce_u64,
+                max_priority_fee_per_gas: *max_priority_fee_per_gas,
+                max_fee_per_gas: max_fee_u128,
+                gas_limit,
+                to: TxKind::Call(to),
+                value: value_u256,
+                input: calldata.clone(),
+                access_list: Default::default(),
+            };
+
+            let sighash = tx.signature_hash();
+            let signature = wallet.sign_hash(&sighash).await?;
+            let signed = tx.into_signed(signature);
+            let envelope = alloy_consensus::TxEnvelope::Eip1559(signed);
+            let raw = envelope.encoded_2718();
+
+            let _ = provider.send_raw_transaction(&raw).await?;
+        }
+
         Commands::Start {
             bitcoin_rpc_read_url,
             bitcoin_rpc_read_user,
@@ -2241,4 +2456,14 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_u256_dec_or_hex(s: &str) -> Result<U256> {
+    if let Some(hexstr) = s.strip_prefix("0x") {
+        let bytes = hex::decode(hexstr)?;
+        Ok(U256::from_be_slice(&bytes))
+    } else {
+        let v: u128 = s.parse()?;
+        Ok(U256::from(v))
+    }
 }

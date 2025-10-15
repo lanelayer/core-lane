@@ -31,6 +31,7 @@ sol! {
 #[borsh(use_discriminant = true)]
 pub enum IntentType {
     AnchorBitcoinFill = 1,
+    RiscVProgram = 2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -61,6 +62,12 @@ pub struct AnchorBitcoinFill {
     pub expire_by: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiscVProgramIntent {
+    pub blob_hash: [u8; 32],
+    pub extra_data: Vec<u8>,
+}
+
 impl IntentData {
     pub fn parse_anchor_bitcoin_fill(&self) -> anyhow::Result<AnchorBitcoinFill> {
         use anyhow::anyhow;
@@ -71,6 +78,16 @@ impl IntentData {
         let fill_data: AnchorBitcoinFill = from_reader(&mut cursor)
             .map_err(|e| anyhow!("Failed to parse AnchorBitcoinFill from CBOR: {}", e))?;
         Ok(fill_data)
+    }
+
+    pub fn parse_riscv_program(&self) -> anyhow::Result<RiscVProgramIntent> {
+        use anyhow::anyhow;
+        if self.intent_type != IntentType::RiscVProgram {
+            return Err(anyhow!("Expected RiscVProgram intent type"));
+        }
+        let mut cursor = std::io::Cursor::new(&self.data);
+        let prog: RiscVProgramIntent = from_reader(&mut cursor)?;
+        Ok(prog)
     }
 }
 
@@ -137,6 +154,9 @@ pub fn parse_bitcoin_address_from_cbor_intent(cbor_intent: &IntentData) -> anyho
             let fill_data = cbor_intent.parse_anchor_bitcoin_fill()?;
             let address_str = fill_data.parse_bitcoin_address()?;
             Ok(address_str)
+        }
+        IntentType::RiscVProgram => {
+            anyhow::bail!("Not a BitcoinFill intent")
         }
     }
 }
@@ -319,6 +339,20 @@ pub enum IntentStatus {
     Submitted,
     Locked(Address),
     Solved,
+    Cancelled,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+)]
+#[repr(u8)]
+#[borsh(use_discriminant = true)]
+pub enum IntentCommandType {
+    Created = 1,
+    CancelIntent = 2,
+    LockIntentForSolving = 3,
+    SolveIntent = 4,
+    CancelIntentLock = 5,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -326,4 +360,6 @@ pub struct Intent {
     pub data: Bytes,
     pub value: u64,
     pub status: IntentStatus,
+    pub last_command: IntentCommandType,
+    pub creator: Address,
 }

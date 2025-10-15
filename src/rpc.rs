@@ -1627,13 +1627,26 @@ impl RpcServer {
         request: JsonRpcRequest,
         _state: &Arc<Self>,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        if request.params.len() != 2 {
+        if request.params.is_empty() || request.params.len() > 2 {
             return Ok(JsonResponse::from(JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 result: None,
                 error: Some(JsonRpcError {
                     code: -32602,
                     message: "Invalid params".to_string(),
+                }),
+                id: request.id,
+            }));
+        }
+
+        // Validate first param is a call object
+        if !request.params[0].is_object() {
+            return Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: expected call object".to_string(),
                 }),
                 id: request.id,
             }));
