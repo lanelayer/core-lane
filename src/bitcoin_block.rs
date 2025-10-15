@@ -10,7 +10,7 @@ use bitcoin::{
     script::Instruction,
     Script, Transaction,
 };
-use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bitcoincore_rpc::{Client, RpcApi};
 use tracing::{debug, info, trace, warn};
 
 use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBurn};
@@ -32,7 +32,6 @@ pub fn process_bitcoin_block(
         block.txdata.len()
     );
 
-    let bitcoin_block_hash = hash.to_string();
     let bitcoin_block_hash_bytes: Vec<u8> = hash.as_raw_hash().to_byte_array().to_vec(); // Store raw 32-byte hash
     let bitcoin_block_timestamp = block.header.time as u64;
 
@@ -56,7 +55,7 @@ pub fn process_bitcoin_block(
     for (tx_index, tx) in block.txdata.iter().enumerate() {
         let txid = tx.compute_txid();
 
-        if let Some((payload, burn_value)) = extract_burn_payload_from_tx(&bitcoin_client, &tx) {
+        if let Some((payload, burn_value)) = extract_burn_payload_from_tx(&bitcoin_client, tx) {
             info!(
                 "   🔥 Found Bitcoin burn in tx {}: {} ({}sats)",
                 tx_index, txid, burn_value
@@ -121,19 +120,19 @@ fn process_bitcoin_burn(
                 mint_amount, eth_address
             );
 
-            return Ok(CoreLaneBurn::new(mint_amount, eth_address));
+            Ok(CoreLaneBurn::new(mint_amount, eth_address))
         } else {
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "   ⚠️  Burn for different chain ID ({}), ignoring",
                 chain_id
-            ));
+            ))
         }
     } else {
-        return Err(anyhow::anyhow!("   ❌ Invalid BRN1 payload format"));
+        Err(anyhow::anyhow!("   ❌ Invalid BRN1 payload format"))
     }
 }
 
-fn extract_burn_payload_from_tx(client: &Client, tx: &Transaction) -> Option<(Vec<u8>, u64)> {
+fn extract_burn_payload_from_tx(_client: &Client, tx: &Transaction) -> Option<(Vec<u8>, u64)> {
     // Look for hybrid P2WSH + OP_RETURN burn pattern
     let mut p2wsh_burn_value = 0u64;
     let mut brn1_payload = None;
@@ -170,12 +169,14 @@ fn extract_burn_payload_from_tx(client: &Client, tx: &Transaction) -> Option<(Ve
     }
 
     // If we found both P2WSH burn and BRN1 data, this is our hybrid burn
-    if p2wsh_burn_value > 0 && brn1_payload.is_some() {
-        info!(
-            "   ✅ Found hybrid P2WSH + OP_RETURN burn: {} sats",
-            p2wsh_burn_value
-        );
-        return Some((brn1_payload.unwrap(), p2wsh_burn_value));
+    if p2wsh_burn_value > 0 {
+        if let Some(payload) = brn1_payload {
+            info!(
+                "   ✅ Found hybrid P2WSH + OP_RETURN burn: {} sats",
+                p2wsh_burn_value
+            );
+            return Some((payload, p2wsh_burn_value));
+        }
     }
 
     None
@@ -209,11 +210,11 @@ fn extract_core_lane_transaction(tx: &Transaction) -> Option<Vec<u8>> {
                 input.witness.len()
             );
 
-            if let Some(script_bytes) = input.witness.to_vec().get(0) {
+            if let Some(script_bytes) = input.witness.to_vec().first() {
                 let script = Script::from_bytes(script_bytes);
 
                 // Use the bitcoin-data-layer extraction logic
-                if let Some(data) = extract_envelope_data_bitcoin_da_style(&script) {
+                if let Some(data) = extract_envelope_data_bitcoin_da_style(script) {
                     // If we got data back, it means we found a Core Lane transaction
                     if !data.is_empty() {
                         info!("   🎯 Found Core Lane transaction in Taproot envelope!");

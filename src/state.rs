@@ -4,7 +4,7 @@ use alloy_rlp::Decodable;
 use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::Write;
 
 use crate::account::CoreLaneAccount;
@@ -80,6 +80,7 @@ pub struct BundleStateManager {
     pub transaction_receipts: BTreeMap<String, TransactionReceipt>,
 }
 
+#[allow(dead_code)]
 impl BundleStateManager {
     pub fn new() -> Self {
         Self {
@@ -154,13 +155,12 @@ impl BundleStateManager {
         address: Address,
     ) -> Option<&mut CoreLaneAccount> {
         // Ensure the account exists in our bundle before getting a mutable reference
-        if !self.accounts.contains_key(&address) {
-            let account = original
+        self.accounts.entry(address).or_insert_with(|| {
+            original
                 .get_account(address)
                 .cloned()
-                .unwrap_or_else(CoreLaneAccount::new);
-            self.accounts.insert(address, account);
-        }
+                .unwrap_or_else(CoreLaneAccount::new)
+        });
 
         // Now get the mutable reference (account definitely exists)
         self.accounts.get_mut(&address)
@@ -362,12 +362,14 @@ impl StateManager {
     }
 
     /// Serialize the StateManager to a writer using borsh
+    #[allow(dead_code)]
     pub fn borsh_serialize_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
         borsh::to_writer(writer, self)
             .map_err(|e| anyhow::anyhow!("Failed to borsh serialize StateManager: {}", e))
     }
 
     /// Deserialize a StateManager from a reader using borsh
+    #[allow(dead_code)]
     pub fn borsh_deserialize_from_reader<R: std::io::Read>(reader: &mut R) -> Result<Self> {
         borsh::from_reader(reader)
             .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))

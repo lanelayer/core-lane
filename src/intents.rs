@@ -1,5 +1,5 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::sol;
 use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 use ciborium::de::from_reader;
@@ -68,12 +68,14 @@ impl IntentData {
             return Err(anyhow!("Expected AnchorBitcoinFill intent type"));
         }
         let mut cursor = std::io::Cursor::new(&self.data);
-        let fill_data: AnchorBitcoinFill = from_reader(&mut cursor).unwrap();
+        let fill_data: AnchorBitcoinFill = from_reader(&mut cursor)
+            .map_err(|e| anyhow!("Failed to parse AnchorBitcoinFill from CBOR: {}", e))?;
         Ok(fill_data)
     }
 }
 
 impl AnchorBitcoinFill {
+    #[allow(dead_code)]
     pub fn from_cbor(cbor_bytes: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(cbor_bytes);
         let fill_data: AnchorBitcoinFill = from_reader(&mut cursor)?;
@@ -128,17 +130,19 @@ pub fn create_anchor_bitcoin_fill_intent(
     })
 }
 
+#[allow(dead_code)]
 pub fn parse_bitcoin_address_from_cbor_intent(cbor_intent: &IntentData) -> anyhow::Result<String> {
     match cbor_intent.intent_type {
         IntentType::AnchorBitcoinFill => {
-            let fill_data = cbor_intent.parse_anchor_bitcoin_fill().unwrap();
-            let address_str = fill_data.parse_bitcoin_address().unwrap();
+            let fill_data = cbor_intent.parse_anchor_bitcoin_fill()?;
+            let address_str = fill_data.parse_bitcoin_address()?;
             Ok(address_str)
         }
     }
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum IntentCall {
     StoreBlob {
         data: Vec<u8>,

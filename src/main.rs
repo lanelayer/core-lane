@@ -1,22 +1,12 @@
-use alloy_primitives::Bytes;
-use anyhow::{anyhow, Result};
-use bitcoin::{
-    blockdata::opcodes::all::{OP_ENDIF, OP_IF, OP_RETURN},
-    blockdata::opcodes::{OP_FALSE, OP_TRUE},
-    blockdata::script::Instruction,
-    Script, Transaction,
-};
+use anyhow::Result;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
-use hex;
 use serde_json::{self, json};
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod account;
@@ -34,11 +24,10 @@ mod tests;
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
-use alloy_rlp::Decodable;
 use bitcoin_cache_rpc::BitcoinCacheRpcServer;
-use intents::{create_anchor_bitcoin_fill_intent, Intent};
+use intents::create_anchor_bitcoin_fill_intent;
 use rpc::RpcServer;
-use state::{BundleStateManager, StateManager, StoredTransaction, TransactionReceipt};
+use state::{StateManager, StoredTransaction, TransactionReceipt};
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
@@ -299,7 +288,7 @@ impl CoreLaneBlock {
             receipts_root: B256::default(),
             transactions_root: B256::default(),
             logs_bloom: vec![0u8; 256],
-            block_origin: block_origin,
+            block_origin,
         }
     }
 
@@ -339,7 +328,7 @@ impl CoreLaneBlock {
         B256::from_slice(hash_bytes.as_slice())
     }
 
-    fn to_json(&self, full: bool) -> serde_json::Value {
+    fn to_json(&self, _full: bool) -> serde_json::Value {
         let mut block_json = json!({
             "number": format!("0x{:x}", self.number),
             "hash": format!("0x{:x}", self.hash),
@@ -361,11 +350,8 @@ impl CoreLaneBlock {
             "uncles": [],
         });
 
-        if full {
-            block_json["transactions"] = json!(self.transactions);
-        } else {
-            block_json["transactions"] = json!(self.transactions);
-        }
+        // Always include transaction hashes (full vs simple mode not yet differentiated)
+        block_json["transactions"] = json!(self.transactions);
 
         block_json
     }
@@ -382,7 +368,8 @@ struct CoreLaneState {
     current_block: Option<CoreLaneBlock>,       // Current block being built
     genesis_block: CoreLaneBlock,               // Genesis block
     bitcoin_client_read: Arc<Client>,           // Client for reading blockchain data
-    bitcoin_client_write: Arc<Client>,          // Client for writing/wallet operations
+    #[allow(dead_code)]
+    bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
 }
 
 impl CoreLaneState {
@@ -390,6 +377,7 @@ impl CoreLaneState {
         self.bitcoin_client_read.clone()
     }
 
+    #[allow(dead_code)]
     pub fn bitcoin_client_write(&self) -> Arc<Client> {
         self.bitcoin_client_write.clone()
     }
@@ -433,7 +421,7 @@ impl CoreLaneState {
                         "❌ Failed to deserialize state for block {}: {}",
                         target_block, e
                     );
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         };
@@ -498,7 +486,7 @@ impl CoreLaneState {
         self.bitcoin_height_to_hash.retain(|btc_height, _| {
             self.bitcoin_height_to_core_block
                 .get(btc_height)
-                .map_or(false, |&core_block| core_block <= target_block)
+                .is_some_and(|&core_block| core_block <= target_block)
         });
         let heights_after = self.bitcoin_height_to_hash.len();
         info!(
@@ -545,7 +533,7 @@ impl CoreLaneNode {
         let bitcoin_height_to_hash = HashMap::new();
 
         // Initialize bitcoin_height_to_core_block mapping
-        let mut bitcoin_height_to_core_block = HashMap::new();
+        let bitcoin_height_to_core_block = HashMap::new();
 
         let state = Arc::new(Mutex::new(CoreLaneState {
             account_manager: StateManager::new(),
@@ -577,7 +565,7 @@ impl CoreLaneNode {
         &self,
         block_origin: Option<CoreLaneBlockParsed>,
     ) -> Result<CoreLaneBlock> {
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
 
         // Get the latest block number
         let latest_number = state.blocks.keys().max().copied().unwrap_or(0);
@@ -707,11 +695,7 @@ impl CoreLaneNode {
         state.blocks.insert(new_block.number, new_block.clone());
         state.block_hashes.insert(new_block.hash, new_block.number);
 
-        // Transactions and receipts are already in bundle state and will be applied via apply_changes
-        // Just need to update block metadata with transaction hashes
-        for (_stored_tx, _receipt, tx_hash) in transactions.iter() {
-            // Transaction hashes already added to new_block in the loop above
-        }
+        // Transactions and receipts are already in bundle state and applied via apply_changes.
 
         info!(
             "✅ Finalized Core Lane block {} with {} transactions",
@@ -781,7 +765,7 @@ impl CoreLaneNode {
 
             match self.process_block(bitcoin_block.clone()).await {
                 Ok(core_lane_block_number) => {
-                    if (core_lane_block_number == 0) {
+                    if core_lane_block_number == 0 {
                         info!("Scanning again, we encountered a reorg");
                         break;
                     }
@@ -910,7 +894,7 @@ impl CoreLaneNode {
                     // skip this bundle because it's not valid for this block
                     continue;
                 }
-                for (_tx_index, tx) in bundle.transactions.iter().enumerate() {
+                for tx in bundle.transactions.iter() {
                     let tx = self
                         .process_core_lane_transaction(
                             &mut bundle_state,
@@ -995,7 +979,7 @@ impl CoreLaneNode {
         }
 
         // Charge gas fee first from bundle state
-        let gas_fee = gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0) as u64);
+        let gas_fee = gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
         if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
             warn!(
                 "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
@@ -1018,14 +1002,14 @@ impl CoreLaneNode {
         let stored_tx = StoredTransaction {
             envelope: tx.0.clone(),
             raw_data: tx.2.clone(),
-            block_number: block_number,
+            block_number,
         };
         // Create and store transaction receipt in bundle state
         let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
 
         let receipt = TransactionReceipt {
             transaction_hash: tx_hash.clone(),
-            block_number: block_number,
+            block_number,
             transaction_index: tx_number,
             from: format!("0x{}", hex::encode(tx.1.as_slice())),
             to: None, // Will be set based on transaction type
@@ -1522,7 +1506,6 @@ async fn main() -> Result<()> {
                 wallet.persist(&mut conn)?;
             } else {
                 // Use Electrum for other networks
-                use bdk_electrum::electrum_client::ElectrumApi;
                 use bdk_electrum::{electrum_client, BdkElectrumClient};
 
                 let electrum_url = electrum_url.as_ref().ok_or_else(|| {
@@ -1533,7 +1516,7 @@ async fn main() -> Result<()> {
                     info!("🔗 Syncing with Electrum: {}", electrum_url);
                 }
 
-                let electrum_client = electrum_client::Client::new(&electrum_url)?;
+                let electrum_client = electrum_client::Client::new(electrum_url)?;
                 let electrum = BdkElectrumClient::new(electrum_client);
 
                 if !cli.plain {
@@ -1602,7 +1585,7 @@ async fn main() -> Result<()> {
             }
 
             // Create BRN1 payload
-            let addr_bytes = hex::decode(&eth_addr)?;
+            let addr_bytes = hex::decode(eth_addr)?;
             let mut payload = Vec::with_capacity(4 + 4 + 20);
             payload.extend_from_slice(b"BRN1");
             payload.extend_from_slice(&chain_id.to_be_bytes());
@@ -1661,7 +1644,7 @@ async fn main() -> Result<()> {
             }
 
             // Build PSBT with updated metadata
-            let mut psbt = tx_builder.finish();
+            let psbt = tx_builder.finish();
             let mut psbt =
                 psbt.map_err(|e| anyhow::anyhow!("Failed to build transaction: {}", e))?;
 
@@ -1799,14 +1782,13 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Use Electrum for other networks
-                use bdk_electrum::electrum_client;
-                use bdk_electrum::electrum_client::ElectrumApi;
+                use bdk_electrum::electrum_client::{self, ElectrumApi};
 
                 let electrum_url = electrum_url.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("--electrum-url required for network: {}", network_str)
                 })?;
 
-                let electrum_client = electrum_client::Client::new(&electrum_url)?;
+                let electrum_client = electrum_client::Client::new(electrum_url)?;
                 let broadcast_txid = electrum_client.transaction_broadcast_raw(&tx_bytes)?;
 
                 if !cli.plain {
@@ -2095,7 +2077,7 @@ async fn main() -> Result<()> {
                 DerivableKey, ExtendedKey, GeneratableKey, GeneratedKey,
             };
             use bdk_wallet::rusqlite::Connection;
-            use bdk_wallet::{KeychainKind, Wallet};
+            use bdk_wallet::Wallet;
 
             // Parse network
             let bdk_network = match network.as_str() {

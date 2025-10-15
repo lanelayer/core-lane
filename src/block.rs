@@ -1,15 +1,16 @@
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
-use alloy_primitives::B256;
-use alloy_primitives::{keccak256, Address, Bytes, U256};
+use alloy_primitives::{Address, U256};
 use alloy_rlp::Decodable;
-use anyhow::{anyhow, Result};
+use anyhow::anyhow;
 use tracing::{error, info};
 
 #[derive(Debug, Clone)]
 pub struct CoreLaneBundle {
     pub valid_for_block: u64,
+    #[allow(dead_code)]
     pub flash_loan_amount: U256,
+    #[allow(dead_code)]
     pub flash_loaner_address: Address,
     pub transactions: Vec<(TxEnvelope, Address, Vec<u8>)>,
 }

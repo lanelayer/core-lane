@@ -9,7 +9,7 @@ use axum::{
 use bitcoin::Block;
 use bitcoincore_rpc::{Client, RpcApi};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -265,24 +265,25 @@ impl BitcoinCacheRpcServer {
 
         // Check for .inited file and start prefetching if needed
         let inited_file = cache_path.join(".inited");
-        if !inited_file.exists() && starting_block_count.is_some() {
-            info!("🔄 First startup detected, initiating block prefetch...");
+        if !inited_file.exists() {
+            if let Some(start_block) = starting_block_count {
+                info!("🔄 First startup detected, initiating block prefetch...");
 
-            // Spawn background task for prefetching
-            let server_clone = server.clone();
-            let start_block = starting_block_count.unwrap();
+                // Spawn background task for prefetching
+                let server_clone = server.clone();
 
-            tokio::spawn(async move {
-                if let Err(e) = server_clone.prefetch_blocks(start_block).await {
-                    warn!("⚠️  Block prefetch failed: {}", e);
+                tokio::spawn(async move {
+                    if let Err(e) = server_clone.prefetch_blocks(start_block).await {
+                        warn!("⚠️  Block prefetch failed: {}", e);
+                    }
+                });
+
+                // Create .inited file immediately to prevent multiple prefetch attempts
+                if let Err(e) = std::fs::write(&inited_file, "") {
+                    warn!("⚠️  Failed to create .inited file: {}", e);
                 }
-            });
-
-            // Create .inited file immediately to prevent multiple prefetch attempts
-            if let Err(e) = std::fs::write(&inited_file, "") {
-                warn!("⚠️  Failed to create .inited file: {}", e);
             }
-        } else if inited_file.exists() {
+        } else {
             info!("✅ Cache already initialized");
         }
 
@@ -388,7 +389,7 @@ impl BitcoinCacheRpcServer {
                 match self.get_or_fetch_block(&hash).await {
                     Ok(_) => {
                         total_fetched += 1;
-                        if total_fetched % 10 == 0 {
+                        if total_fetched.is_multiple_of(10) {
                             info!("✅ Prefetched {}/{} blocks", total_fetched, total_blocks);
                         }
                     }
@@ -613,7 +614,7 @@ impl BitcoinCacheRpcServer {
         &self,
         block_data: &[u8],
         expected_hash: &str,
-        block_file: &PathBuf,
+        block_file: &Path,
     ) -> Result<String> {
         // Parse and verify the block hash
         let block: Block = bitcoin::consensus::deserialize(block_data)
@@ -657,8 +658,8 @@ impl BitcoinCacheRpcServer {
         &self,
         block_hash: &str,
         bitcoin_client: BitcoinRpcClient,
-        block_file: &PathBuf,
-        _lock_file: &PathBuf,
+        block_file: &Path,
+        _lock_file: &Path,
     ) -> Result<String> {
         // First, try to fetch from the block archive server using the shared HTTP client
         let archive_url = format!("{}/{}.bin", self.state.block_archive_url, block_hash);
@@ -827,7 +828,7 @@ async fn handle_rpc(
         "getblockcount" => server.handle_getblockcount().await,
         "getblockchaininfo" => server.handle_getblockchaininfo().await,
         "getblockhash" => {
-            let block_height = match params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()) {
+            let block_height = match params.and_then(|p| p.first()).and_then(|v| v.as_u64()) {
                 Some(h) => h,
                 None => {
                     return (
@@ -847,7 +848,7 @@ async fn handle_rpc(
             server.handle_getblockhash(block_height).await
         }
         "getblock" => {
-            let block_hash = match params.and_then(|p| p.get(0)).and_then(|v| v.as_str()) {
+            let block_hash = match params.and_then(|p| p.first()).and_then(|v| v.as_str()) {
                 Some(h) => h.to_string(),
                 None => {
                     return (

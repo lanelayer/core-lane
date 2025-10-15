@@ -18,6 +18,7 @@ impl CoreLaneAccount {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_balance(balance: U256) -> Self {
         Self {
             balance,

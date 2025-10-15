@@ -2,11 +2,9 @@ use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, U256};
-use anyhow;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
-use hex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -44,6 +42,7 @@ pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
     network: Option<bitcoin::Network>,
+    #[allow(dead_code)]
     wallet: Option<String>,
     mnemonic: Option<String>,
     electrum_url: Option<String>,
@@ -223,7 +222,7 @@ impl RpcServer {
 
     async fn handle_get_code(
         request: JsonRpcRequest,
-        state: &Arc<Self>,
+        _state: &Arc<Self>,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
         if request.params.len() != 2 {
             return Ok(JsonResponse::from(JsonRpcResponse {
@@ -815,9 +814,7 @@ impl RpcServer {
                 // Get transaction hash from block
                 if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                     // Find the actual transaction data
-                    for (_stored_index, stored_tx) in
-                        state.account_manager.get_transactions().iter().enumerate()
-                    {
+                    for stored_tx in state.account_manager.get_transactions().iter() {
                         let current_tx_hash = format!(
                             "0x{}",
                             hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1115,9 +1112,7 @@ impl RpcServer {
             // Get transaction hash from block
             if let Some(tx_hash) = block.transactions.get(tx_index as usize) {
                 // Find the actual transaction data
-                for (_stored_index, stored_tx) in
-                    state.account_manager.get_transactions().iter().enumerate()
-                {
+                for stored_tx in state.account_manager.get_transactions().iter() {
                     let current_tx_hash = format!(
                         "0x{}",
                         hex::encode(alloy_primitives::keccak256(&stored_tx.raw_data))
@@ -1722,13 +1717,13 @@ impl RpcServer {
         let position_str = request.params[1].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
         // Parse address and position
-        let address = address_from_str(address_str.trim_start_matches("0x"))
+        let _address = address_from_str(address_str.trim_start_matches("0x"))
             .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let position = B256::from_str(position_str.trim_start_matches("0x"))
+        let _position = B256::from_str(position_str.trim_start_matches("0x"))
             .map_err(|_| StatusCode::BAD_REQUEST)?;
 
         // Get storage value from account manager
-        let state = state.state.lock().await;
+        let _state = state.state.lock().await;
         let storage_value = B256::ZERO;
 
         // Convert to hex string (0x-prefixed, 32 bytes)
