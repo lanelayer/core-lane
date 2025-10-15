@@ -9,7 +9,6 @@ use bitcoin::{
 };
 use bitcoincore_rpc::{Client, RpcApi};
 use secp256k1::rand::rngs::OsRng;
-use serde_json;
 use std::sync::Arc;
 
 // BDK imports for wallet operations
@@ -53,8 +52,7 @@ impl TaprootDA {
                 reveal_fee,
                 min_relay_fee_sats
             );
-            let adjusted_sat_per_vb =
-                (min_relay_fee_sats + exact_tx_size_vb - 1) / exact_tx_size_vb; // Round up
+            let adjusted_sat_per_vb = min_relay_fee_sats.div_ceil(exact_tx_size_vb);
             reveal_fee = adjusted_sat_per_vb * exact_tx_size_vb;
             tracing::info!(
                 "🔧 Adjusted reveal fee rate: {} sat/vB (was {} sat/vB)",
@@ -119,7 +117,7 @@ impl TaprootDA {
 
         // Add the witness data (this is what we're measuring)
         let mut witness = Witness::new();
-        witness.push(&envelope_script.as_bytes());
+        witness.push(envelope_script.as_bytes());
         witness.push(control_block);
         tx.input[0].witness = witness;
 
@@ -137,7 +135,7 @@ impl TaprootDA {
 
         // Use the battle-tested weight calculation from rust-bitcoin (BIP-141 exact)
         let weight = tx.weight();
-        let vsize = (weight.to_wu() + 3) / 4;
+        let vsize = weight.to_wu().div_ceil(4);
 
         tracing::info!(
             "📏 Actual transaction size: {} vB (weight: {} WU)",
@@ -206,7 +204,7 @@ impl TaprootDA {
             }
         };
 
-        let final_sat_per_vb = sat_per_vb.max(1).min(10);
+        let final_sat_per_vb = sat_per_vb.clamp(1, 10);
         tracing::info!(
             "🔧 FORCED fee rate: {} sat/vB (was {})",
             final_sat_per_vb,
@@ -316,7 +314,6 @@ impl TaprootDA {
             wallet.persist(&mut conn)?;
         } else {
             // Use Electrum for other networks
-            use bdk_electrum::electrum_client::ElectrumApi;
             use bdk_electrum::{electrum_client, BdkElectrumClient};
 
             let electrum_url = electrum_url
@@ -385,7 +382,6 @@ impl TaprootDA {
         let dust_threshold = 330;
         // Use the exact reveal fee, but ensure it meets dust threshold
         let min_taproot_output = exact_reveal_fee.max(dust_threshold);
-        let taproot_output_btc = min_taproot_output as f64 / 100_000_000.0; // Convert to BTC
 
         tracing::info!("🔍 Calculated exact Taproot output: {} sats for reveal tx needs (dust threshold: {} sats)", min_taproot_output, dust_threshold);
 
@@ -526,7 +522,7 @@ impl TaprootDA {
 
         // Add the witness data to reveal the Core Lane transaction
         let mut witness = Witness::new();
-        witness.push(&envelope_script.as_bytes());
+        witness.push(envelope_script.as_bytes());
         witness.push(&control_block);
         reveal_tx.input[0].witness = witness;
 
@@ -618,7 +614,7 @@ impl TaprootDA {
         let envelope_script = self.create_taproot_envelope_script(data)?;
 
         let spend_info = TaprootBuilder::new()
-            .add_leaf(0, envelope_script.clone().into())
+            .add_leaf(0, envelope_script.clone())
             .map_err(|e| anyhow!("Failed to add leaf to Taproot builder: {}", e))?
             .finalize(&secp, xonly)
             .map_err(|e| anyhow!("Failed to finalize Taproot spend info: {:?}", e))?;
@@ -627,7 +623,7 @@ impl TaprootDA {
         let address = BitcoinAddress::p2tr_tweaked(output_key, network);
 
         let control_block = spend_info
-            .control_block(&(envelope_script.clone().into(), LeafVersion::TapScript))
+            .control_block(&(envelope_script.clone(), LeafVersion::TapScript))
             .ok_or_else(|| anyhow!("Failed to get control block"))?;
 
         let internal_key_hex = keypair.display_secret().to_string();
