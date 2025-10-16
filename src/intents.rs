@@ -358,6 +358,10 @@ pub enum IntentCommandType {
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Intent {
     pub data: Bytes,
+    /// Value locked in the intent (in wei)
+    ///
+    /// NOTE: Currently limited to u64::MAX (~18.4 ETH in wei) for compatibility.
+    /// TODO: Migrate to U256 to support arbitrary values without conversion loss.
     pub value: u64,
     pub status: IntentStatus,
     pub last_command: IntentCommandType,

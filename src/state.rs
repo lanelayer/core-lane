@@ -62,7 +62,7 @@ impl BorshDeserialize for StoredTransaction {
 }
 
 /// State manager for Core Lane
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
 pub struct StateManager {
     accounts: BTreeMap<Address, CoreLaneAccount>,
     stored_blobs: BTreeMap<B256, Vec<u8>>,
@@ -71,7 +71,7 @@ pub struct StateManager {
     transaction_receipts: BTreeMap<String, TransactionReceipt>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
 pub struct BundleStateManager {
     pub accounts: BTreeMap<Address, CoreLaneAccount>,
     pub stored_blobs: BTreeMap<B256, Vec<u8>>,
@@ -83,13 +83,7 @@ pub struct BundleStateManager {
 #[allow(dead_code)]
 impl BundleStateManager {
     pub fn new() -> Self {
-        Self {
-            accounts: BTreeMap::new(),
-            stored_blobs: BTreeMap::new(),
-            intents: BTreeMap::new(),
-            transactions: Vec::new(),
-            transaction_receipts: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     // XXX in future this may be a expired blob?
@@ -272,13 +266,7 @@ impl BundleStateManager {
 
 impl StateManager {
     pub fn new() -> Self {
-        Self {
-            accounts: BTreeMap::new(),
-            stored_blobs: BTreeMap::new(),
-            intents: BTreeMap::new(),
-            transactions: Vec::new(),
-            transaction_receipts: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     pub fn get_account(&self, address: Address) -> Option<&CoreLaneAccount> {

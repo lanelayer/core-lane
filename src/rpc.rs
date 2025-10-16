@@ -72,7 +72,22 @@ impl RpcServer {
 
     pub fn router(self) -> Router {
         Router::new()
+            // JSON-RPC endpoint (POST)
             .route("/", post(Self::handle_request))
+            // Custom REST endpoints for raw data access (GET)
+            .route(
+                "/get_raw_block/:block_number",
+                axum::routing::get(Self::handle_get_raw_block),
+            )
+            .route(
+                "/get_raw_block_delta/:block_number",
+                axum::routing::get(Self::handle_get_raw_block_delta),
+            )
+            .route(
+                "/get_latest_block",
+                axum::routing::get(Self::handle_get_latest_block),
+            )
+            .route("/health", axum::routing::get(Self::handle_health))
             .with_state(Arc::new(self))
     }
 
@@ -162,10 +177,7 @@ impl RpcServer {
 
         let address_str = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-        // Remove "0x" prefix if present
-        let address_str = address_str.trim_start_matches("0x");
-
-        // Parse address
+        // Parse address (address_from_str handles "0x" prefix)
         let address = address_from_str(address_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
         // Get balance from account manager
@@ -201,9 +213,8 @@ impl RpcServer {
 
         let address_str = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-        // Parse address
-        let address = address_from_str(address_str.trim_start_matches("0x"))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        // Parse address (address_from_str handles "0x" prefix)
+        let address = address_from_str(address_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
         // Get nonce from account manager
         let state = state.state.lock().await;
@@ -383,9 +394,11 @@ impl RpcServer {
                 let tx_hash = keccak256(&tx_bytes);
                 let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
 
-                println!("✅ Transaction sent to Bitcoin DA");
-                println!("   Bitcoin TXID: {}", bitcoin_txid);
-                println!("   Core Lane TX Hash: {}", tx_hash_hex);
+                info!(
+                    bitcoin_txid = %bitcoin_txid,
+                    core_tx_hash = %tx_hash_hex,
+                    "Transaction sent to Bitcoin DA"
+                );
 
                 Ok(JsonResponse::from(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
@@ -1729,11 +1742,9 @@ impl RpcServer {
         let address_str = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
         let position_str = request.params[1].as_str().ok_or(StatusCode::BAD_REQUEST)?;
 
-        // Parse address and position
-        let _address = address_from_str(address_str.trim_start_matches("0x"))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let _position = B256::from_str(position_str.trim_start_matches("0x"))
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        // Parse address and position (both handle "0x" prefix)
+        let _address = address_from_str(address_str).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let _position = B256::from_str(position_str).map_err(|_| StatusCode::BAD_REQUEST)?;
 
         // Get storage value from account manager
         let _state = state.state.lock().await;
@@ -1865,10 +1876,108 @@ impl RpcServer {
             id: request.id,
         }))
     }
+
+    /// GET /get_raw_block/:block_number
+    /// Returns the raw Borsh-serialized StateManager for the specified block
+    async fn handle_get_raw_block(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        axum::extract::Path(block_number): axum::extract::Path<u64>,
+    ) -> Result<axum::response::Response, StatusCode> {
+        use std::fs;
+        use std::path::Path;
+
+        let blocks_dir = Path::new(&rpc_state.data_dir).join("blocks");
+        let block_file = blocks_dir.join(format!("{}", block_number));
+
+        if !block_file.exists() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
+        let bytes = fs::read(&block_file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Block-Number", block_number.to_string())
+            .body(axum::body::Body::from(bytes))
+            .unwrap())
+    }
+
+    /// GET /get_raw_block_delta/:block_number
+    /// Returns the raw Borsh-serialized BundleStateManager (delta) for the specified block
+    async fn handle_get_raw_block_delta(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        axum::extract::Path(block_number): axum::extract::Path<u64>,
+    ) -> Result<axum::response::Response, StatusCode> {
+        use std::fs;
+        use std::path::Path;
+
+        let deltas_dir = Path::new(&rpc_state.data_dir).join("deltas");
+        let delta_file = deltas_dir.join(format!("{}", block_number));
+
+        if !delta_file.exists() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
+        let bytes = fs::read(&delta_file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Block-Number", block_number.to_string())
+            .body(axum::body::Body::from(bytes))
+            .unwrap())
+    }
+
+    /// GET /get_latest_block
+    /// Returns the raw Borsh-serialized StateManager for the latest block
+    async fn handle_get_latest_block(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+    ) -> Result<axum::response::Response, StatusCode> {
+        use std::fs;
+        use std::path::Path;
+
+        let state = rpc_state.state.lock().await;
+        let latest_block = state.blocks.keys().max().copied().unwrap_or(0);
+        drop(state);
+
+        let blocks_dir = Path::new(&rpc_state.data_dir).join("blocks");
+        let block_file = blocks_dir.join(format!("{}", latest_block));
+
+        if !block_file.exists() {
+            return Err(StatusCode::NOT_FOUND);
+        }
+
+        let bytes = fs::read(&block_file).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Block-Number", latest_block.to_string())
+            .body(axum::body::Body::from(bytes))
+            .unwrap())
+    }
+
+    /// GET /health
+    /// Simple health check endpoint
+    async fn handle_health(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+    ) -> Result<JsonResponse<serde_json::Value>, StatusCode> {
+        let state = rpc_state.state.lock().await;
+        let block_count = state.blocks.len();
+        let latest_block = state.blocks.keys().max().copied().unwrap_or(0);
+
+        Ok(JsonResponse(json!({
+            "status": "ok",
+            "block_count": block_count,
+            "latest_block": latest_block,
+            "last_processed_bitcoin_height": state.last_processed_bitcoin_height,
+        })))
+    }
 }
 
 // Helper function to parse Address from string
-pub fn from_str(s: &str) -> Result<Address, String> {
+pub fn parse_address(s: &str) -> Result<Address, String> {
     // Handle both with and without 0x prefix
     let s = s.trim_start_matches("0x");
 
@@ -1888,4 +1997,4 @@ pub fn from_str(s: &str) -> Result<Address, String> {
 }
 
 // Re-export for use in main.rs
-pub use from_str as address_from_str;
+pub use parse_address as address_from_str;
