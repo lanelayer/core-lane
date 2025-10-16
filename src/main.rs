@@ -23,16 +23,13 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod account;
-mod bitcoin_block;
-mod bitcoin_cache_rpc;
-mod block;
-mod cmio;
-mod intents;
+// Import modules from the library
+use core_lane::{
+    bitcoin_block, bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, transaction,
+};
+
+// RPC module is specific to the binary (depends on CoreLaneState)
 mod rpc;
-mod state;
-mod taproot_da;
-mod transaction;
 
 #[cfg(test)]
 mod tests;
@@ -47,19 +44,6 @@ use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
 use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
-
-fn parse_b256(hex_input: &str) -> Option<B256> {
-    let raw = hex_input.trim_start_matches("0x");
-    if raw.len() != 64 {
-        return None;
-    }
-    let mut buf = [0u8; 32];
-    if hex::decode_to_slice(raw, &mut buf).is_ok() {
-        Some(B256::from_slice(&buf))
-    } else {
-        None
-    }
-}
 
 /// Helper function to construct wallet database path
 fn wallet_db_path(data_dir: &str, network: &str) -> String {
@@ -420,6 +404,7 @@ struct CoreLaneState {
 }
 
 impl CoreLaneState {
+    #[allow(dead_code)]
     pub fn bitcoin_client_read(&self) -> Arc<Client> {
         self.bitcoin_client_read.clone()
     }
@@ -427,114 +412,6 @@ impl CoreLaneState {
     #[allow(dead_code)]
     pub fn bitcoin_client_write(&self) -> Arc<Client> {
         self.bitcoin_client_write.clone()
-    }
-
-    pub fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage> {
-        match message {
-            CmioMessage::QueryCommandType { intent_id } => {
-                let intent_id_b256 = match parse_b256(&intent_id) {
-                    Some(id) => id,
-                    None => {
-                        warn!(
-                            "Invalid intent_id for QueryCommandType (expect 32-byte hex): {:?}",
-                            intent_id
-                        );
-                        return None;
-                    }
-                };
-                self.account_manager
-                    .get_intent(&intent_id_b256)
-                    .map(|intent| CmioMessage::CommandTypeResponse {
-                        command_type: intent.last_command,
-                        success: true,
-                    })
-            }
-            CmioMessage::ReadIntentData { intent_id } => {
-                let intent_id_b256 = match parse_b256(&intent_id) {
-                    Some(id) => id,
-                    None => {
-                        warn!(
-                            "Invalid intent_id for ReadIntentData (expect 32-byte hex): {:?}",
-                            intent_id
-                        );
-                        return Some(CmioMessage::IntentDataResponse {
-                            data_hex: "0x".to_string(),
-                            success: false,
-                        });
-                    }
-                };
-                if let Some(intent) = self.account_manager.get_intent(&intent_id_b256) {
-                    Some(CmioMessage::IntentDataResponse {
-                        data_hex: format!("0x{}", hex::encode(&intent.data)),
-                        success: true,
-                    })
-                } else {
-                    Some(CmioMessage::IntentDataResponse {
-                        data_hex: "0x".to_string(),
-                        success: false,
-                    })
-                }
-            }
-            CmioMessage::ReadBlobInfo { blob_hash_hex } => {
-                let blob_hash = match parse_b256(&blob_hash_hex) {
-                    Some(h) => h,
-                    None => {
-                        warn!(
-                            "Invalid blob_hash_hex for ReadBlobInfo (expect 32-byte hex): {:?}",
-                            blob_hash_hex
-                        );
-                        return Some(CmioMessage::BlobInfoResponse {
-                            length: 0,
-                            success: false,
-                        });
-                    }
-                };
-                if let Some(data) = self.account_manager.get_blob(&blob_hash) {
-                    Some(CmioMessage::BlobInfoResponse {
-                        length: data.len() as u64,
-                        success: true,
-                    })
-                } else {
-                    Some(CmioMessage::BlobInfoResponse {
-                        length: 0,
-                        success: false,
-                    })
-                }
-            }
-
-            CmioMessage::ReadBlob { blob_hash_hex } => {
-                let blob_hash = match parse_b256(&blob_hash_hex) {
-                    Some(h) => h,
-                    None => {
-                        warn!(
-                            "Invalid blob_hash_hex for ReadBlob (expect 32-byte hex): {:?}",
-                            blob_hash_hex
-                        );
-                        return Some(CmioMessage::BlobResponse {
-                            data_hex: "0x".to_string(),
-                            success: false,
-                        });
-                    }
-                };
-                if let Some(data) = self.account_manager.get_blob(&blob_hash) {
-                    Some(CmioMessage::BlobResponse {
-                        data_hex: format!("0x{}", hex::encode(data)),
-                        success: true,
-                    })
-                } else {
-                    Some(CmioMessage::BlobResponse {
-                        data_hex: "0x".to_string(),
-                        success: false,
-                    })
-                }
-            }
-            CmioMessage::Log { message } => {
-                tracing::info!(target = "cmio", "CM LOG: {}", message);
-                None
-            }
-            CmioMessage::Exit { .. } => None,
-            _ => None,
-        }
     }
 
     /// Rollback state to the specified Core Lane block number
@@ -658,6 +535,25 @@ impl CoreLaneState {
             target_block, bitcoin_height
         );
         Ok(())
+    }
+}
+
+impl transaction::ProcessingContext for CoreLaneState {
+    fn state_manager(&self) -> &state::StateManager {
+        &self.account_manager
+    }
+
+    fn state_manager_mut(&mut self) -> &mut state::StateManager {
+        &mut self.account_manager
+    }
+
+    fn bitcoin_client_read(&self) -> Arc<Client> {
+        self.bitcoin_client_read.clone()
+    }
+
+    fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage> {
+        // Use the shared CMIO handler from the cmio module
+        cmio::handle_cmio_query(message, &self.account_manager)
     }
 }
 
@@ -1146,7 +1042,24 @@ impl CoreLaneNode {
         }
 
         // Execute transaction with bundle state
-        let _execution_result = execute_transaction(&tx.0, tx.1, bundle_state, &mut state);
+        let execution_result = match execute_transaction(&tx.0, tx.1, bundle_state, &mut *state) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("      ⚠️  Transaction execution failed with error: {}", e);
+                // Return None to skip this transaction
+                return None;
+            }
+        };
+
+        // Log execution outcome
+        if execution_result.success {
+            info!("      ✅ Transaction executed successfully");
+        } else {
+            warn!(
+                "      ⚠️  Transaction execution failed: {:?}",
+                execution_result.error
+            );
+        }
 
         // XXX add gas refund later
 
@@ -1168,11 +1081,16 @@ impl CoreLaneNode {
             transaction_index: tx_number,
             from: format!("0x{}", hex::encode(tx.1.as_slice())),
             to: None, // Will be set based on transaction type
-            cumulative_gas_used: "0x0".to_string(),
-            gas_used: "0x0".to_string(),
+            cumulative_gas_used: format!("0x{:x}", execution_result.gas_used),
+            gas_used: format!("0x{:x}", execution_result.gas_used),
             contract_address: None,
-            logs: Vec::new(),
-            status: "0x1".to_string(), // Success
+            logs: execution_result.logs.clone(),
+            status: if execution_result.success {
+                "0x1"
+            } else {
+                "0x0"
+            }
+            .to_string(),
             effective_gas_price: format!("0x{}", hex::encode(gas_price.to_be_bytes_vec())),
             tx_type: match &tx.0 {
                 TxEnvelope::Legacy(_) => "0x0".to_string(),

@@ -4,7 +4,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Core Lane account structure
-#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
 pub struct CoreLaneAccount {
     pub balance: U256,
     pub nonce: U256,
@@ -12,10 +12,7 @@ pub struct CoreLaneAccount {
 
 impl CoreLaneAccount {
     pub fn new() -> Self {
-        Self {
-            balance: U256::ZERO,
-            nonce: U256::ZERO,
-        }
+        Self::default()
     }
 
     #[allow(dead_code)]
@@ -29,7 +26,7 @@ impl CoreLaneAccount {
     pub fn increment_nonce(&mut self) -> Result<()> {
         self.nonce = self
             .nonce
-            .checked_add(U256::from(1))
+            .checked_add(U256::ONE)
             .ok_or_else(|| anyhow!("Nonce overflow"))?;
         Ok(())
     }

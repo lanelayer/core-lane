@@ -1,25 +1,24 @@
 use crate::cmio::CmioMessage;
 use crate::intents::{
     decode_intent_calldata, Intent, IntentCall, IntentCommandType, IntentData, IntentStatus,
+    IntentType, RiscVProgramIntent,
 };
-use crate::intents::{IntentType, RiscVProgramIntent};
-use crate::state::BundleStateManager;
-use crate::CoreLaneState;
-use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
-use cartesi_machine::config::runtime::RuntimeConfig;
-use cartesi_machine::machine::Machine;
-use cartesi_machine::types::cmio::CmioResponseReason;
+use crate::state::{BundleStateManager, StateManager};
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
+use bitcoincore_rpc::Client;
 use bitcoincore_rpc::RpcApi;
-use cartesi_machine::types::cmio::AutomaticReason;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
 use cartesi_machine::types::cmio::CmioRequest;
-use cartesi_machine::types::cmio::ManualReason;
+use cartesi_machine::types::cmio::{AutomaticReason, CmioResponseReason, ManualReason};
+use cartesi_machine::Machine;
 use ciborium::into_writer;
 use std::str::FromStr;
+use std::sync::Arc;
 use tracing::info;
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
@@ -34,13 +33,22 @@ pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
 }
 
 /// Get the transaction nonce
-fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
+pub fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
     match tx {
         TxEnvelope::Legacy(signed) => signed.tx().nonce,
         TxEnvelope::Eip1559(signed) => signed.tx().nonce,
         TxEnvelope::Eip2930(signed) => signed.tx().nonce,
         _ => 0,
     }
+}
+
+/// Trait for contexts that can process transactions
+/// This allows both the node (CoreLaneState) and external sequencers to process transactions
+pub trait ProcessingContext {
+    fn state_manager(&self) -> &StateManager;
+    fn state_manager_mut(&mut self) -> &mut StateManager;
+    fn bitcoin_client_read(&self) -> Arc<Client>;
+    fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage>;
 }
 
 /// Core Lane specific addresses for special operations
@@ -79,11 +87,11 @@ pub struct ExecutionResult {
 }
 
 /// Execute a Core Lane transaction
-pub fn execute_transaction(
+pub fn execute_transaction<T: ProcessingContext>(
     tx: &TxEnvelope,
     sender: Address,
     bundle_state: &mut BundleStateManager,
-    state: &mut CoreLaneState,
+    state: &mut T,
 ) -> Result<ExecutionResult> {
     execute_transfer(tx, sender, bundle_state, state)
 }
@@ -151,18 +159,18 @@ fn get_transaction_to(tx: &TxEnvelope) -> Option<Address> {
 }
 
 /// Execute transfer operation
-fn execute_transfer(
+fn execute_transfer<T: ProcessingContext>(
     tx: &TxEnvelope,
     sender: Address,
     bundle_state: &mut BundleStateManager,
-    state: &mut CoreLaneState,
+    state: &mut T,
 ) -> Result<ExecutionResult> {
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
 
     // Validate nonce to prevent replay attacks and ensure transaction ordering
     let tx_nonce = get_transaction_nonce(tx);
-    let expected_nonce = bundle_state.get_nonce(&state.account_manager, sender);
+    let expected_nonce = bundle_state.get_nonce(state.state_manager(), sender);
 
     if U256::from(tx_nonce) != expected_nonce {
         return Ok(ExecutionResult {
@@ -212,7 +220,7 @@ fn execute_transfer(
         match decode_intent_calldata(&input) {
             Some(IntentCall::StoreBlob { data, .. }) => {
                 let blob_hash = keccak256(&data);
-                if bundle_state.contains_blob(&state.account_manager, &blob_hash) {
+                if bundle_state.contains_blob(state.state_manager(), &blob_hash) {
                     return Ok(ExecutionResult {
                         success: true,
                         gas_used,
@@ -223,7 +231,7 @@ fn execute_transfer(
                     });
                 }
                 bundle_state.insert_blob(blob_hash, data.clone());
-                if let Err(e) = bundle_state.increment_nonce(&state.account_manager, sender) {
+                if let Err(e) = bundle_state.increment_nonce(state.state_manager(), sender) {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -266,7 +274,7 @@ fn execute_transfer(
                 extra_data,
                 ..
             }) => {
-                if !bundle_state.contains_blob(&state.account_manager, &blob_hash) {
+                if !bundle_state.contains_blob(state.state_manager(), &blob_hash) {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -277,7 +285,7 @@ fn execute_transfer(
                     });
                 }
 
-                if bundle_state.get_balance(&state.account_manager, sender) < value {
+                if bundle_state.get_balance(state.state_manager(), sender) < value {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -292,9 +300,25 @@ fn execute_transfer(
                 preimage.extend_from_slice(blob_hash.as_slice());
                 preimage.extend_from_slice(&extra_data);
 
-                bundle_state.sub_balance(&state.account_manager, sender, value)?;
-                bundle_state.increment_nonce(&state.account_manager, sender)?;
-                let value_u64: u64 = value.try_into().unwrap();
+                // Safely convert value to u64 - reject if too large
+                let value_u64: u64 = match u64::try_from(value) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec![
+                                "intentFromBlob: value exceeds u64::MAX (18.4 ETH)".to_string()
+                            ],
+                            error: Some("Value too large for intent".to_string()),
+                        });
+                    }
+                };
+
+                bundle_state.sub_balance(state.state_manager(), sender, value)?;
+                bundle_state.increment_nonce(state.state_manager(), sender)?;
                 let intent_id = calculate_intent_id(sender, nonce, Bytes::from(preimage));
                 info!("Calculated intent id: {:?}", intent_id);
                 bundle_state.insert_intent(
@@ -322,7 +346,7 @@ fn execute_transfer(
             }
             Some(IntentCall::Intent { intent_data, .. }) => {
                 // Explicit intent submission via ABI: use the intent payload for ID
-                if bundle_state.get_balance(&state.account_manager, sender) < value {
+                if bundle_state.get_balance(state.state_manager(), sender) < value {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -332,9 +356,24 @@ fn execute_transfer(
                         error: Some("Insufficient balance".to_string()),
                     });
                 }
-                bundle_state.sub_balance(&state.account_manager, sender, value)?;
-                bundle_state.increment_nonce(&state.account_manager, sender)?;
-                let value_u64: u64 = value.try_into().unwrap_or(u64::MAX);
+
+                // Safely convert value to u64 - reject if too large
+                let value_u64: u64 = match u64::try_from(value) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["intent: value exceeds u64::MAX (18.4 ETH)".to_string()],
+                            error: Some("Value too large for intent".to_string()),
+                        });
+                    }
+                };
+
+                bundle_state.sub_balance(state.state_manager(), sender, value)?;
+                bundle_state.increment_nonce(state.state_manager(), sender)?;
                 let intent_id =
                     calculate_intent_id(sender, nonce, Bytes::from(intent_data.clone()));
                 bundle_state.insert_intent(
@@ -357,7 +396,7 @@ fn execute_transfer(
                 });
             }
             Some(IntentCall::IsIntentSolved { intent_id }) => {
-                let solved = match bundle_state.get_intent(&state.account_manager, &intent_id) {
+                let solved = match bundle_state.get_intent(state.state_manager(), &intent_id) {
                     Some(intent) => matches!(intent.status, IntentStatus::Solved),
                     None => false,
                 };
@@ -375,15 +414,14 @@ fn execute_transfer(
                 });
             }
             Some(IntentCall::LockIntentForSolving { intent_id, .. }) => {
-                if let Some(intent) =
-                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                if let Some(intent) = bundle_state.get_intent_mut(state.state_manager(), &intent_id)
                 {
                     match intent.status {
                         IntentStatus::Submitted => {
                             intent.status = IntentStatus::Locked(sender);
                             intent.last_command = IntentCommandType::LockIntentForSolving;
                             if let Err(e) =
-                                bundle_state.increment_nonce(&state.account_manager, sender)
+                                bundle_state.increment_nonce(state.state_manager(), sender)
                             {
                                 return Ok(ExecutionResult {
                                     success: false,
@@ -450,7 +488,7 @@ fn execute_transfer(
                     data[..8].try_into().expect("data must be at least 8 bytes"),
                 );
 
-                if let Some(intent) = bundle_state.get_intent(&state.account_manager, &intent_id) {
+                if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id) {
                     if !matches!(intent.status, IntentStatus::Locked(_)) {
                         return Ok(ExecutionResult {
                             success: false,
@@ -473,7 +511,7 @@ fn execute_transfer(
                 }
                 // Branch by intent type: AnchorBitcoinFill requires L1 verification, RiscVProgram does not
                 let current_intent =
-                    match bundle_state.get_intent(&state.account_manager, &intent_id) {
+                    match bundle_state.get_intent(state.state_manager(), &intent_id) {
                         Some(i) => i,
                         None => {
                             info!("solveIntent: intent disappeared");
@@ -494,22 +532,22 @@ fn execute_transfer(
                             Ok(true) => {
                                 // Extract intent value first to avoid borrow checker issues
                                 let intent_value = bundle_state
-                                    .get_intent(&state.account_manager, &intent_id)
+                                    .get_intent(state.state_manager(), &intent_id)
                                     .ok_or_else(|| anyhow!("Intent disappeared"))?
                                     .value;
                                 bundle_state.add_balance(
-                                    &state.account_manager,
+                                    state.state_manager(),
                                     sender,
                                     U256::from(intent_value),
                                 )?;
 
                                 if let Some(intent) =
-                                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                                    bundle_state.get_intent_mut(state.state_manager(), &intent_id)
                                 {
                                     intent.status = IntentStatus::Solved;
                                     intent.last_command = IntentCommandType::SolveIntent;
                                     if let Err(e) =
-                                        bundle_state.increment_nonce(&state.account_manager, sender)
+                                        bundle_state.increment_nonce(state.state_manager(), sender)
                                     {
                                         return Ok(ExecutionResult {
                                             success: false,
@@ -566,20 +604,20 @@ fn execute_transfer(
                     }
                     IntentType::RiscVProgram => {
                         let intent_value = bundle_state
-                            .get_intent(&state.account_manager, &intent_id)
+                            .get_intent(state.state_manager(), &intent_id)
                             .ok_or_else(|| anyhow!("Intent disappeared"))?
                             .value;
                         bundle_state.add_balance(
-                            &state.account_manager,
+                            state.state_manager(),
                             sender,
                             U256::from(intent_value),
                         )?;
                         if let Some(intent) =
-                            bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                            bundle_state.get_intent_mut(state.state_manager(), &intent_id)
                         {
                             intent.status = IntentStatus::Solved;
                             intent.last_command = IntentCommandType::SolveIntent;
-                            bundle_state.increment_nonce(&state.account_manager, sender)?;
+                            bundle_state.increment_nonce(state.state_manager(), sender)?;
                             run_intent_for(bundle_state, state, intent_id)?;
                         }
                         return Ok(ExecutionResult {
@@ -595,8 +633,7 @@ fn execute_transfer(
             }
             Some(IntentCall::CancelIntent { intent_id, .. }) => {
                 let (creator, value) = {
-                    if let Some(intent) =
-                        bundle_state.get_intent(&state.account_manager, &intent_id)
+                    if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id)
                     {
                         if matches!(intent.status, IntentStatus::Solved) {
                             return Ok(ExecutionResult {
@@ -632,14 +669,14 @@ fn execute_transfer(
                 };
                 {
                     let intent = bundle_state
-                        .get_intent_mut(&state.account_manager, &intent_id)
+                        .get_intent_mut(state.state_manager(), &intent_id)
                         .unwrap();
 
                     intent.status = IntentStatus::Cancelled;
                     intent.last_command = IntentCommandType::CancelIntent;
                 }
-                bundle_state.add_balance(&state.account_manager, creator, U256::from(value))?;
-                bundle_state.increment_nonce(&state.account_manager, sender)?;
+                bundle_state.add_balance(state.state_manager(), creator, U256::from(value))?;
+                bundle_state.increment_nonce(state.state_manager(), sender)?;
 
                 return Ok(ExecutionResult {
                     success: true,
@@ -651,8 +688,7 @@ fn execute_transfer(
                 });
             }
             Some(IntentCall::CancelIntentLock { intent_id, .. }) => {
-                if let Some(intent) =
-                    bundle_state.get_intent_mut(&state.account_manager, &intent_id)
+                if let Some(intent) = bundle_state.get_intent_mut(state.state_manager(), &intent_id)
                 {
                     match intent.status {
                         IntentStatus::Locked(locker) => {
@@ -668,7 +704,7 @@ fn execute_transfer(
                             }
                             intent.status = IntentStatus::Submitted;
                             intent.last_command = IntentCommandType::CancelIntentLock;
-                            bundle_state.increment_nonce(&state.account_manager, sender)?;
+                            bundle_state.increment_nonce(state.state_manager(), sender)?;
                             return Ok(ExecutionResult {
                                 success: true,
                                 gas_used,
@@ -712,7 +748,7 @@ fn execute_transfer(
         }
     }
 
-    if bundle_state.get_balance(&state.account_manager, sender) < value {
+    if bundle_state.get_balance(state.state_manager(), sender) < value {
         return Ok(ExecutionResult {
             success: false,
             gas_used,
@@ -723,9 +759,9 @@ fn execute_transfer(
         });
     }
 
-    bundle_state.sub_balance(&state.account_manager, sender, value)?;
-    bundle_state.add_balance(&state.account_manager, to, value)?;
-    bundle_state.increment_nonce(&state.account_manager, sender)?;
+    bundle_state.sub_balance(state.state_manager(), sender, value)?;
+    bundle_state.add_balance(state.state_manager(), to, value)?;
+    bundle_state.increment_nonce(state.state_manager(), sender)?;
 
     Ok(ExecutionResult {
         success: true,
@@ -748,8 +784,8 @@ fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
     keccak256(preimage)
 }
 
-fn verify_intent_fill_on_bitcoin(
-    state: &crate::CoreLaneState,
+fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
+    state: &T,
     intent_id: B256,
     block_number: u64,
 ) -> Result<bool> {
@@ -757,7 +793,7 @@ fn verify_intent_fill_on_bitcoin(
 
     let network = bitcoin::Network::Regtest;
     let intent = state
-        .account_manager
+        .state_manager()
         .get_intent(&intent_id)
         .ok_or_else(|| anyhow!("Intent not found for verification"))?;
     let cbor_intent = IntentData::from_cbor(&intent.data)?;
@@ -804,7 +840,10 @@ fn verify_intent_fill_on_bitcoin(
     Ok(false)
 }
 
-fn run_intent_with_image(state: &mut CoreLaneState, program_blob: Option<Vec<u8>>) -> Result<()> {
+fn run_intent_with_image<T: ProcessingContext>(
+    state: &mut T,
+    program_blob: Option<Vec<u8>>,
+) -> Result<()> {
     let mut machine = Machine::create(
         &MachineConfig::new_with_ram(RAMConfig {
             length: 134217728,
@@ -863,18 +902,18 @@ fn run_intent_with_image(state: &mut CoreLaneState, program_blob: Option<Vec<u8>
     Ok(())
 }
 
-fn run_intent_for(
+fn run_intent_for<T: ProcessingContext>(
     bundle_state: &mut BundleStateManager,
-    state: &mut CoreLaneState,
+    state: &mut T,
     intent_id: B256,
 ) -> Result<()> {
     let mut program_blob: Option<Vec<u8>> = None;
-    if let Some(intent) = bundle_state.get_intent(&state.account_manager, &intent_id) {
+    if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id) {
         if let Ok(intent_data) = IntentData::from_cbor(&intent.data) {
             if intent_data.intent_type == crate::intents::IntentType::RiscVProgram {
                 if let Ok(prog) = intent_data.parse_riscv_program() {
                     let blob_hash = B256::from_slice(&prog.blob_hash);
-                    if let Some(bytes) = state.account_manager.get_blob(&blob_hash) {
+                    if let Some(bytes) = state.state_manager().get_blob(&blob_hash) {
                         bundle_state.insert_blob(blob_hash, bytes.clone());
                         program_blob = Some(bytes.clone());
                     }
