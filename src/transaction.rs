@@ -484,9 +484,21 @@ fn execute_transfer<T: ProcessingContext>(
                 }
             }
             Some(IntentCall::SolveIntent { intent_id, data }) => {
+                // Parse block height (u64, 8 bytes) and txid (32 bytes)
+                if data.len() < 40 {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["solveIntent: data must contain block_height (8 bytes) and txid (32 bytes)".to_string()],
+                        error: Some("Invalid solve data length".to_string()),
+                    });
+                }
                 let block_number = u64::from_le_bytes(
                     data[..8].try_into().expect("data must be at least 8 bytes"),
                 );
+                let txid_bytes: [u8; 32] = data[8..40].try_into().expect("txid must be 32 bytes");
 
                 if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id) {
                     if !matches!(intent.status, IntentStatus::Locked(_)) {
@@ -525,10 +537,15 @@ fn execute_transfer<T: ProcessingContext>(
                             });
                         }
                     };
-                let cbor_intent = IntentData::from_cbor(&current_intent.data)?;
+                let cbor_intent: IntentData = IntentData::from_cbor(&current_intent.data)?;
                 match cbor_intent.intent_type {
                     IntentType::AnchorBitcoinFill => {
-                        match verify_intent_fill_on_bitcoin(state, intent_id, block_number) {
+                        match verify_intent_fill_on_bitcoin(
+                            state,
+                            intent_id,
+                            block_number,
+                            txid_bytes,
+                        ) {
                             Ok(true) => {
                                 // Extract intent value first to avoid borrow checker issues
                                 let intent_value = bundle_state
@@ -788,6 +805,7 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     state: &T,
     intent_id: B256,
     block_number: u64,
+    txid_bytes: [u8; 32],
 ) -> Result<bool> {
     let client = state.bitcoin_client_read();
 
@@ -806,37 +824,73 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     };
     let expected_amount_u256 = fill.amount;
 
-    let hash = client.get_block_hash(block_number).unwrap();
-    let block = client.get_block(&hash)?;
+    // Convert block height to hash
+    let block_hash = client.get_block_hash(block_number)?;
+
+    // Convert txid bytes to Txid (note: Bitcoin txids are in internal byte order)
+    use bitcoin::hashes::{sha256d, Hash};
+    let txid = bitcoin::Txid::from_raw_hash(sha256d::Hash::from_byte_array(txid_bytes));
+
+    info!(
+        "Verifying intent {} with txid {} in block {}",
+        intent_id, txid, block_number
+    );
+
+    // Get the raw transaction - include the block hash to verify it's in the specified block
+    let tx_info = client.get_raw_transaction_info(&txid, Some(&block_hash))?;
+
+    // Verify the transaction is in the correct block
+    if let Some(tx_block_hash) = tx_info.blockhash {
+        if tx_block_hash != block_hash {
+            info!("Transaction {} not in expected block", txid);
+            return Ok(false);
+        }
+    } else {
+        info!("Transaction {} not confirmed in any block", txid);
+        return Ok(false);
+    }
+
+    let tx = &tx_info
+        .transaction()
+        .map_err(|e| anyhow!("Failed to decode transaction: {}", e))?;
     let tag = intent_id.as_slice();
-    for tx in block.txdata.iter() {
-        // We expect exactly two outputs: one payment and one OP_RETURN with the intent id
-        if tx.output.len() == 2 {
-            let mut has_correct_payment = false;
-            let mut has_matching_tag = false;
-            for out in &tx.output {
-                // Check payment output to the expected address with exact amount
-                if out.script_pubkey == dest_script {
-                    let out_amount_u256 = U256::from(out.value.to_sat());
-                    has_correct_payment = out_amount_u256 == expected_amount_u256;
-                } else if out.script_pubkey.is_op_return() {
-                    // Check the OP_RETURN output contains the intent id bytes
-                    let script = out.script_pubkey.as_bytes();
-                    if script.len() >= 2 {
-                        let data = &script[2..];
-                        let tag_found = data.windows(tag.len()).any(|window| window == tag);
-                        if tag_found {
-                            has_matching_tag = true;
-                        }
+
+    // We expect exactly two outputs: one payment and one OP_RETURN with the intent id
+    if tx.output.len() == 2 {
+        let mut has_correct_payment = false;
+        let mut has_matching_tag = false;
+
+        for out in &tx.output {
+            // Check payment output to the expected address with exact amount
+            if out.script_pubkey == dest_script {
+                let out_amount_u256 = U256::from(out.value.to_sat());
+                has_correct_payment = out_amount_u256 == expected_amount_u256;
+            } else if out.script_pubkey.is_op_return() {
+                // Check the OP_RETURN output contains the intent id bytes
+                let script = out.script_pubkey.as_bytes();
+                if script.len() >= 2 {
+                    let data = &script[2..];
+                    let tag_found = data.windows(tag.len()).any(|window| window == tag);
+                    if tag_found {
+                        has_matching_tag = true;
                     }
                 }
             }
+        }
 
-            if has_correct_payment && has_matching_tag {
-                return Ok(true);
-            }
+        if has_correct_payment && has_matching_tag {
+            info!(
+                "Intent {} verified successfully in transaction {}",
+                intent_id, txid
+            );
+            return Ok(true);
         }
     }
+
+    info!(
+        "Intent {} verification failed for transaction {}",
+        intent_id, txid
+    );
     Ok(false)
 }
 
