@@ -28,6 +28,7 @@ mod bitcoin_block;
 mod bitcoin_cache_rpc;
 mod block;
 mod cmio;
+mod eip1559;
 mod intents;
 mod rpc;
 mod state;
@@ -321,7 +322,7 @@ impl CoreLaneBlock {
             transaction_count: 0,
             gas_used: U256::ZERO,
             gas_limit: U256::from(30_000_000u64), // 30M gas limit
-            base_fee_per_gas: Some(U256::from(1_000_000_000u64)), // 1 gwei
+            base_fee_per_gas: Some(U256::from(1_000_000_000u64)), // 1 gwei - will be updated dynamically
             difficulty: U256::from(1u64),
             total_difficulty: U256::from(number),
             extra_data,
@@ -417,6 +418,9 @@ struct CoreLaneState {
     bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
     #[allow(dead_code)]
     bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
+    eip1559_fee_manager: eip1559::Eip1559FeeManager, // EIP-1559 fee management
+    sequencer_address: Address, // Address that receives priority fees
+    total_burned_amount: U256, // Total amount burned from base fees
 }
 
 impl CoreLaneState {
@@ -701,6 +705,9 @@ impl CoreLaneNode {
             genesis_block: genesis_block.clone(),
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
+            eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+            sequencer_address: Address::from([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]), // Sequencer address
+            total_burned_amount: U256::ZERO,
         }));
 
         // Write genesis state to disk
@@ -835,6 +842,31 @@ impl CoreLaneNode {
     ) -> Result<()> {
         let mut state = self.state.lock().await;
 
+        // Calculate total gas used from transactions
+        let total_gas_used = transactions.iter()
+            .map(|(_stored_tx, receipt, _tx_hash)| {
+                U256::from_str(&receipt.gas_used).unwrap_or(U256::ZERO)
+            })
+            .sum::<U256>();
+
+        // Update block gas usage
+        new_block.gas_used = total_gas_used;
+
+        // Calculate and update base fee for this block using EIP-1559
+        let new_base_fee = state.eip1559_fee_manager.update_base_fee(
+            new_block.number,
+            total_gas_used
+        );
+        new_block.base_fee_per_gas = Some(new_base_fee);
+
+        info!(
+            "⛽ Block {} gas usage: {} / {} (base fee: {} gwei)",
+            new_block.number,
+            total_gas_used,
+            new_block.gas_limit,
+            new_base_fee / U256::from(1_000_000_000u64) // Convert to gwei
+        );
+
         // Update state root, receipts root, etc.
         new_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
         new_block.receipts_root = B256::from_slice(&[0u8; 32]); // Simplified for now
@@ -853,8 +885,10 @@ impl CoreLaneNode {
         // Transactions and receipts are already in bundle state and applied via apply_changes.
 
         info!(
-            "✅ Finalized Core Lane block {} with {} transactions",
-            new_block.number, new_block.transaction_count
+            "✅ Finalized Core Lane block {} with {} transactions (base fee: {} gwei)",
+            new_block.number,
+            new_block.transaction_count,
+            new_base_fee / U256::from(1_000_000_000u64)
         );
         state.current_block = Some(new_block);
         Ok(())
@@ -1106,43 +1140,77 @@ impl CoreLaneNode {
         block_number: u64,
         tx_number: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
-        let gas_price = U256::from(214285714u64);
-
         let mut state = self.state.lock().await;
+        let gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
 
-        //  Transaction size ≈ 150 byte
-        // Fee rate = 3 sats/vbyte
-        // Conversion rate: 1 sat = 10¹⁰ wei
-        // Gas cost for comparable tx: 21,000 gas = 150 bytes
-        //
+        // Handle EIP-1559 transactions with proper fee calculation and burning
         if tx.0.is_eip1559() {
-            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
-                warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
+            let eip1559_tx = tx.0.as_eip1559().unwrap();
+            let max_fee_per_gas = eip1559_tx.tx().max_fee_per_gas;
+            let max_priority_fee_per_gas = eip1559_tx.tx().max_priority_fee_per_gas;
+
+            // Validate EIP-1559 transaction
+            if let Err(e) = state.eip1559_fee_manager.validate_eip1559_transaction(
+                U256::from(max_fee_per_gas),
+                U256::from(max_priority_fee_per_gas),
+                gas_limit,
+            ) {
+                warn!("      ⚠️  EIP-1559 transaction validation failed: {}, skipping: {:?}", e, tx.0);
                 return None;
             }
+
+            // Calculate fee breakdown (total, base_fee_portion, priority_fee_portion)
+            let (total_fee, base_fee_portion, priority_fee_portion) =
+                state.eip1559_fee_manager.calculate_fee_breakdown(
+                    U256::from(max_fee_per_gas),
+                    U256::from(max_priority_fee_per_gas),
+                    gas_limit,
+                );
+
+            // Charge total fee from sender
+            if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, total_fee) {
+                warn!("      ⚠️  Failed to charge EIP-1559 fee: {}, skipping: {:?}", e, tx.0);
+                return None;
+            }
+
+            // ACTUAL BURNING: Base fee portion is destroyed from total supply
+            // We don't add it to any account - it's permanently removed
+            state.total_burned_amount += base_fee_portion;
+            info!("      🔥 BURNED base fee: {} wei (total burned: {} wei)", 
+                  base_fee_portion, state.total_burned_amount);
+
+            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer
+            if priority_fee_portion > U256::ZERO {
+                if let Err(e) = bundle_state.add_balance(&state.account_manager, state.sequencer_address, priority_fee_portion) {
+                    warn!("      ⚠️  Failed to pay sequencer priority fee: {}", e);
+                } else {
+                    info!("      💰 Paid sequencer priority fee: {} wei", priority_fee_portion);
+                }
+            }
+
+            info!("      💰 Total EIP-1559 fee charged: {} wei (base: {}, priority: {})",
+                  total_fee, base_fee_portion, priority_fee_portion);
+
         } else if tx.0.is_legacy() {
-            if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
+            // Legacy transaction handling (fallback to fixed gas price)
+            let gas_price = U256::from(214285714u64); // Fixed legacy gas price
+            let legacy_tx = tx.0.as_legacy().unwrap();
+
+            if gas_price > legacy_tx.tx().gas_price {
                 warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
                 return None;
             }
-        } else {
-            warn!(
-                "      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}",
-                tx.0
-            );
-            return None;
-        }
 
-        // Charge gas fee first from bundle state
-        let gas_fee = gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
-        if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
-            warn!(
-                "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
-                e
-            );
-            return None;
+            let gas_fee = gas_price * gas_limit;
+            if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
+                warn!("      ⚠️  Failed to charge legacy gas fee: {}, skipping: {:?}", e, tx.0);
+                return None;
+            }
+
+            info!("      💰 Charged legacy gas fee: {} wei", gas_fee);
         } else {
-            info!("      💰 Charged gas fee: {} wei", gas_fee);
+            warn!("      ⚠️  Unsupported transaction type, skipping: {:?}", tx.0);
+            return None;
         }
 
         // Execute transaction with bundle state
@@ -1162,6 +1230,23 @@ impl CoreLaneNode {
         // Create and store transaction receipt in bundle state
         let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
 
+        // Calculate effective gas price and gas used for receipt
+        let (effective_gas_price, gas_used) = if tx.0.is_eip1559() {
+            let eip1559_tx = tx.0.as_eip1559().unwrap();
+            let max_fee_per_gas = eip1559_tx.tx().max_fee_per_gas;
+            let max_priority_fee_per_gas = eip1559_tx.tx().max_priority_fee_per_gas;
+            let effective_price = state.eip1559_fee_manager.calculate_effective_gas_price(
+                U256::from(max_fee_per_gas),
+                U256::from(max_priority_fee_per_gas),
+            );
+            (effective_price, gas_limit)
+        } else if tx.0.is_legacy() {
+            let legacy_tx = tx.0.as_legacy().unwrap();
+            (U256::from(legacy_tx.tx().gas_price), gas_limit)
+        } else {
+            (U256::from(214285714u64), gas_limit) // Default fallback
+        };
+
         let receipt = TransactionReceipt {
             transaction_hash: tx_hash.clone(),
             block_number,
@@ -1169,11 +1254,11 @@ impl CoreLaneNode {
             from: format!("0x{}", hex::encode(tx.1.as_slice())),
             to: None, // Will be set based on transaction type
             cumulative_gas_used: "0x0".to_string(),
-            gas_used: "0x0".to_string(),
+            gas_used: format!("0x{:x}", gas_used),
             contract_address: None,
             logs: Vec::new(),
             status: "0x1".to_string(), // Success
-            effective_gas_price: format!("0x{}", hex::encode(gas_price.to_be_bytes_vec())),
+            effective_gas_price: format!("0x{:x}", effective_gas_price),
             tx_type: match &tx.0 {
                 TxEnvelope::Legacy(_) => "0x0".to_string(),
                 TxEnvelope::Eip2930(_) => "0x1".to_string(),
