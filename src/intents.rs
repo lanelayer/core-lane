@@ -5,6 +5,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use ciborium::de::from_reader;
 use ciborium::into_writer;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 sol! {
     #[allow(missing_docs)]
@@ -212,6 +213,10 @@ pub enum IntentCall {
 
 fn extract_selector(calldata: &[u8]) -> Option<[u8; 4]> {
     if calldata.len() < 4 {
+        debug!(
+            "⚠️  Calldata too short to extract selector: {} bytes",
+            calldata.len()
+        );
         return None;
     }
     Some([calldata[0], calldata[1], calldata[2], calldata[3]])
@@ -326,7 +331,14 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
                 intent_id: B256::from_slice(call.intentId.as_slice()),
             })
         }
-        _ => None,
+        _ => {
+            debug!(
+                "⚠️  Unknown intent selector: 0x{} (calldata: {} bytes)",
+                hex::encode(selector),
+                calldata.len()
+            );
+            None
+        }
     }
 }
 
