@@ -19,7 +19,7 @@ use cartesi_machine::Machine;
 use ciborium::into_writer;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
 pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
@@ -320,7 +320,10 @@ fn execute_transfer<T: ProcessingContext>(
                 bundle_state.sub_balance(state.state_manager(), sender, value)?;
                 bundle_state.increment_nonce(state.state_manager(), sender)?;
                 let intent_id = calculate_intent_id(sender, nonce, Bytes::from(preimage));
-                info!("Calculated intent id: {:?}", intent_id);
+                info!(
+                    "📝 Intent created (from blob): intent_id = {}, creator = {:?}, value = {} wei",
+                    intent_id, sender, value_u64
+                );
                 bundle_state.insert_intent(
                     intent_id,
                     Intent {
@@ -376,6 +379,10 @@ fn execute_transfer<T: ProcessingContext>(
                 bundle_state.increment_nonce(state.state_manager(), sender)?;
                 let intent_id =
                     calculate_intent_id(sender, nonce, Bytes::from(intent_data.clone()));
+                info!(
+                    "📝 Intent created: intent_id = {}, creator = {:?}, value = {} wei",
+                    intent_id, sender, value_u64
+                );
                 bundle_state.insert_intent(
                     intent_id,
                     Intent {
@@ -798,7 +805,15 @@ fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
     preimage.extend_from_slice(sender.as_slice());
     preimage.extend_from_slice(&nonce.to_be_bytes());
     preimage.extend_from_slice(&input);
-    keccak256(preimage)
+    debug!(
+        "Calculating intent ID: sender={:?}, nonce={}, input_len={}",
+        sender,
+        nonce,
+        input.len()
+    );
+    let intent_id = keccak256(preimage);
+    debug!("Calculated intent_id: {:?}", intent_id);
+    intent_id
 }
 
 fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(

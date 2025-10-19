@@ -31,3 +31,9 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# External repositories
+external/
+
+# Filler bot wallet database
+*-wallet.db
