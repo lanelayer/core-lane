@@ -847,12 +847,26 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     let txid = bitcoin::Txid::from_raw_hash(sha256d::Hash::from_byte_array(txid_bytes));
 
     info!(
-        "Verifying intent {} with txid {} in block {}",
+        "Verifying intent {} with txid {} in Bitcoin block {}",
         intent_id, txid, block_number
     );
+    debug!("Expected block hash: {}", block_hash);
 
     // Get the raw transaction - include the block hash to verify it's in the specified block
-    let tx_info = client.get_raw_transaction_info(&txid, Some(&block_hash))?;
+    debug!(
+        "Calling get_raw_transaction_info for txid {} in block {}",
+        txid, block_hash
+    );
+    let tx_info = client
+        .get_raw_transaction_info(&txid, Some(&block_hash))
+        .map_err(|e| {
+            anyhow!(
+                "Failed to get transaction {} from block {}: {}",
+                txid,
+                block_number,
+                e
+            )
+        })?;
 
     // Verify the transaction is in the correct block
     if let Some(tx_block_hash) = tx_info.blockhash {
@@ -870,41 +884,74 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
         .map_err(|e| anyhow!("Failed to decode transaction: {}", e))?;
     let tag = intent_id.as_slice();
 
-    // We expect exactly two outputs: one payment and one OP_RETURN with the intent id
-    if tx.output.len() == 2 {
-        let mut has_correct_payment = false;
-        let mut has_matching_tag = false;
+    // We expect at least two outputs: one payment and one OP_RETURN with the intent id
+    // There may be a 3rd output for change
+    if tx.output.len() < 2 {
+        info!(
+            "Transaction {} has only {} output(s), need at least 2 (payment + OP_RETURN)",
+            txid,
+            tx.output.len()
+        );
+        return Ok(false);
+    }
 
-        for out in &tx.output {
-            // Check payment output to the expected address with exact amount
-            if out.script_pubkey == dest_script {
-                let out_amount_u256 = U256::from(out.value.to_sat());
-                has_correct_payment = out_amount_u256 == expected_amount_u256;
-            } else if out.script_pubkey.is_op_return() {
-                // Check the OP_RETURN output contains the intent id bytes
-                let script = out.script_pubkey.as_bytes();
-                if script.len() >= 2 {
-                    let data = &script[2..];
-                    let tag_found = data.windows(tag.len()).any(|window| window == tag);
-                    if tag_found {
-                        has_matching_tag = true;
-                    }
+    debug!("Transaction has {} outputs", tx.output.len());
+    let mut total_payment_amount = U256::ZERO;
+    let mut has_matching_tag = false;
+
+    for (idx, out) in tx.output.iter().enumerate() {
+        debug!(
+            "Output {}: {} sats, script_pubkey={}",
+            idx,
+            out.value.to_sat(),
+            hex::encode(out.script_pubkey.as_bytes())
+        );
+
+        // Accumulate amounts for all outputs to the expected destination address
+        if out.script_pubkey == dest_script {
+            let out_amount_u256 = U256::from(out.value.to_sat());
+            debug!(
+                "Found payment output to dest address: {} sats",
+                out_amount_u256
+            );
+            total_payment_amount += out_amount_u256;
+        } else if out.script_pubkey.is_op_return() {
+            // Check the OP_RETURN output contains the intent id bytes
+            let script = out.script_pubkey.as_bytes();
+            debug!("Found OP_RETURN output: {} bytes", script.len());
+            if script.len() >= 2 {
+                let data = &script[2..];
+                let tag_found = data.windows(tag.len()).any(|window| window == tag);
+                if tag_found {
+                    debug!("✅ Intent ID tag found in OP_RETURN");
+                    has_matching_tag = true;
                 }
             }
-        }
-
-        if has_correct_payment && has_matching_tag {
-            info!(
-                "Intent {} verified successfully in transaction {}",
-                intent_id, txid
-            );
-            return Ok(true);
+        } else {
+            debug!("Output {}: Other type (likely change)", idx);
         }
     }
 
+    // Check if total payment amount matches expected
+    let has_correct_payment = total_payment_amount == expected_amount_u256;
+    debug!(
+        "Total payment to dest address: {} sats (expected {})",
+        total_payment_amount, expected_amount_u256
+    );
+
+    if has_correct_payment && has_matching_tag {
+        info!(
+            "✅ Intent {} verified successfully in transaction {} ({} outputs)",
+            intent_id,
+            txid,
+            tx.output.len()
+        );
+        return Ok(true);
+    }
+
     info!(
-        "Intent {} verification failed for transaction {}",
-        intent_id, txid
+        "❌ Intent {} verification failed for transaction {} (payment={}, tag={})",
+        intent_id, txid, has_correct_payment, has_matching_tag
     );
     Ok(false)
 }
