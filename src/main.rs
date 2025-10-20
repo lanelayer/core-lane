@@ -13,6 +13,7 @@ use anyhow::Result;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
 use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
 use std::collections::HashMap;
 use std::fs;
@@ -23,12 +24,19 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MetaState {
+    eip1559_fee_manager: eip1559::Eip1559FeeManager,
+    total_burned_amount: U256,
+}
+
 // Import modules from the library
 use core_lane::{
     bitcoin_block, bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, transaction,
 };
 
-// RPC module is specific to the binary (depends on CoreLaneState)
+// RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
+mod eip1559;
 mod rpc;
 
 #[cfg(test)]
@@ -370,7 +378,7 @@ impl CoreLaneBlock {
             transaction_count: 0,
             gas_used: U256::ZERO,
             gas_limit: U256::from(30_000_000u64), // 30M gas limit
-            base_fee_per_gas: Some(U256::from(1_000_000_000u64)), // 1 gwei
+            base_fee_per_gas: Some(U256::from(1_000_000_000u64)), // 1 gwei - will be updated dynamically
             difficulty: U256::from(1u64),
             total_difficulty: U256::from(number),
             extra_data,
@@ -466,6 +474,9 @@ struct CoreLaneState {
     bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
     #[allow(dead_code)]
     bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
+    eip1559_fee_manager: eip1559::Eip1559FeeManager, // EIP-1559 fee management
+    sequencer_address: Address,       // Address that receives priority fees
+    total_burned_amount: U256,        // Total amount burned from base fees
 }
 
 impl CoreLaneState {
@@ -662,6 +673,12 @@ impl CoreLaneNode {
             genesis_block: genesis_block.clone(),
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
+            eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+            sequencer_address: Address::from([
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            ]), // Sequencer address
+            total_burned_amount: U256::ZERO,
         }));
 
         // Write genesis state to disk
@@ -765,6 +782,54 @@ impl CoreLaneNode {
         Ok(())
     }
 
+    /// Write the metadata state (MetaState) to disk
+    fn write_metastate_to_disk(&self, block_number: u64, metastate: &MetaState) -> Result<()> {
+        use std::fs;
+        use std::path::Path;
+
+        // Create metastate directory if it doesn't exist
+        let metastate_dir = Path::new(&self.data_dir).join("metastate");
+        fs::create_dir_all(&metastate_dir)?;
+
+        // Write the metadata state using bincode serialization
+        let metastate_file = metastate_dir.join(format!("{}", block_number));
+        let serialized_metastate = bincode::serialize(metastate)?;
+        fs::write(&metastate_file, serialized_metastate)?;
+
+        info!(
+            "💾 Wrote metastate for block {} to {}",
+            block_number,
+            metastate_file.display()
+        );
+        Ok(())
+    }
+
+    /// Read the metadata state (MetaState) from disk
+    fn read_metastate_from_disk(&self, block_number: u64) -> Result<MetaState> {
+        use std::fs;
+        use std::path::Path;
+
+        let metastate_dir = Path::new(&self.data_dir).join("metastate");
+        let metastate_file = metastate_dir.join(format!("{}", block_number));
+
+        if !metastate_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Metastate file not found for block {}",
+                block_number
+            ));
+        }
+
+        let serialized_metastate = fs::read(&metastate_file)?;
+        let metastate = bincode::deserialize(&serialized_metastate)?;
+
+        info!(
+            "💾 Read metastate for block {} from {}",
+            block_number,
+            metastate_file.display()
+        );
+        Ok(metastate)
+    }
+
     /// Write the genesis state (block 0) to disk
     pub fn write_genesis_state(data_dir: &str) -> Result<()> {
         use std::fs;
@@ -786,6 +851,26 @@ impl CoreLaneNode {
             "💾 Wrote genesis state (block 0) to {}",
             block_file.display()
         );
+
+        // Create metastate directory if it doesn't exist
+        let metastate_dir = Path::new(data_dir).join("metastate");
+        fs::create_dir_all(&metastate_dir)?;
+
+        // Create initial metastate for genesis block
+        let genesis_metastate = MetaState {
+            eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+            total_burned_amount: U256::ZERO,
+        };
+
+        // Write the genesis metastate using bincode serialization
+        let metastate_file = metastate_dir.join("0");
+        let serialized_metastate = bincode::serialize(&genesis_metastate)?;
+        fs::write(&metastate_file, serialized_metastate)?;
+
+        info!(
+            "💾 Wrote genesis metastate (block 0) to {}",
+            metastate_file.display()
+        );
         Ok(())
     }
 
@@ -795,6 +880,37 @@ impl CoreLaneNode {
         mut new_block: CoreLaneBlock,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
+
+        // Calculate total gas used from transactions
+        let total_gas_used = transactions
+            .iter()
+            .fold(U256::ZERO, |acc, (_tx, receipt, _)| {
+                let s = receipt.gas_used.as_str();
+                let val = if let Some(hex) = s.strip_prefix("0x") {
+                    let bytes = hex::decode(hex).unwrap_or_default();
+                    U256::from_be_slice(&bytes)
+                } else {
+                    U256::from_str(s).unwrap_or(U256::ZERO)
+                };
+                acc + val
+            });
+
+        // Update block gas usage
+        new_block.gas_used = total_gas_used;
+
+        // Update base fee for the NEXT block using this block's gas usage
+        let next_base_fee = state
+            .eip1559_fee_manager
+            .update_base_fee(new_block.number + 1, total_gas_used);
+
+        info!(
+            "⛽ Block {} gas usage: {} / {} (base fee used: {} gwei, next: {} gwei)",
+            new_block.number,
+            total_gas_used,
+            new_block.gas_limit,
+            new_block.base_fee_per_gas.unwrap_or_default() / U256::from(1_000_000_000u64),
+            next_base_fee / U256::from(1_000_000_000u64)
+        );
 
         // Update state root, receipts root, etc.
         new_block.state_root = B256::from_slice(&[0u8; 32]); // Simplified for now
@@ -813,11 +929,33 @@ impl CoreLaneNode {
 
         // Transactions and receipts are already in bundle state and applied via apply_changes.
 
+        // Create metastate with current EIP-1559 fee manager and total burned amount
+        let metastate = MetaState {
+            eip1559_fee_manager: state.eip1559_fee_manager.clone(),
+            total_burned_amount: state.total_burned_amount,
+        };
+
+        // Persist metastate to disk
+        drop(state);
+        if let Err(e) = self.write_metastate_to_disk(new_block.number, &metastate) {
+            error!(
+                "Failed to write metastate for block {} to disk: {}",
+                new_block.number, e
+            );
+        }
+
         info!(
-            "✅ Finalized Core Lane block {} with {} transactions",
-            new_block.number, new_block.transaction_count
+            "✅ Finalized Core Lane block {} with {} transactions (base fee used: {} gwei, next: {} gwei)",
+            new_block.number,
+            new_block.transaction_count,
+            new_block.base_fee_per_gas.unwrap_or_default() / U256::from(1_000_000_000u64),
+            next_base_fee / U256::from(1_000_000_000u64)
         );
-        state.current_block = Some(new_block);
+
+        {
+            let mut state = self.state.lock().await;
+            state.current_block = Some(new_block);
+        }
         Ok(())
     }
 
@@ -1067,43 +1205,100 @@ impl CoreLaneNode {
         block_number: u64,
         tx_number: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
-        let gas_price = U256::from(214285714u64);
-
         let mut state = self.state.lock().await;
+        let gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
 
-        //  Transaction size ≈ 150 byte
-        // Fee rate = 3 sats/vbyte
-        // Conversion rate: 1 sat = 10¹⁰ wei
-        // Gas cost for comparable tx: 21,000 gas = 150 bytes
-        //
+        // Handle EIP-1559 transactions with proper fee calculation and burning
         if tx.0.is_eip1559() {
-            if gas_price > tx.0.as_eip1559().unwrap().tx().max_fee_per_gas {
-                warn!("      ⚠️  Gas fee is greater than the EIP-1559 transaction max fee per gas, skipping: {:?}", tx.0);
+            let eip1559_tx = tx.0.as_eip1559().unwrap();
+            let max_fee_per_gas = eip1559_tx.tx().max_fee_per_gas;
+            let max_priority_fee_per_gas = eip1559_tx.tx().max_priority_fee_per_gas;
+
+            // Validate EIP-1559 transaction
+            if let Err(e) = state.eip1559_fee_manager.validate_eip1559_transaction(
+                U256::from(max_fee_per_gas),
+                U256::from(max_priority_fee_per_gas),
+                gas_limit,
+            ) {
+                warn!(
+                    "      ⚠️  EIP-1559 transaction validation failed: {}, skipping: {:?}",
+                    e, tx.0
+                );
                 return None;
             }
+
+            // Calculate fee breakdown (total, base_fee_portion, priority_fee_portion)
+            // Note: Using gas_limit as approximation since actual gas_used is not known yet
+            let (total_fee, base_fee_portion, priority_fee_portion) =
+                state.eip1559_fee_manager.calculate_fee_breakdown(
+                    U256::from(max_fee_per_gas),
+                    U256::from(max_priority_fee_per_gas),
+                    gas_limit, // TODO: Use actual gas_used when available
+                );
+
+            // Charge total fee from sender
+            if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, total_fee) {
+                warn!(
+                    "      ⚠️  Failed to charge EIP-1559 fee: {}, skipping: {:?}",
+                    e, tx.0
+                );
+                return None;
+            }
+
+            // ACTUAL BURNING: Base fee portion is destroyed from total supply
+            // We don't add it to any account - it's permanently removed
+            state.total_burned_amount += base_fee_portion;
+            info!(
+                "      🔥 BURNED base fee: {} wei (total burned: {} wei)",
+                base_fee_portion, state.total_burned_amount
+            );
+
+            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer
+            if priority_fee_portion > U256::ZERO {
+                if let Err(e) = bundle_state.add_balance(
+                    &state.account_manager,
+                    state.sequencer_address,
+                    priority_fee_portion,
+                ) {
+                    warn!("      ⚠️  Failed to pay sequencer priority fee: {}", e);
+                } else {
+                    info!(
+                        "      💰 Paid sequencer priority fee: {} wei",
+                        priority_fee_portion
+                    );
+                }
+            }
+
+            info!(
+                "      💰 Total EIP-1559 fee charged: {} wei (base: {}, priority: {})",
+                total_fee, base_fee_portion, priority_fee_portion
+            );
         } else if tx.0.is_legacy() {
-            if gas_price > tx.0.as_legacy().unwrap().tx().gas_price {
+            // Legacy transaction handling (fallback to fixed gas price)
+            let gas_price = U256::from(214285714u64); // Fixed legacy gas price
+            let legacy_tx = tx.0.as_legacy().unwrap();
+
+            if gas_price > legacy_tx.tx().gas_price {
                 warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
                 return None;
             }
+
+            let gas_fee = gas_price * gas_limit;
+            if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
+                warn!(
+                    "      ⚠️  Failed to charge legacy gas fee: {}, skipping: {:?}",
+                    e, tx.0
+                );
+                return None;
+            }
+
+            info!("      💰 Charged legacy gas fee: {} wei", gas_fee);
         } else {
             warn!(
-                "      ⚠️  Non-EIP 1559 or legacy transactions are not supported, skipping: {:?}",
+                "      ⚠️  Unsupported transaction type, skipping: {:?}",
                 tx.0
             );
             return None;
-        }
-
-        // Charge gas fee first from bundle state
-        let gas_fee = gas_price * U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
-        if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
-            warn!(
-                "      ⚠️  Failed to charge gas fee ahead of tx execution: {}",
-                e
-            );
-            return None;
-        } else {
-            info!("      💰 Charged gas fee: {} wei", gas_fee);
         }
 
         // Execute transaction with bundle state
@@ -1140,6 +1335,23 @@ impl CoreLaneNode {
         // Create and store transaction receipt in bundle state
         let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
 
+        // Calculate effective gas price and gas used for receipt
+        let (effective_gas_price, _gas_used) = if tx.0.is_eip1559() {
+            let eip1559_tx = tx.0.as_eip1559().unwrap();
+            let max_fee_per_gas = eip1559_tx.tx().max_fee_per_gas;
+            let max_priority_fee_per_gas = eip1559_tx.tx().max_priority_fee_per_gas;
+            let effective_price = state.eip1559_fee_manager.calculate_effective_gas_price(
+                U256::from(max_fee_per_gas),
+                U256::from(max_priority_fee_per_gas),
+            );
+            (effective_price, gas_limit)
+        } else if tx.0.is_legacy() {
+            let legacy_tx = tx.0.as_legacy().unwrap();
+            (U256::from(legacy_tx.tx().gas_price), gas_limit)
+        } else {
+            (U256::from(214285714u64), gas_limit) // Default fallback
+        };
+
         let receipt = TransactionReceipt {
             transaction_hash: tx_hash.clone(),
             block_number,
@@ -1156,7 +1368,7 @@ impl CoreLaneNode {
                 "0x0"
             }
             .to_string(),
-            effective_gas_price: format!("0x{}", hex::encode(gas_price.to_be_bytes_vec())),
+            effective_gas_price: format!("0x{:x}", effective_gas_price),
             tx_type: match &tx.0 {
                 TxEnvelope::Legacy(_) => "0x0".to_string(),
                 TxEnvelope::Eip2930(_) => "0x1".to_string(),
@@ -1365,6 +1577,29 @@ impl CoreLaneNode {
         {
             let mut state_mut = self.state.lock().await;
             state_mut.rollback_to_block(fork_core_block, &self.data_dir)?;
+        }
+
+        // Load and restore metastate (EIP-1559 fee manager and total burned amount)
+        {
+            let mut state_mut = self.state.lock().await;
+            match self.read_metastate_from_disk(fork_core_block) {
+                Ok(metastate) => {
+                    info!(
+                        "✅ Successfully loaded metastate for block {}",
+                        fork_core_block
+                    );
+                    state_mut.eip1559_fee_manager = metastate.eip1559_fee_manager;
+                    state_mut.total_burned_amount = metastate.total_burned_amount;
+                    info!("✅ Restored EIP-1559 fee manager and total burned amount");
+                }
+                Err(e) => {
+                    warn!(
+                        "⚠️ Failed to load metastate for block {}: {}",
+                        fork_core_block, e
+                    );
+                    warn!("⚠️ Continuing with current metastate (may not match historical state)");
+                }
+            }
         }
 
         info!(
