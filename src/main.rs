@@ -742,16 +742,18 @@ impl CoreLaneNode {
         let mut state = self.state.lock().await;
 
         // Calculate total gas used from transactions
-        let total_gas_used = transactions.iter().fold(U256::ZERO, |acc, (_tx, receipt, _)| {
-            let s = receipt.gas_used.as_str();
-            let val = if let Some(hex) = s.strip_prefix("0x") {
-                let bytes = hex::decode(hex).unwrap_or_default();
-                U256::from_be_slice(&bytes)
-            } else {
-                U256::from_str(s).unwrap_or(U256::ZERO)
-            };
-            acc + val
-        });
+        let total_gas_used = transactions
+            .iter()
+            .fold(U256::ZERO, |acc, (_tx, receipt, _)| {
+                let s = receipt.gas_used.as_str();
+                let val = if let Some(hex) = s.strip_prefix("0x") {
+                    let bytes = hex::decode(hex).unwrap_or_default();
+                    U256::from_be_slice(&bytes)
+                } else {
+                    U256::from_str(s).unwrap_or(U256::ZERO)
+                };
+                acc + val
+            });
 
         // Update block gas usage
         new_block.gas_used = total_gas_used;

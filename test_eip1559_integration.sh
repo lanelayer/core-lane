@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Test configuration
-CORE_LANE_RPC_URL="http://localhost:8545"
+CORE_LANE_RPC_URL="http://localhost:8546"
 TEST_PRIVATE_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" # Account 0 from Anvil
 TEST_ADDRESS="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 
@@ -118,13 +118,12 @@ test_eip1559_transaction() {
 
     print_status "Base fee: $BASE_FEE, Priority fee: $PRIORITY_FEE"
 
-    # Convert hex to decimal for max fee calculation
-    BASE_FEE_DEC=$(printf "%d" $BASE_FEE)
-    PRIORITY_FEE_DEC=$(printf "%d" $PRIORITY_FEE)
-    MAX_FEE_DEC=$((BASE_FEE_DEC + PRIORITY_FEE_DEC + 1000000000)) # Add 1 gwei buffer
-    MAX_FEE_HEX=$(printf "0x%x" $MAX_FEE_DEC)
+    # Use simple, reasonable gas prices for testing
+    # Base fee is very small (7 wei), so use a reasonable max fee
+    MAX_FEE_DECIMAL="1000000000"  # 1 gwei in decimal
+    PRIORITY_FEE_DECIMAL="100000000"  # Priority fee in decimal
 
-    print_status "Calculated max fee: $MAX_FEE_HEX"
+    print_status "Using max fee: $MAX_FEE_DECIMAL wei, priority fee: $PRIORITY_FEE_DECIMAL wei"
 
     # Create EIP-1559 transaction using cast
     print_status "Creating EIP-1559 transaction with cast..."
@@ -141,17 +140,24 @@ test_eip1559_transaction() {
     # Create and send EIP-1559 transaction directly
     print_status "Sending EIP-1559 transaction with cast send..."
     TX_HASH=$(cast send $TEST_ADDRESS --value 0.001ether \
-        --gas-price $MAX_FEE_HEX \
-        --priority-gas-price $PRIORITY_FEE \
-        --gas 21000 \
+        --gas-price $MAX_FEE_DECIMAL \
+        --priority-gas-price $PRIORITY_FEE_DECIMAL \
+        --gas-limit 21000 \
         --nonce $NONCE \
         --private-key $TEST_PRIVATE_KEY \
         --rpc-url $CORE_LANE_RPC_URL)
 
-    print_status "Transaction hash: $TX_HASH"
+    # Extract transaction hash from the output (it might be in the JSON response)
+    if echo "$TX_HASH" | grep -q "transactionHash"; then
+        ACTUAL_TX_HASH=$(echo "$TX_HASH" | jq -r '.transactionHash' 2>/dev/null || echo "")
+    else
+        ACTUAL_TX_HASH="$TX_HASH"
+    fi
 
-    if [ -n "$TX_HASH" ] && [ "$TX_HASH" != "null" ]; then
-        print_success "EIP-1559 transaction sent successfully: $TX_HASH"
+    print_status "Transaction hash: $ACTUAL_TX_HASH"
+
+    if [ -n "$ACTUAL_TX_HASH" ] && [ "$ACTUAL_TX_HASH" != "null" ] && [ "$ACTUAL_TX_HASH" != "" ]; then
+        print_success "EIP-1559 transaction sent successfully: $ACTUAL_TX_HASH"
 
         # Wait a moment for transaction to be processed
         sleep 2
@@ -159,7 +165,7 @@ test_eip1559_transaction() {
         # Get transaction receipt
         RECEIPT_RESPONSE=$(curl -s -X POST \
             -H "Content-Type: application/json" \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$TX_HASH\"],\"id\":6}" \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"$ACTUAL_TX_HASH\"],\"id\":6}" \
             "$CORE_LANE_RPC_URL")
 
         if echo "$RECEIPT_RESPONSE" | grep -q '"result"'; then
