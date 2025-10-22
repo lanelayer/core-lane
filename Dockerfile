@@ -6,10 +6,12 @@ RUN apt-get update && apt-get install -y \
     libudev-dev \
     build-essential \
     ca-certificates \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+COPY opensbi.bin ./opensbi.bin
 COPY src ./src
 COPY Cargo.toml ./Cargo.toml
 COPY Cargo.lock ./Cargo.lock
