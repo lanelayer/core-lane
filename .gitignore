@@ -32,6 +32,12 @@ Thumbs.db
 .env
 .env.local
 
+# Core Lane runtime data
+blocks/
+deltas/
+wallet_regtest.sqlite3
+core-mel-node.log
+
 # External repositories
 external/
 

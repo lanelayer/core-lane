@@ -134,8 +134,13 @@ impl RpcServer {
             // Gas and fee methods
             "eth_gasPrice" => Self::handle_gas_price(request).await,
             "eth_estimateGas" => Self::handle_estimate_gas(request, &state).await,
-            "eth_maxPriorityFeePerGas" => Self::handle_max_priority_fee_per_gas(request).await,
-            "eth_feeHistory" => Self::handle_fee_history(request).await,
+            "eth_maxPriorityFeePerGas" => {
+                Self::handle_max_priority_fee_per_gas(&state, request).await
+            }
+            "eth_feeHistory" => Self::handle_fee_history(&state, request).await,
+            "eth_baseFeePerGas" => Self::handle_base_fee_per_gas(&state, request).await,
+            "corelane_sequencerBalance" => Self::handle_sequencer_balance(&state, request).await,
+            "corelane_totalBurned" => Self::handle_total_burned(&state, request).await,
 
             // Storage and state methods
             "eth_getStorageAt" => Self::handle_get_storage_at(request, &state).await,
@@ -1677,10 +1682,20 @@ impl RpcServer {
     }
 
     async fn handle_max_priority_fee_per_gas(
+        state: &Arc<Self>,
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        // Return a reasonable priority fee (0.1 Gwei)
-        let priority_fee = "0x5f5e100"; // 0.1 Gwei in hex
+        // Get current base fee to suggest a reasonable priority fee
+        let state = state.state.lock().await;
+        let current_base_fee = state.eip1559_fee_manager.current_base_fee();
+
+        // Suggest priority fee as 10% of current base fee, minimum 0.1 Gwei
+        let suggested_priority_fee = std::cmp::max(
+            current_base_fee / U256::from(10u64), // 10% of base fee
+            U256::from(100_000_000u64),           // 0.1 Gwei minimum
+        );
+
+        let priority_fee = format!("0x{:x}", suggested_priority_fee);
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -1691,6 +1706,7 @@ impl RpcServer {
     }
 
     async fn handle_fee_history(
+        state: &Arc<Self>,
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
         if request.params.len() != 3 {
@@ -1705,17 +1721,125 @@ impl RpcServer {
             }));
         }
 
-        // Return a simple fee history structure
+        // Parse parameters: blockCount, newestBlock, rewardPercentiles
+        let block_count = request.params[0].as_u64().unwrap_or(10);
+        let _newest_block = request.params[1].as_str().unwrap_or("latest");
+        let _reward_percentiles = &request.params[2]; // Not used for now
+
+        // Get state to access EIP-1559 fee manager
+        let state = state.state.lock().await;
+
+        // Calculate block range
+        let current_block = state.blocks.len() as u64;
+        let start_block = if current_block > block_count {
+            current_block - block_count + 1
+        } else {
+            1
+        };
+        let end_block = current_block;
+
+        // Get base fee history from EIP-1559 fee manager
+        let _base_fee_history = state
+            .eip1559_fee_manager
+            .get_base_fee_history(start_block, end_block);
+
+        // Build base fee array
+        let mut base_fees = Vec::new();
+        let mut gas_used_ratios = Vec::new();
+        let mut rewards = Vec::new();
+
+        for block_num in start_block..=end_block {
+            if let Some(base_fee) = state.eip1559_fee_manager.get_base_fee_for_block(block_num) {
+                base_fees.push(format!("0x{:x}", base_fee));
+
+                // Get gas used ratio for this block
+                if let Some(block) = state.blocks.get(&block_num) {
+                    let gas_used_ratio =
+                        state.eip1559_fee_manager.get_gas_used_ratio(block.gas_used);
+                    gas_used_ratios.push(gas_used_ratio);
+                } else {
+                    gas_used_ratios.push(0.5); // Default ratio
+                }
+
+                // For now, return a simple reward structure
+                rewards.push(vec!["0x5f5e100".to_string()]); // 0.1 Gwei priority fee
+            } else {
+                // Fallback to default values
+                base_fees.push("0x3b9aca00".to_string()); // 1 gwei
+                gas_used_ratios.push(0.5);
+                rewards.push(vec!["0x5f5e100".to_string()]);
+            }
+        }
+
+        // If no history available, return default values
+        if base_fees.is_empty() {
+            base_fees.push("0x3b9aca00".to_string()); // 1 gwei
+            gas_used_ratios.push(0.5);
+            rewards.push(vec!["0x5f5e100".to_string()]);
+        }
+
         let fee_history = json!({
-            "oldestBlock": "0x1",
-            "baseFeePerGas": ["0x3b9aca00"],
-            "gasUsedRatio": [0.5],
-            "reward": [["0x5f5e100"]]
+            "oldestBlock": format!("0x{:x}", start_block),
+            "baseFeePerGas": base_fees,
+            "gasUsedRatio": gas_used_ratios,
+            "reward": rewards
         });
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: Some(fee_history),
+            error: None,
+            id: request.id,
+        }))
+    }
+
+    async fn handle_base_fee_per_gas(
+        state: &Arc<Self>,
+        request: JsonRpcRequest,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        // Get current base fee from EIP-1559 fee manager
+        let state = state.state.lock().await;
+        let current_base_fee = state.eip1559_fee_manager.current_base_fee();
+
+        let base_fee = format!("0x{:x}", current_base_fee);
+
+        Ok(JsonResponse::from(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(json!(base_fee)),
+            error: None,
+            id: request.id,
+        }))
+    }
+
+    async fn handle_sequencer_balance(
+        state: &Arc<Self>,
+        request: JsonRpcRequest,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        // Get sequencer balance from state
+        let state = state.state.lock().await;
+        let sequencer_balance = state.account_manager.get_balance(state.sequencer_address);
+
+        let balance = format!("0x{:x}", sequencer_balance);
+
+        Ok(JsonResponse::from(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(json!(balance)),
+            error: None,
+            id: request.id,
+        }))
+    }
+
+    async fn handle_total_burned(
+        state: &Arc<Self>,
+        request: JsonRpcRequest,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        // Get total burned amount from state
+        let state = state.state.lock().await;
+        let total_burned = format!("0x{:x}", state.total_burned_amount);
+
+        Ok(JsonResponse::from(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(json!(total_burned)),
             error: None,
             id: request.id,
         }))
