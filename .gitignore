@@ -37,3 +37,9 @@ blocks/
 deltas/
 wallet_regtest.sqlite3
 core-mel-node.log
+
+# External repositories
+external/
+
+# Filler bot wallet database
+*-wallet.db

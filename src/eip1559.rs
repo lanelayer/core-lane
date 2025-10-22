@@ -80,7 +80,7 @@ impl Eip1559FeeManager {
     /// where gas_used_delta = parent_gas_used - parent_gas_target
     pub fn calculate_next_base_fee(&self, gas_used: U256) -> U256 {
         let parent_base_fee = self.current_base_fee;
-        let parent_gas_limit = self.config.gas_limit;
+        let _parent_gas_limit = self.config.gas_limit;
         let parent_gas_target = self.config.target_gas_usage;
         let base_fee_change_denominator = self.config.base_fee_change_denominator;
 
@@ -95,11 +95,11 @@ impl Eip1559FeeManager {
         let base_fee_change = if gas_used > parent_gas_target {
             // Base fee increases when block is more than 50% full
             let excess_gas = gas_used - parent_gas_target;
-            parent_base_fee * excess_gas / parent_gas_limit / base_fee_change_denominator
+            parent_base_fee * excess_gas / parent_gas_target / base_fee_change_denominator
         } else {
             // Base fee decreases when block is less than 50% full
             let gas_shortage = parent_gas_target - gas_used;
-            parent_base_fee * gas_shortage / parent_gas_limit / base_fee_change_denominator
+            parent_base_fee * gas_shortage / parent_gas_target / base_fee_change_denominator
         };
 
         // Calculate new base fee
@@ -166,12 +166,7 @@ impl Eip1559FeeManager {
             ));
         }
 
-        if max_priority_fee_per_gas < U256::ZERO {
-            return Err(anyhow!(
-                "max_priority_fee_per_gas ({}) must be >= 0",
-                max_priority_fee_per_gas
-            ));
-        }
+        // Note: max_priority_fee_per_gas is unsigned, so it can't be negative
 
         // Calculate effective gas price
         let effective_gas_price = if max_fee_per_gas > current_base_fee + max_priority_fee_per_gas {
@@ -212,14 +207,14 @@ impl Eip1559FeeManager {
         &self,
         max_fee_per_gas: U256,
         max_priority_fee_per_gas: U256,
-        gas_limit: U256,
+        gas_used: U256,
     ) -> (U256, U256, U256) {
         let current_base_fee = self.current_base_fee;
         let effective_gas_price =
             self.calculate_effective_gas_price(max_fee_per_gas, max_priority_fee_per_gas);
 
-        let total_fee = effective_gas_price * gas_limit;
-        let base_fee_portion = current_base_fee * gas_limit;
+        let total_fee = effective_gas_price * gas_used;
+        let base_fee_portion = current_base_fee * gas_used;
         let priority_fee_portion = total_fee - base_fee_portion;
 
         (total_fee, base_fee_portion, priority_fee_portion)

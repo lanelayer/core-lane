@@ -742,28 +742,32 @@ impl CoreLaneNode {
         let mut state = self.state.lock().await;
 
         // Calculate total gas used from transactions
-        let total_gas_used = transactions
-            .iter()
-            .map(|(_stored_tx, receipt, _tx_hash)| {
-                U256::from_str(&receipt.gas_used).unwrap_or(U256::ZERO)
-            })
-            .sum::<U256>();
+        let total_gas_used = transactions.iter().fold(U256::ZERO, |acc, (_tx, receipt, _)| {
+            let s = receipt.gas_used.as_str();
+            let val = if let Some(hex) = s.strip_prefix("0x") {
+                let bytes = hex::decode(hex).unwrap_or_default();
+                U256::from_be_slice(&bytes)
+            } else {
+                U256::from_str(s).unwrap_or(U256::ZERO)
+            };
+            acc + val
+        });
 
         // Update block gas usage
         new_block.gas_used = total_gas_used;
 
-        // Calculate and update base fee for this block using EIP-1559
-        let new_base_fee = state
+        // Update base fee for the NEXT block using this block's gas usage
+        let next_base_fee = state
             .eip1559_fee_manager
-            .update_base_fee(new_block.number, total_gas_used);
-        new_block.base_fee_per_gas = Some(new_base_fee);
+            .update_base_fee(new_block.number + 1, total_gas_used);
 
         info!(
-            "⛽ Block {} gas usage: {} / {} (base fee: {} gwei)",
+            "⛽ Block {} gas usage: {} / {} (base fee used: {} gwei, next: {} gwei)",
             new_block.number,
             total_gas_used,
             new_block.gas_limit,
-            new_base_fee / U256::from(1_000_000_000u64) // Convert to gwei
+            new_block.base_fee_per_gas.unwrap_or_default() / U256::from(1_000_000_000u64),
+            next_base_fee / U256::from(1_000_000_000u64)
         );
 
         // Update state root, receipts root, etc.
@@ -784,10 +788,11 @@ impl CoreLaneNode {
         // Transactions and receipts are already in bundle state and applied via apply_changes.
 
         info!(
-            "✅ Finalized Core Lane block {} with {} transactions (base fee: {} gwei)",
+            "✅ Finalized Core Lane block {} with {} transactions (base fee used: {} gwei, next: {} gwei)",
             new_block.number,
             new_block.transaction_count,
-            new_base_fee / U256::from(1_000_000_000u64)
+            new_block.base_fee_per_gas.unwrap_or_default() / U256::from(1_000_000_000u64),
+            next_base_fee / U256::from(1_000_000_000u64)
         );
         state.current_block = Some(new_block);
         Ok(())
@@ -1062,11 +1067,12 @@ impl CoreLaneNode {
             }
 
             // Calculate fee breakdown (total, base_fee_portion, priority_fee_portion)
+            // Note: Using gas_limit as approximation since actual gas_used is not known yet
             let (total_fee, base_fee_portion, priority_fee_portion) =
                 state.eip1559_fee_manager.calculate_fee_breakdown(
                     U256::from(max_fee_per_gas),
                     U256::from(max_priority_fee_per_gas),
-                    gas_limit,
+                    gas_limit, // TODO: Use actual gas_used when available
                 );
 
             // Charge total fee from sender
