@@ -23,9 +23,7 @@ services:
   #     start_period: 600s
 
   bitcoin-cache:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: ghcr.io/lanelayer/core-lane/core-lane:latest
     container_name: bitcoin-cache
     restart: unless-stopped
     ports:
@@ -45,9 +43,7 @@ services:
       - lane-network
 
   core-lane:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: ghcr.io/lanelayer/core-lane/core-lane:latest
     container_name: core-lane
     depends_on:
       - bitcoin-cache

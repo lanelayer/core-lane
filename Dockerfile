@@ -18,7 +18,7 @@ COPY Cargo.lock ./Cargo.lock
 RUN cargo build --release
 
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 
 RUN apt-get update && apt-get install -y \
     libssl3 \
