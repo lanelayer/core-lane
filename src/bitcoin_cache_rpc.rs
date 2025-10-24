@@ -795,6 +795,94 @@ impl BitcoinCacheRpcServer {
         // Return lowercase normalized hash
         Ok(hash.to_lowercase())
     }
+
+    /// Handle submitpackage RPC call - forward to upstream Bitcoin RPC
+    async fn handle_submitpackage(&self, package_txs: Value) -> Result<Value> {
+        let tx_count = package_txs.as_array().map(|arr| arr.len()).unwrap_or(0);
+        info!(
+            "📦 Bitcoin Cache: submitpackage called with {} transactions",
+            tx_count
+        );
+
+        // Forward to upstream Bitcoin RPC using HTTP client
+        let result = self
+            .forward_rpc_call("submitpackage", vec![package_txs])
+            .await?;
+
+        info!("✅ Forwarded submitpackage to upstream Bitcoin RPC");
+        Ok(result)
+    }
+
+    /// Handle sendrawtransaction RPC call - forward to upstream Bitcoin RPC
+    async fn handle_sendrawtransaction(&self, raw_tx_hex: String) -> Result<Value> {
+        info!(
+            "📤 Bitcoin Cache: sendrawtransaction called with tx: {}...",
+            &raw_tx_hex[..32.min(raw_tx_hex.len())]
+        );
+
+        // Forward to upstream Bitcoin RPC using HTTP client
+        let result = self
+            .forward_rpc_call("sendrawtransaction", vec![json!(raw_tx_hex)])
+            .await?;
+
+        info!("✅ Forwarded sendrawtransaction to upstream Bitcoin RPC");
+        Ok(result)
+    }
+
+    /// Handle getnetworkinfo RPC call - forward to upstream Bitcoin RPC
+    async fn handle_getnetworkinfo(&self) -> Result<Value> {
+        info!("🌐 Bitcoin Cache: getnetworkinfo called");
+
+        // Forward to upstream Bitcoin RPC using HTTP client
+        let result = self.forward_rpc_call("getnetworkinfo", vec![]).await?;
+
+        debug!("✅ Forwarded getnetworkinfo to upstream Bitcoin RPC");
+        Ok(result)
+    }
+
+    /// Handle estimatesmartfee RPC call - forward to upstream Bitcoin RPC
+    async fn handle_estimatesmartfee(
+        &self,
+        conf_target: u64,
+        estimate_mode: &str,
+    ) -> Result<Value> {
+        info!(
+            "💰 Bitcoin Cache: estimatesmartfee called (target: {}, mode: {})",
+            conf_target, estimate_mode
+        );
+
+        // Forward to upstream Bitcoin RPC using HTTP client
+        let result = self
+            .forward_rpc_call(
+                "estimatesmartfee",
+                vec![json!(conf_target), json!(estimate_mode)],
+            )
+            .await?;
+
+        debug!("✅ Forwarded estimatesmartfee to upstream Bitcoin RPC");
+        Ok(result)
+    }
+
+    /// Forward RPC call to upstream Bitcoin RPC server
+    async fn forward_rpc_call(&self, method: &str, params: Vec<Value>) -> Result<Value> {
+        match &self.state.bitcoin_client {
+            BitcoinRpcClient::BitcoinCore(client) => {
+                // Use the existing call method for Bitcoin Core client
+                let result = client
+                    .call(method, &params)
+                    .map_err(|e| anyhow!("Bitcoin Core RPC call failed: {}", e))?;
+                Ok(result)
+            }
+            BitcoinRpcClient::Http(client) => {
+                // Use the existing call method for HTTP client
+                let result = client
+                    .call(method, params)
+                    .await
+                    .map_err(|e| anyhow!("HTTP RPC call failed: {}", e))?;
+                Ok(result)
+            }
+        }
+    }
 }
 
 async fn handle_rpc(
@@ -867,6 +955,75 @@ async fn handle_rpc(
             };
             let verbosity = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64());
             server.handle_getblock(block_hash, verbosity).await
+        }
+        // Write operations - forward to upstream Bitcoin RPC
+        "submitpackage" => {
+            let package_txs = match params.and_then(|p| p.first()).cloned() {
+                Some(p) => p,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32602,
+                                "message": "Invalid params: package transactions required"
+                            },
+                            "id": id
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            server.handle_submitpackage(package_txs).await
+        }
+        "sendrawtransaction" => {
+            let raw_tx_hex = match params.and_then(|p| p.first()).and_then(|v| v.as_str()) {
+                Some(hex) => hex.to_string(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32602,
+                                "message": "Invalid params: raw transaction hex required"
+                            },
+                            "id": id
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            server.handle_sendrawtransaction(raw_tx_hex).await
+        }
+        // Additional read operations needed by TaprootDA
+        "getnetworkinfo" => server.handle_getnetworkinfo().await,
+        "estimatesmartfee" => {
+            let conf_target = match params.and_then(|p| p.first()).and_then(|v| v.as_u64()) {
+                Some(target) => target,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32602,
+                                "message": "Invalid params: confirmation target required"
+                            },
+                            "id": id
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            let estimate_mode = params
+                .and_then(|p| p.get(1))
+                .and_then(|v| v.as_str())
+                .unwrap_or("ECONOMICAL");
+            server
+                .handle_estimatesmartfee(conf_target, estimate_mode)
+                .await
         }
         _ => {
             return (

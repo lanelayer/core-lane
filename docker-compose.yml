@@ -1,27 +1,4 @@
 services:
-  # bitcoind:
-  #   build: ./bitcoind
-  #   container_name: bitcoind
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8332:8332"   # RPC
-  #     - "8333:8333"   # P2P
-  #     - "28332:28332" # ZMQ raw block
-  #     - "28333:28333" # ZMQ raw tx
-  #   environment:
-  #     - RPC_USER=${RPC_USER}
-  #     - RPC_PASSWORD=${RPC_PASSWORD}
-  #   volumes:
-  #     - bitcoind:/home/bitcoin/.bitcoin
-  #   networks:
-  #     - lane-network
-  #   healthcheck:
-  #     test: ["CMD", "bitcoin-cli", "-rpcuser=${RPC_USER}", "-rpcpassword=${RPC_PASSWORD}", "getblockchaininfo"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 600s
-
   bitcoin-cache:
     image: ghcr.io/lanelayer/core-lane/core-lane:latest
     container_name: bitcoin-cache
@@ -58,11 +35,11 @@ services:
       /app/core-lane-node start
       --data-dir /data
       --bitcoin-rpc-read-url http://bitcoin-cache:8332
-      --bitcoin-rpc-read-user ${RPC_USER}
-      --bitcoin-rpc-read-password ${RPC_PASSWORD}
+      --bitcoin-rpc-read-user ${RPC_USER:-bitcoin}
+      --bitcoin-rpc-read-password ${RPC_PASSWORD:-bitcoin123}
       --bitcoin-rpc-write-url http://bitcoin-cache:8332
-      --bitcoin-rpc-write-user ${RPC_USER}
-      --bitcoin-rpc-write-password ${RPC_PASSWORD}
+      --bitcoin-rpc-write-user ${RPC_USER:-bitcoin}
+      --bitcoin-rpc-write-password ${RPC_PASSWORD:-bitcoin123}
       --start-block 916201
       --rpc-wallet hot
       --mnemonic \"$$CORE_LANE_MNEMONIC\"
