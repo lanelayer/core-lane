@@ -84,6 +84,65 @@ fn resolve_mnemonic(
     ))
 }
 
+/// Helper function to create wallet database from mnemonic
+/// Handles network parsing, mnemonic validation, key derivation, descriptor creation, and wallet creation
+fn create_wallet_from_mnemonic(
+    data_dir: &str,
+    network_str: &str,
+    mnemonic_str: String,
+    plain_mode: bool,
+) -> Result<()> {
+    use bdk_wallet::bitcoin::Network as BdkNetwork;
+    use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
+    use bdk_wallet::rusqlite::Connection;
+    use bdk_wallet::Wallet;
+
+    // Parse network (include "mainnet" mapping)
+    let bdk_network = match network_str {
+        "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
+        "testnet" => BdkNetwork::Testnet,
+        "signet" => BdkNetwork::Signet,
+        "regtest" => BdkNetwork::Regtest,
+        _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
+    };
+
+    // Parse and validate mnemonic
+    let mnemonic =
+        Mnemonic::parse(mnemonic_str).map_err(|e| anyhow::anyhow!("Invalid mnemonic: {}", e))?;
+
+    // Derive extended key and xprv
+    let xkey: ExtendedKey = mnemonic
+        .into_extended_key()
+        .map_err(|_| anyhow::anyhow!("Failed to derive extended key"))?;
+    let xprv = xkey
+        .into_xprv(bdk_network)
+        .ok_or_else(|| anyhow::anyhow!("Failed to get xprv"))?;
+
+    // Build external and internal descriptors
+    let external_descriptor = format!("wpkh({}/0/*)", xprv);
+    let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+    // Ensure data directory exists
+    std::fs::create_dir_all(data_dir)?;
+
+    // Get wallet database path and create wallet
+    let db_path = wallet_db_path(data_dir, network_str);
+    let mut conn = Connection::open(&db_path)
+        .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
+
+    let _wallet = Wallet::create(external_descriptor, internal_descriptor)
+        .network(bdk_network)
+        .create_wallet(&mut conn)
+        .map_err(|e| anyhow::anyhow!("Failed to create wallet: {}", e))?;
+
+    // Log success when not in plain mode
+    if !plain_mode {
+        info!("✅ Wallet database created successfully");
+    }
+
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "core-lane-node")]
 #[command(about = "Core Lane Node - Bitcoin-anchored execution environment")]
@@ -252,6 +311,12 @@ enum Commands {
         /// Network of the wallet to load (bitcoin, testnet, signet, regtest)
         #[arg(long, default_value = "regtest")]
         network: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
     },
 }
 
@@ -2204,21 +2269,9 @@ async fn main() -> Result<()> {
             mnemonic: mnemonic_opt,
             mnemonic_only,
         } => {
-            use bdk_wallet::bitcoin::Network as BdkNetwork;
             use bdk_wallet::keys::{
                 bip39::{Language, Mnemonic, WordCount},
-                DerivableKey, ExtendedKey, GeneratableKey, GeneratedKey,
-            };
-            use bdk_wallet::rusqlite::Connection;
-            use bdk_wallet::Wallet;
-
-            // Parse network
-            let bdk_network = match network.as_str() {
-                "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
-                "testnet" => BdkNetwork::Testnet,
-                "signet" => BdkNetwork::Signet,
-                "regtest" => BdkNetwork::Regtest,
-                _ => return Err(anyhow::anyhow!("Invalid network: {}", network)),
+                GeneratableKey, GeneratedKey,
             };
 
             // Either use provided mnemonic or generate a new one
@@ -2250,18 +2303,6 @@ async fn main() -> Result<()> {
                 info!("📝 Using provided mnemonic to restore wallet");
             }
 
-            // Parse mnemonic string
-            let mnemonic = Mnemonic::parse(&mnemonic_words)
-                .map_err(|e| anyhow::anyhow!("Invalid mnemonic: {}", e))?;
-
-            // Derive extended key from mnemonic
-            let xkey: ExtendedKey = mnemonic
-                .into_extended_key()
-                .map_err(|_| anyhow::anyhow!("Failed to derive extended key"))?;
-            let xprv = xkey
-                .into_xprv(bdk_network)
-                .ok_or_else(|| anyhow::anyhow!("Failed to get xprv"))?;
-
             // If mnemonic-only mode, just output the mnemonic and exit
             if *mnemonic_only {
                 if cli.plain {
@@ -2282,29 +2323,14 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            // Create descriptor from xprv (using BIP84 path for native segwit)
-            // Simple format without key origin - BDK will derive keys directly
-            let external_descriptor = format!("wpkh({}/0/*)", xprv);
-            let internal_descriptor = format!("wpkh({}/1/*)", xprv);
-
-            // Ensure data directory exists
-            std::fs::create_dir_all(&cli.data_dir)?;
-
-            // Create wallet database file
-            let db_path = wallet_db_path(&cli.data_dir, network);
+            // Create wallet using helper function
             if !cli.plain {
-                info!("💾 Creating wallet database: {}", db_path);
+                info!("💾 Creating wallet database...");
             }
-
-            let mut conn = Connection::open(&db_path)
-                .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
-
-            let _wallet = Wallet::create(external_descriptor, internal_descriptor)
-                .network(bdk_network)
-                .create_wallet(&mut conn)
-                .map_err(|e| anyhow::anyhow!("Failed to create wallet: {}", e))?;
+            create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_words.clone(), cli.plain)?;
 
             // Output formatting based on plain flag
+            let db_path = wallet_db_path(&cli.data_dir, network);
             if cli.plain {
                 // Plain mode: just print mnemonic for new wallets, nothing for restored
                 if !is_restored {
@@ -2326,19 +2352,35 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::GetAddress { network } => {
+        Commands::GetAddress {
+            network,
+            mnemonic,
+            mnemonic_file,
+        } => {
             use bdk_wallet::rusqlite::Connection;
             use bdk_wallet::{KeychainKind, Wallet};
 
             let db_path = wallet_db_path(&cli.data_dir, network);
 
+            // Check if wallet database exists, create if missing
             if !std::path::Path::new(&db_path).exists() {
-                return Err(anyhow::anyhow!(
-                    "Wallet database not found: {}\nCreate a wallet first with: create-wallet --network {} --data-dir {}",
-                    db_path,
-                    network,
-                    cli.data_dir
-                ));
+                if !cli.plain {
+                    info!("📝 Wallet database not found, creating from mnemonic...");
+                }
+
+                // Resolve mnemonic from various sources
+                // If no explicit mnemonic or file provided, fall back to old file naming convention
+                let mnemonic_str = if mnemonic.is_some() || mnemonic_file.is_some() {
+                    resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?
+                } else {
+                    // Fall back to old file naming convention for backward compatibility
+                    let old_mnemonic_file = std::path::Path::new(&cli.data_dir)
+                        .join(format!("mnemonic_{}.txt", network));
+                    resolve_mnemonic(None, old_mnemonic_file.to_str())?
+                };
+
+                // Create wallet using helper function
+                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain)?;
             }
 
             if !cli.plain {
