@@ -318,6 +318,29 @@ enum Commands {
         #[arg(long)]
         mnemonic_file: Option<String>,
     },
+    GetBitcoinBalance {
+        /// Network of the wallet to check (bitcoin, testnet, signet, regtest)
+        #[arg(long, default_value = "regtest")]
+        network: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
+        /// Electrum server URL (for mainnet/signet/testnet)
+        #[arg(long)]
+        electrum_url: Option<String>,
+        /// Bitcoin RPC URL (for regtest)
+        #[arg(long, default_value = "http://127.0.0.1:18443")]
+        rpc_url: String,
+        /// Bitcoin RPC username (for regtest)
+        #[arg(long, default_value = "")]
+        rpc_user: String,
+        /// Bitcoin RPC password (for regtest)
+        #[arg(long, default_value = "")]
+        rpc_password: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2411,6 +2434,153 @@ async fn main() -> Result<()> {
                 // Pretty mode with emojis
                 println!("📍 Receive address: {}", address.address);
                 println!("🔢 Address index: {}", address.index);
+            }
+        }
+
+        Commands::GetBitcoinBalance {
+            network,
+            mnemonic,
+            mnemonic_file,
+            electrum_url,
+            rpc_url,
+            rpc_user,
+            rpc_password,
+        } => {
+            use bdk_wallet::rusqlite::Connection;
+            use bdk_wallet::Wallet;
+
+            let db_path = wallet_db_path(&cli.data_dir, network);
+
+            // Check if wallet database exists, create if missing
+            if !std::path::Path::new(&db_path).exists() {
+                if !cli.plain {
+                    info!("📝 Wallet database not found, creating from mnemonic...");
+                }
+
+                // Resolve mnemonic from various sources
+                // If no explicit mnemonic or file provided, fall back to old file naming convention
+                let mnemonic_str = if mnemonic.is_some() || mnemonic_file.is_some() {
+                    resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?
+                } else {
+                    // Fall back to old file naming convention for backward compatibility
+                    let old_mnemonic_file = std::path::Path::new(&cli.data_dir)
+                        .join(format!("mnemonic_{}.txt", network));
+                    resolve_mnemonic(None, old_mnemonic_file.to_str())?
+                };
+
+                // Create wallet using helper function
+                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain)?;
+            }
+
+            if !cli.plain {
+                info!("📂 Loading wallet from: {}", db_path);
+            }
+
+            let mut conn = Connection::open(&db_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open database: {}", e))?;
+
+            // Load wallet - it should exist since we created it above if missing
+            let mut wallet = Wallet::load()
+                .extract_keys()
+                .load_wallet(&mut conn)
+                .map_err(|e| anyhow::anyhow!("Failed to load wallet: {}", e))?
+                .ok_or_else(|| anyhow::anyhow!("No wallet found in database"))?;
+
+            // Sync wallet based on network
+            if !cli.plain {
+                info!("🔄 Syncing wallet with network...");
+            }
+
+            if network == "regtest" {
+                // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
+                use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
+                use bdk_bitcoind_rpc::Emitter;
+                use std::sync::Arc;
+
+                if !cli.plain {
+                    info!("🔗 Syncing with Bitcoin RPC: {}", rpc_url);
+                }
+
+                let rpc_pass = if rpc_password.is_empty() {
+                    "bitcoin123".to_string()
+                } else {
+                    rpc_password.clone()
+                };
+                let rpc_client =
+                    Client::new(rpc_url, RpcAuth::UserPass(rpc_user.clone(), rpc_pass))?;
+
+                let mut emitter = Emitter::new(
+                    &rpc_client,
+                    wallet.latest_checkpoint().clone(),
+                    0,
+                    std::iter::empty::<Arc<bitcoin::Transaction>>(), // No mempool txs
+                );
+
+                while let Some(block_emission) = emitter.next_block()? {
+                    wallet.apply_block(&block_emission.block, block_emission.block_height())?;
+                }
+
+                wallet.persist(&mut conn)?;
+            } else {
+                // Use Electrum for other networks
+                use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+                let electrum_url = electrum_url.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--electrum-url required for network: {}", network)
+                })?;
+
+                if !cli.plain {
+                    info!("🔗 Syncing with Electrum: {}", electrum_url);
+                }
+
+                let electrum_client = electrum_client::Client::new(electrum_url)?;
+                let electrum = BdkElectrumClient::new(electrum_client);
+
+                if !cli.plain {
+                    info!("🔍 Scanning blockchain for wallet transactions...");
+                }
+
+                let request = wallet.start_full_scan().build();
+                let response = electrum.full_scan(request, 5, 1, false)?;
+
+                wallet.apply_update(response)?;
+                wallet.persist(&mut conn)?;
+            }
+
+            if !cli.plain {
+                info!("💰 Wallet synced successfully");
+            }
+
+            // Get wallet balance
+            let balance = wallet.balance();
+
+            if cli.plain {
+                // Plain mode: just print the balance in satoshis
+                println!("{}", balance.total().to_sat());
+            } else {
+                // Pretty mode with emojis and formatted output
+                let total_sats = balance.total().to_sat();
+                let confirmed_sats = balance.confirmed.to_sat();
+                let unconfirmed_sats = balance.untrusted_pending.to_sat();
+
+                println!("💰 Bitcoin Balance Summary");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("🌐 Network: {}", network);
+                println!("📊 Total Balance: {} sats", total_sats);
+                println!("✅ Confirmed: {} sats", confirmed_sats);
+                println!("⏳ Unconfirmed: {} sats", unconfirmed_sats);
+
+                // Convert to BTC for display
+                let total_btc = total_sats as f64 / 100_000_000.0;
+                let confirmed_btc = confirmed_sats as f64 / 100_000_000.0;
+                let unconfirmed_btc = unconfirmed_sats as f64 / 100_000_000.0;
+
+                println!("\n💎 Bitcoin Amounts");
+                println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                println!("📊 Total Balance: {:.8} BTC", total_btc);
+                println!("✅ Confirmed: {:.8} BTC", confirmed_btc);
+                println!("⏳ Unconfirmed: {:.8} BTC", unconfirmed_btc);
             }
         }
     }
