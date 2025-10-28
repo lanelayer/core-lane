@@ -1733,7 +1733,8 @@ impl RpcServer {
                             result: None,
                             error: Some(JsonRpcError {
                                 code: -32602,
-                                message: "Invalid params: block count must be a valid hex string".to_string(),
+                                message: "Invalid params: block count must be a valid hex string"
+                                    .to_string(),
                             }),
                             id: request.id,
                         }))
@@ -1748,7 +1749,8 @@ impl RpcServer {
                         result: None,
                         error: Some(JsonRpcError {
                             code: -32602,
-                            message: "Invalid params: block count must be a valid integer".to_string(),
+                            message: "Invalid params: block count must be a valid integer"
+                                .to_string(),
                         }),
                         id: request.id,
                     }))
@@ -1760,7 +1762,8 @@ impl RpcServer {
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32602,
-                        message: "Invalid params: block count must be a hex string or number".to_string(),
+                        message: "Invalid params: block count must be a hex string or number"
+                            .to_string(),
                     }),
                     id: request.id,
                 }))
@@ -1863,22 +1866,28 @@ impl RpcServer {
                         // Collect priority fees from all transactions in the block
                         let mut priority_fees: Vec<U256> = Vec::new();
                         for tx_hash in &block.transactions {
-                            if let Some(tx) = state.account_manager.get_transactions().iter().find(|tx| {
-                                let hash = format!(
-                                    "0x{}",
-                                    hex::encode(alloy_primitives::keccak256(&tx.raw_data))
-                                );
-                                &hash == tx_hash
-                            }) {
+                            if let Some(tx) =
+                                state.account_manager.get_transactions().iter().find(|tx| {
+                                    let hash = format!(
+                                        "0x{}",
+                                        hex::encode(alloy_primitives::keccak256(&tx.raw_data))
+                                    );
+                                    &hash == tx_hash
+                                })
+                            {
                                 // Extract priority fee based on transaction type
                                 match &tx.envelope {
                                     alloy_consensus::TxEnvelope::Eip1559(tx) => {
                                         // max_priority_fee_per_gas is a primitive (u128) — convert to U256
-                                        priority_fees.push(U256::from(tx.tx().max_priority_fee_per_gas));
+                                        priority_fees
+                                            .push(U256::from(tx.tx().max_priority_fee_per_gas));
                                     }
                                     // For non-1559 transactions, use the excess over base fee as priority fee
                                     alloy_consensus::TxEnvelope::Legacy(tx) => {
-                                        if let Some(base_fee) = state.eip1559_fee_manager.get_base_fee_for_block(block_num) {
+                                        if let Some(base_fee) = state
+                                            .eip1559_fee_manager
+                                            .get_base_fee_for_block(block_num)
+                                        {
                                             let tx_gas_price = U256::from(tx.tx().gas_price);
                                             if tx_gas_price > base_fee {
                                                 priority_fees.push(tx_gas_price - base_fee);
@@ -1900,7 +1909,10 @@ impl RpcServer {
                             .collect()
                     } else {
                         // If block not found, return zeros for all percentiles
-                        reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+                        reward_percentiles
+                            .iter()
+                            .map(|_| "0x0".to_string())
+                            .collect()
                     };
                     rewards.push(block_rewards);
                 } else {
@@ -1915,7 +1927,10 @@ impl RpcServer {
                 rewards.push(if reward_percentiles.is_empty() {
                     vec![]
                 } else {
-                    reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+                    reward_percentiles
+                        .iter()
+                        .map(|_| "0x0".to_string())
+                        .collect()
                 });
             }
         }
@@ -1928,7 +1943,10 @@ impl RpcServer {
             rewards.push(if reward_percentiles.is_empty() {
                 vec![]
             } else {
-                reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+                reward_percentiles
+                    .iter()
+                    .map(|_| "0x0".to_string())
+                    .collect()
             });
         }
 
