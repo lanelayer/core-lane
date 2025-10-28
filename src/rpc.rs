@@ -1721,14 +1721,63 @@ impl RpcServer {
             }));
         }
 
-        // Parse block count from hex string
+        // Parse block count from hex string or number, rejecting invalid inputs
         let block_count = match &request.params[0] {
             Value::String(s) => {
                 let s = s.trim_start_matches("0x");
-                u64::from_str_radix(s, 16).unwrap_or(1)
+                match u64::from_str_radix(s, 16) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        return Ok(JsonResponse::from(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32602,
+                                message: "Invalid params: block count must be a valid hex string".to_string(),
+                            }),
+                            id: request.id,
+                        }))
+                    }
+                }
             }
-            Value::Number(n) => n.as_u64().unwrap_or(1),
-            _ => 1,
+            Value::Number(n) => match n.as_u64() {
+                Some(count) => count,
+                None => {
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: "Invalid params: block count must be a valid integer".to_string(),
+                        }),
+                        id: request.id,
+                    }))
+                }
+            },
+            _ => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: "Invalid params: block count must be a hex string or number".to_string(),
+                    }),
+                    id: request.id,
+                }))
+            }
+        };
+
+        // Validate block count is not zero
+        if block_count == 0 {
+            return Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params: block count must be greater than zero".to_string(),
+                }),
+                id: request.id,
+            }));
         };
 
         // Parse newest block parameter (may be "latest"/"pending", a hex string, or a number)
@@ -1755,17 +1804,34 @@ impl RpcServer {
             }
         };
 
-        let _reward_percentiles = &request.params[2]; // Not used for now
+        // Parse reward percentiles - must be between 0-100, sorted ascending
+        let reward_percentiles = match &request.params[2] {
+            Value::Array(arr) => {
+                let mut percentiles: Vec<f64> = arr
+                    .iter()
+                    .filter_map(|v| v.as_f64())
+                    .filter(|&p| (0.0..=100.0).contains(&p))
+                    .collect();
+                percentiles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                percentiles
+            }
+            _ => vec![], // If not provided or invalid, return empty array
+        };
 
         // Get state to access EIP-1559 fee manager
         let state = state.state.lock().await;
 
-        // Calculate block range using newest_block (honor caller's newestBlock)
-        let start_block = if newest_block >= block_count {
-            newest_block - block_count + 1
-        } else {
-            1
+        // Helper function to calculate percentiles from a sorted array
+        let calculate_percentile = |sorted_values: &[U256], percentile: f64| -> U256 {
+            if sorted_values.is_empty() {
+                return U256::ZERO;
+            }
+            let index = (percentile / 100.0 * (sorted_values.len() - 1) as f64).round() as usize;
+            sorted_values[index.min(sorted_values.len() - 1)]
         };
+
+        // Calculate block range using saturating subtraction to handle genesis block and prevent underflow
+        let start_block = newest_block.saturating_sub(block_count.saturating_sub(1));
         let end_block = newest_block;
 
         // Get base fee history from EIP-1559 fee manager
@@ -1791,13 +1857,66 @@ impl RpcServer {
                     gas_used_ratios.push(0.5); // Default ratio
                 }
 
-                // For now, return a simple reward structure
-                rewards.push(vec!["0x5f5e100".to_string()]); // 0.1 Gwei priority fee
+                // Calculate reward percentiles for this block
+                if !reward_percentiles.is_empty() {
+                    let block_rewards = if let Some(block) = state.blocks.get(&block_num) {
+                        // Collect priority fees from all transactions in the block
+                        let mut priority_fees: Vec<U256> = Vec::new();
+                        for tx_hash in &block.transactions {
+                            if let Some(tx) = state.account_manager.get_transactions().iter().find(|tx| {
+                                let hash = format!(
+                                    "0x{}",
+                                    hex::encode(alloy_primitives::keccak256(&tx.raw_data))
+                                );
+                                &hash == tx_hash
+                            }) {
+                                // Extract priority fee based on transaction type
+                                match &tx.envelope {
+                                    alloy_consensus::TxEnvelope::Eip1559(tx) => {
+                                        // max_priority_fee_per_gas is a primitive (u128) — convert to U256
+                                        priority_fees.push(U256::from(tx.tx().max_priority_fee_per_gas));
+                                    }
+                                    // For non-1559 transactions, use the excess over base fee as priority fee
+                                    alloy_consensus::TxEnvelope::Legacy(tx) => {
+                                        if let Some(base_fee) = state.eip1559_fee_manager.get_base_fee_for_block(block_num) {
+                                            let tx_gas_price = U256::from(tx.tx().gas_price);
+                                            if tx_gas_price > base_fee {
+                                                priority_fees.push(tx_gas_price - base_fee);
+                                            }
+                                        }
+                                    }
+                                    _ => {} // Skip other transaction types
+                                }
+                            }
+                        }
+
+                        // Sort priority fees for percentile calculation
+                        priority_fees.sort();
+
+                        // Calculate requested percentiles
+                        reward_percentiles
+                            .iter()
+                            .map(|&p| format!("0x{:x}", calculate_percentile(&priority_fees, p)))
+                            .collect()
+                    } else {
+                        // If block not found, return zeros for all percentiles
+                        reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+                    };
+                    rewards.push(block_rewards);
+                } else {
+                    // No percentiles requested, return empty array
+                    rewards.push(vec![]);
+                }
             } else {
-                // Fallback to default values
+                // Fallback to default values when no base fee available
                 base_fees.push("0x3b9aca00".to_string()); // 1 gwei
                 gas_used_ratios.push(0.5);
-                rewards.push(vec!["0x5f5e100".to_string()]);
+                // Return empty or zero rewards based on whether percentiles were requested
+                rewards.push(if reward_percentiles.is_empty() {
+                    vec![]
+                } else {
+                    reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+                });
             }
         }
 
@@ -1805,7 +1924,12 @@ impl RpcServer {
         if base_fees.is_empty() {
             base_fees.push("0x3b9aca00".to_string()); // 1 gwei
             gas_used_ratios.push(0.5);
-            rewards.push(vec!["0x5f5e100".to_string()]);
+            // Return empty or zero rewards based on whether percentiles were requested
+            rewards.push(if reward_percentiles.is_empty() {
+                vec![]
+            } else {
+                reward_percentiles.iter().map(|_| "0x0".to_string()).collect()
+            });
         }
 
         let fee_history = json!({
