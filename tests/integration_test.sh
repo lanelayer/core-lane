@@ -21,7 +21,6 @@ TEST_CHAIN_ID=1
 TEST_BURN_AMOUNT=1000000  # 1 million sats (0.01 BTC)
 RPC_USER="bitcoin"
 RPC_PASSWORD="bitcoin123"
-RPC_WALLET="mine"
 RPC_URL="http://127.0.0.1:18443"
 JSON_RPC_PORT=8546  # Use different port to avoid conflicts
 JSON_RPC_URL="http://127.0.0.1:$JSON_RPC_PORT"
