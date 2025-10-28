@@ -1,9 +1,13 @@
 use crate::cmio::CmioMessage;
 use crate::intents::{
     decode_intent_calldata, Intent, IntentCall, IntentCommandType, IntentData, IntentStatus,
-    IntentType, RiscVProgramIntent,
+    IntentType,
 };
-use crate::state::{BundleStateManager, StateManager};
+use crate::state::BundleStateManager;
+use crate::state::StateManager;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
+use cartesi_machine::types::cmio::CmioResponseReason;
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
@@ -11,12 +15,10 @@ use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::Client;
 use bitcoincore_rpc::RpcApi;
-use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
-use cartesi_machine::config::runtime::RuntimeConfig;
+use cartesi_machine::types::cmio::AutomaticReason;
 use cartesi_machine::types::cmio::CmioRequest;
-use cartesi_machine::types::cmio::{AutomaticReason, CmioResponseReason, ManualReason};
+use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
-use ciborium::into_writer;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -48,7 +50,11 @@ pub trait ProcessingContext {
     fn state_manager(&self) -> &StateManager;
     fn state_manager_mut(&mut self) -> &mut StateManager;
     fn bitcoin_client_read(&self) -> Arc<Client>;
-    fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage>;
+    fn handle_cmio_query(
+        &mut self,
+        message: CmioMessage,
+        current_intent_id: Option<B256>,
+    ) -> Option<CmioMessage>;
 }
 
 /// Core Lane specific addresses for special operations
@@ -244,22 +250,12 @@ fn execute_transfer<T: ProcessingContext>(
                 // Build and log the extra_data hex for a RISC-V program intent using this blob
                 let mut blob_hash_bytes = [0u8; 32];
                 blob_hash_bytes.copy_from_slice(blob_hash.as_slice());
-                let riscv_intent = RiscVProgramIntent {
-                    blob_hash: blob_hash_bytes,
-                    extra_data: Vec::new(),
-                };
-                let mut inner_cbor = Vec::new();
-                let _ = into_writer(&riscv_intent, &mut inner_cbor);
-                let intent_data = IntentData {
-                    intent_type: IntentType::RiscVProgram,
-                    data: inner_cbor,
-                };
-                if let Ok(extra_data_bytes) = intent_data.to_cbor() {
-                    info!(
-                        "extra_data_hex for RiscVProgram: 0x{}",
-                        hex::encode(extra_data_bytes)
-                    );
-                }
+
+                info!(
+                    "storeBlob: RiscVProgram intentData constructed; blob_hash = {}",
+                    blob_hash
+                );
+
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -393,6 +389,7 @@ fn execute_transfer<T: ProcessingContext>(
                         creator: sender,
                     },
                 );
+                info!("Intent submitted: intent_id = {}", intent_id);
                 return Ok(ExecutionResult {
                     success: true,
                     gas_used,
@@ -421,65 +418,13 @@ fn execute_transfer<T: ProcessingContext>(
                 });
             }
             Some(IntentCall::LockIntentForSolving { intent_id, .. }) => {
-                if let Some(intent) = bundle_state.get_intent_mut(state.state_manager(), &intent_id)
-                {
-                    match intent.status {
-                        IntentStatus::Submitted => {
-                            intent.status = IntentStatus::Locked(sender);
-                            intent.last_command = IntentCommandType::LockIntentForSolving;
-                            if let Err(e) =
-                                bundle_state.increment_nonce(state.state_manager(), sender)
-                            {
-                                return Ok(ExecutionResult {
-                                    success: false,
-                                    gas_used,
-                                    gas_refund: U256::ZERO,
-                                    output: Bytes::new(),
-                                    logs: vec![format!("Failed to increment nonce: {}", e)],
-                                    error: Some(e.to_string()),
-                                });
-                            }
-                            return Ok(ExecutionResult {
-                                success: true,
-                                gas_used,
-                                gas_refund: U256::ZERO,
-                                output: Bytes::new(),
-                                logs: vec!["Intent locked".to_string()],
-                                error: None,
-                            });
-                        }
-                        IntentStatus::Locked(_) => {
-                            return Ok(ExecutionResult {
-                                success: false,
-                                gas_used,
-                                gas_refund: U256::ZERO,
-                                output: Bytes::new(),
-                                logs: vec!["lockIntentForSolving: already locked".to_string()],
-                                error: Some("Already locked".to_string()),
-                            });
-                        }
-                        IntentStatus::Solved => {
-                            return Ok(ExecutionResult {
-                                success: false,
-                                gas_used,
-                                gas_refund: U256::ZERO,
-                                output: Bytes::new(),
-                                logs: vec!["lockIntentForSolving: already solved".to_string()],
-                                error: Some("Already solved".to_string()),
-                            });
-                        }
-                        IntentStatus::Cancelled => {
-                            return Ok(ExecutionResult {
-                                success: false,
-                                gas_used,
-                                gas_refund: U256::ZERO,
-                                output: Bytes::new(),
-                                logs: vec!["lockIntentForSolving: cancelled".to_string()],
-                                error: Some("Cancelled".to_string()),
-                            });
-                        }
-                    }
-                } else {
+                let (status_snapshot, intent_data) =
+                    match bundle_state.get_intent(state.state_manager(), &intent_id) {
+                        Some(i) => (Some(i.status), IntentData::from_cbor(&i.data).ok()),
+                        None => (None, None),
+                    };
+
+                if status_snapshot.is_none() {
                     return Ok(ExecutionResult {
                         success: false,
                         gas_used,
@@ -488,6 +433,101 @@ fn execute_transfer<T: ProcessingContext>(
                         logs: vec!["lockIntentForSolving: intent not found".to_string()],
                         error: Some("Intent not found".to_string()),
                     });
+                }
+
+                match status_snapshot.unwrap() {
+                    IntentStatus::Submitted => {
+                        let original_main_intent =
+                            state.state_manager().get_intent(&intent_id).cloned();
+                        if let Some(mut updated_intent) = original_main_intent.clone() {
+                            updated_intent.last_command = IntentCommandType::LockIntentForSolving;
+                            state
+                                .state_manager_mut()
+                                .insert_intent(intent_id, updated_intent);
+                        }
+
+                        if let Some(intent_data) = intent_data.as_ref() {
+                            if intent_data.intent_type == IntentType::RiscVProgram {
+                                let permission = check_riscv_intent_permission(
+                                    bundle_state,
+                                    state,
+                                    intent_data,
+                                    intent_id,
+                                )?;
+                                if permission == 1 {
+                                    if let Some(original_intent) = original_main_intent {
+                                        state
+                                            .state_manager_mut()
+                                            .insert_intent(intent_id, original_intent);
+                                    }
+                                    return Ok(ExecutionResult {
+                                        success: false,
+                                        gas_used,
+                                        gas_refund: U256::ZERO,
+                                        output: Bytes::new(),
+                                        logs: vec!["Permission denied".to_string()],
+                                        error: Some("Permission denied".to_string()),
+                                    });
+                                }
+                            }
+                        }
+
+                        if let Some(intent) =
+                            bundle_state.get_intent_mut(state.state_manager(), &intent_id)
+                        {
+                            intent.status = IntentStatus::Locked(sender);
+                            intent.last_command = IntentCommandType::LockIntentForSolving;
+                        }
+                        if let Err(e) = bundle_state.increment_nonce(state.state_manager(), sender)
+                        {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec![format!("Failed to increment nonce: {}", e)],
+                                error: Some(e.to_string()),
+                            });
+                        }
+                        return Ok(ExecutionResult {
+                            success: true,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["Intent locked".to_string()],
+                            error: None,
+                        });
+                    }
+                    IntentStatus::Locked(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["lockIntentForSolving: already locked".to_string()],
+                            error: Some("Already locked".to_string()),
+                        });
+                    }
+                    IntentStatus::Solved => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["lockIntentForSolving: already solved".to_string()],
+                            error: Some("Already solved".to_string()),
+                        });
+                    }
+                    IntentStatus::Cancelled => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["lockIntentForSolving: cancelled".to_string()],
+                            error: Some("Cancelled".to_string()),
+                        });
+                    }
                 }
             }
             Some(IntentCall::SolveIntent { intent_id, data }) => {
@@ -627,6 +667,14 @@ fn execute_transfer<T: ProcessingContext>(
                         }
                     }
                     IntentType::RiscVProgram => {
+                        if let Some(main_intent) = state.state_manager().get_intent(&intent_id) {
+                            let mut updated_intent = main_intent.clone();
+                            updated_intent.last_command = IntentCommandType::SolveIntent;
+                            state
+                                .state_manager_mut()
+                                .insert_intent(intent_id, updated_intent);
+                        }
+
                         let intent_value = bundle_state
                             .get_intent(state.state_manager(), &intent_id)
                             .ok_or_else(|| anyhow!("Intent disappeared"))?
@@ -642,7 +690,24 @@ fn execute_transfer<T: ProcessingContext>(
                             intent.status = IntentStatus::Solved;
                             intent.last_command = IntentCommandType::SolveIntent;
                             bundle_state.increment_nonce(state.state_manager(), sender)?;
-                            run_intent_for(bundle_state, state, intent_id)?;
+                            let permission = check_riscv_intent_permission(
+                                bundle_state,
+                                state,
+                                &cbor_intent,
+                                intent_id,
+                            )?;
+
+                            if permission == 1 {
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec!["solveIntent: permission denied by RISC-V program"
+                                        .to_string()],
+                                    error: Some("Permission denied".to_string()),
+                                });
+                            }
                         }
                         return Ok(ExecutionResult {
                             success: true,
@@ -692,12 +757,54 @@ fn execute_transfer<T: ProcessingContext>(
                     }
                 };
                 {
-                    let intent = bundle_state
-                        .get_intent_mut(state.state_manager(), &intent_id)
-                        .unwrap();
+                    let intent_data = {
+                        let intent = bundle_state
+                            .get_intent(state.state_manager(), &intent_id)
+                            .ok_or_else(|| anyhow!("Intent disappeared"))?;
+                        IntentData::from_cbor(&intent.data)?
+                    };
+                    if intent_data.intent_type == IntentType::RiscVProgram {
+                        let original_main_intent =
+                            state.state_manager().get_intent(&intent_id).cloned();
+                        if let Some(mut updated_intent) = original_main_intent.clone() {
+                            updated_intent.last_command = IntentCommandType::CancelIntent;
+                            state
+                                .state_manager_mut()
+                                .insert_intent(intent_id, updated_intent);
+                        }
 
-                    intent.status = IntentStatus::Cancelled;
-                    intent.last_command = IntentCommandType::CancelIntent;
+                        let permission = check_riscv_intent_permission(
+                            bundle_state,
+                            state,
+                            &intent_data,
+                            intent_id,
+                        )?;
+
+                        if permission == 1 {
+                            if let Some(original_intent) = original_main_intent {
+                                state
+                                    .state_manager_mut()
+                                    .insert_intent(intent_id, original_intent);
+                            }
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec![
+                                    "cancelIntent: permission denied by RISC-V program".to_string()
+                                ],
+                                error: Some("Permission denied".to_string()),
+                            });
+                        }
+                    }
+
+                    if let Some(intent_mut) =
+                        bundle_state.get_intent_mut(state.state_manager(), &intent_id)
+                    {
+                        intent_mut.status = IntentStatus::Cancelled;
+                        intent_mut.last_command = IntentCommandType::CancelIntent;
+                    }
                 }
                 bundle_state.add_balance(state.state_manager(), creator, U256::from(value))?;
                 bundle_state.increment_nonce(state.state_manager(), sender)?;
@@ -712,8 +819,7 @@ fn execute_transfer<T: ProcessingContext>(
                 });
             }
             Some(IntentCall::CancelIntentLock { intent_id, .. }) => {
-                if let Some(intent) = bundle_state.get_intent_mut(state.state_manager(), &intent_id)
-                {
+                if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id) {
                     match intent.status {
                         IntentStatus::Locked(locker) => {
                             if locker != sender {
@@ -726,8 +832,52 @@ fn execute_transfer<T: ProcessingContext>(
                                     error: Some("Not locker".to_string()),
                                 });
                             }
-                            intent.status = IntentStatus::Submitted;
-                            intent.last_command = IntentCommandType::CancelIntentLock;
+
+                            let intent_data = IntentData::from_cbor(&intent.data)?;
+                            if intent_data.intent_type == IntentType::RiscVProgram {
+                                let original_main_intent =
+                                    state.state_manager().get_intent(&intent_id).cloned();
+                                if let Some(mut updated_intent) = original_main_intent.clone() {
+                                    updated_intent.last_command =
+                                        IntentCommandType::CancelIntentLock;
+                                    state
+                                        .state_manager_mut()
+                                        .insert_intent(intent_id, updated_intent);
+                                }
+
+                                let permission = check_riscv_intent_permission(
+                                    bundle_state,
+                                    state,
+                                    &intent_data,
+                                    intent_id,
+                                )?;
+
+                                if permission == 1 {
+                                    if let Some(original_intent) = original_main_intent {
+                                        state
+                                            .state_manager_mut()
+                                            .insert_intent(intent_id, original_intent);
+                                    }
+                                    return Ok(ExecutionResult {
+                                        success: false,
+                                        gas_used,
+                                        gas_refund: U256::ZERO,
+                                        output: Bytes::new(),
+                                        logs: vec![
+                                            "cancelIntentLock: permission denied by RISC-V program"
+                                                .to_string(),
+                                        ],
+                                        error: Some("Permission denied".to_string()),
+                                    });
+                                }
+                            }
+
+                            if let Some(intent_mut) =
+                                bundle_state.get_intent_mut(state.state_manager(), &intent_id)
+                            {
+                                intent_mut.status = IntentStatus::Submitted;
+                                intent_mut.last_command = IntentCommandType::CancelIntentLock;
+                            }
                             bundle_state.increment_nonce(state.state_manager(), sender)?;
                             return Ok(ExecutionResult {
                                 success: true,
@@ -956,10 +1106,21 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     Ok(false)
 }
 
-fn run_intent_with_image<T: ProcessingContext>(
+fn check_riscv_intent_permission<T: ProcessingContext>(
+    bundle_state: &BundleStateManager,
     state: &mut T,
-    program_blob: Option<Vec<u8>>,
-) -> Result<()> {
+    intent_data: &IntentData,
+    intent_id: B256,
+) -> Result<u32> {
+    let riscv_program_intent = intent_data.parse_riscv_program()?;
+    let blob_hash = B256::from_slice(&riscv_program_intent.blob_hash);
+    // Look up program blob from pending bundle if available, fall back to persisted state
+    let program_blob = bundle_state
+        .stored_blobs
+        .get(&blob_hash)
+        .or_else(|| state.state_manager().get_blob(&blob_hash))
+        .ok_or_else(|| anyhow::anyhow!("Program blob not found for hash {:?}", blob_hash))?;
+
     let mut machine = Machine::create(
         &MachineConfig::new_with_ram(RAMConfig {
             length: 134217728,
@@ -969,9 +1130,10 @@ fn run_intent_with_image<T: ProcessingContext>(
     )?;
 
     let opensbi = include_bytes!("../opensbi.bin");
-
     machine.write_memory(0x8000_0000u64, opensbi.as_ref())?;
-    machine.write_memory(0x8020_0000u64, program_blob.unwrap().as_ref())?;
+    machine.write_memory(0x8020_0000u64, program_blob)?;
+
+    let mut permission = 1;
 
     loop {
         let reason = machine.run(u64::MAX)?;
@@ -980,7 +1142,6 @@ fn run_intent_with_image<T: ProcessingContext>(
         }
         match machine.receive_cmio_request() {
             Ok(req) => {
-                info!("Handling CMIO request: {:?}", req);
                 let data = match req {
                     CmioRequest::Automatic(AutomaticReason::TxOutput { data }) => data,
                     CmioRequest::Manual(ManualReason::GIO { data, .. }) => data,
@@ -989,21 +1150,23 @@ fn run_intent_with_image<T: ProcessingContext>(
                         continue;
                     }
                 };
-                info!("Handling CMIO data: {:?}", data);
 
                 if let Ok(msg) = CmioMessage::from_bytes(&data) {
-                    if let CmioMessage::Exit { code: _ } = msg {
-                        machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                    info!(
+                        "Handling CMIO query: {:?} machine m_cycles: {}",
+                        msg,
+                        machine.mcycle()?
+                    );
+                    let response = state.handle_cmio_query(msg, Some(intent_id));
+                    if let Some(CmioMessage::Exit { code }) = response {
+                        info!("Permission granted: {}", code);
+                        permission = code;
                         break;
+                    } else if let Some(response_msg) = response {
+                        let resp_bytes = response_msg.to_bytes().unwrap_or_default();
+                        machine.send_cmio_response(CmioResponseReason::Advance, &resp_bytes)?;
+                        continue;
                     }
-                    info!("Handling CMIO query: {:?}", msg);
-                    let response = state.handle_cmio_query(msg);
-                    let resp_bytes = response
-                        .map(|r| r.to_bytes().unwrap_or_default())
-                        .unwrap_or_default();
-                    machine.send_cmio_response(CmioResponseReason::Advance, &resp_bytes)?;
-                    // keep running until Exit
-                    continue;
                 } else {
                     machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
                     continue;
@@ -1013,37 +1176,5 @@ fn run_intent_with_image<T: ProcessingContext>(
         }
     }
 
-    let _ = machine.run(u64::MAX)?;
-
-    Ok(())
-}
-
-fn run_intent_for<T: ProcessingContext>(
-    bundle_state: &mut BundleStateManager,
-    state: &mut T,
-    intent_id: B256,
-) -> Result<()> {
-    let mut program_blob: Option<Vec<u8>> = None;
-    if let Some(intent) = bundle_state.get_intent(state.state_manager(), &intent_id) {
-        if let Ok(intent_data) = IntentData::from_cbor(&intent.data) {
-            if intent_data.intent_type == crate::intents::IntentType::RiscVProgram {
-                if let Ok(prog) = intent_data.parse_riscv_program() {
-                    let blob_hash = B256::from_slice(&prog.blob_hash);
-                    if let Some(bytes) = state.state_manager().get_blob(&blob_hash) {
-                        bundle_state.insert_blob(blob_hash, bytes.clone());
-                        program_blob = Some(bytes.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    if program_blob.is_none() {
-        return Err(anyhow::anyhow!(
-            "Program blob not found for intent {:?}",
-            intent_id
-        ));
-    }
-    run_intent_with_image(state, program_blob)?;
-    Ok(())
+    Ok(permission)
 }
