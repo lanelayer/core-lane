@@ -132,9 +132,13 @@ impl transaction::ProcessingContext for CoreLaneStateForLib {
         self.bitcoin_client_read.clone()
     }
 
-    fn handle_cmio_query(&mut self, message: cmio::CmioMessage) -> Option<cmio::CmioMessage> {
+    fn handle_cmio_query(
+        &mut self,
+        message: cmio::CmioMessage,
+        current_intent_id: Option<B256>,
+    ) -> Option<cmio::CmioMessage> {
         // Use the shared CMIO handler from the cmio module
-        cmio::handle_cmio_query(message, &self.account_manager)
+        cmio::handle_cmio_query(message, &self.account_manager, current_intent_id)
     }
 }
 

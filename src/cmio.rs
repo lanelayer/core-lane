@@ -1,14 +1,14 @@
 use crate::intents::IntentCommandType;
 use crate::state::StateManager;
+use crate::IntentData;
+use crate::IntentType;
 use alloy_primitives::B256;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-
+use tracing::warn;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CmioMessage {
-    QueryCommandType {
-        intent_id: String,
-    },
+    QueryCommandType {},
     CommandTypeResponse {
         command_type: IntentCommandType,
         success: bool,
@@ -36,6 +36,10 @@ pub enum CmioMessage {
     },
     Log {
         message: String,
+    },
+    ReadExtraData {},
+    ExtraDataResponse {
+        extra_data: Vec<u8>,
     },
     Exit {
         code: u32,
@@ -65,16 +69,20 @@ fn parse_b256(hex_input: &str) -> Option<B256> {
 pub fn handle_cmio_query(
     message: CmioMessage,
     state_manager: &StateManager,
+    current_intent_id: Option<B256>,
 ) -> Option<CmioMessage> {
     match message {
-        CmioMessage::QueryCommandType { intent_id } => {
-            let intent_id_b256 = parse_b256(&intent_id)?;
-            state_manager.get_intent(&intent_id_b256).map(|intent| {
-                CmioMessage::CommandTypeResponse {
+        CmioMessage::QueryCommandType {} => {
+            let Some(intent_id) = current_intent_id else {
+                warn!("QueryCommandType called without current intent context");
+                return None;
+            };
+            state_manager
+                .get_intent(&intent_id)
+                .map(|intent| CmioMessage::CommandTypeResponse {
                     command_type: intent.last_command,
                     success: true,
-                }
-            })
+                })
         }
         CmioMessage::ReadIntentData { intent_id } => {
             let intent_id_b256 = parse_b256(&intent_id)?;
@@ -122,7 +130,39 @@ pub fn handle_cmio_query(
             tracing::info!(target = "cmio", "CM LOG: {}", message);
             None
         }
-        CmioMessage::Exit { .. } => None,
+        CmioMessage::ReadExtraData {} => {
+            if let Some(intent_id) = current_intent_id {
+                if let Some(intent) = state_manager.get_intent(&intent_id) {
+                    let intent_data = match IntentData::from_cbor(&intent.data) {
+                        Ok(data) => data,
+                        Err(_) => {
+                            return Some(CmioMessage::ExtraDataResponse { extra_data: vec![] });
+                        }
+                    };
+
+                    if intent_data.intent_type == IntentType::RiscVProgram {
+                        let riscv_intent = match intent_data.parse_riscv_program() {
+                            Ok(prog) => prog,
+                            Err(_) => {
+                                return Some(CmioMessage::ExtraDataResponse { extra_data: vec![] });
+                            }
+                        };
+
+                        Some(CmioMessage::ExtraDataResponse {
+                            extra_data: riscv_intent.extra_data,
+                        })
+                    } else {
+                        Some(CmioMessage::ExtraDataResponse { extra_data: vec![] })
+                    }
+                } else {
+                    Some(CmioMessage::ExtraDataResponse { extra_data: vec![] })
+                }
+            } else {
+                warn!("ReadExtraData called but no current intent context available");
+                Some(CmioMessage::ExtraDataResponse { extra_data: vec![] })
+            }
+        }
+        CmioMessage::Exit { code } => Some(CmioMessage::Exit { code }),
         _ => None,
     }
 }

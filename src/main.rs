@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
@@ -648,9 +649,13 @@ impl transaction::ProcessingContext for CoreLaneState {
         self.bitcoin_client_read.clone()
     }
 
-    fn handle_cmio_query(&mut self, message: CmioMessage) -> Option<CmioMessage> {
+    fn handle_cmio_query(
+        &mut self,
+        message: CmioMessage,
+        current_intent_id: Option<B256>,
+    ) -> Option<CmioMessage> {
         // Use the shared CMIO handler from the cmio module
-        cmio::handle_cmio_query(message, &self.account_manager)
+        cmio::handle_cmio_query(message, &self.account_manager, current_intent_id)
     }
 }
 
@@ -1068,6 +1073,13 @@ impl CoreLaneNode {
     }
 
     async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<u64> {
+        let block_start_time = Instant::now();
+        let bitcoin_height = bitcoin_block.anchor_block_height;
+        info!(
+            "Starting block execution for Bitcoin block height: {}",
+            bitcoin_height
+        );
+
         // 🔍 REORG DETECTION: Check for blockchain reorganizations
         {
             let state = self.state.lock().await;
@@ -1216,6 +1228,12 @@ impl CoreLaneNode {
         self.finalize_current_block(core_lane_transactions, new_block)
             .await?;
 
+        let block_execution_time = block_start_time.elapsed();
+        info!(
+            "Block execution completed in {:?} for Bitcoin block height: {} -> Core Lane block: {}",
+            block_execution_time, bitcoin_height, core_lane_block_number
+        );
+
         Ok(core_lane_block_number)
     }
 
@@ -1226,6 +1244,8 @@ impl CoreLaneNode {
         block_number: u64,
         tx_number: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
+        let tx_start_time = Instant::now();
+
         let mut state = self.state.lock().await;
         let gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
 
@@ -1406,6 +1426,12 @@ impl CoreLaneNode {
 
         // Print account balances after execution
         debug!("   💰 Account balance after execution: {}", final_balance);
+
+        let tx_execution_time = tx_start_time.elapsed();
+        debug!(
+            "Transaction executed in {:?} (tx #{})",
+            tx_execution_time, tx_number
+        );
 
         drop(state); // Release lock
         Some((stored_tx, receipt, tx_hash))

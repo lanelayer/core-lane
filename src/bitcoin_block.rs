@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use alloy_primitives::{Address, U256};
 use bitcoin::{
@@ -19,6 +20,7 @@ pub fn process_bitcoin_block(
     bitcoin_client: Arc<Client>,
     height: u64,
 ) -> Result<CoreLaneBlockParsed, anyhow::Error> {
+    let bitcoin_start_time = Instant::now();
     info!(
         "📦 Processing Bitcoin block {} with height {}",
         height, height
@@ -85,6 +87,12 @@ pub fn process_bitcoin_block(
             }
         }
     }
+
+    let bitcoin_processing_time = bitcoin_start_time.elapsed();
+    info!(
+        "Bitcoin block processing completed in {:?} for height: {}",
+        bitcoin_processing_time, height
+    );
 
     Ok(core_lane_block)
 }
