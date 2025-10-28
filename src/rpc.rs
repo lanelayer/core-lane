@@ -1753,14 +1753,13 @@ impl RpcServer {
         // Get state to access EIP-1559 fee manager
         let state = state.state.lock().await;
 
-        // Calculate block range
-        let current_block = state.blocks.len() as u64;
-        let start_block = if current_block > block_count {
-            current_block - block_count + 1
+        // Calculate block range using newest_block (honor caller's newestBlock)
+        let start_block = if newest_block >= block_count {
+            newest_block - block_count + 1
         } else {
             1
         };
-        let end_block = current_block;
+        let end_block = newest_block;
 
         // Get base fee history from EIP-1559 fee manager
         let _base_fee_history = state
