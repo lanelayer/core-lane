@@ -209,8 +209,6 @@ enum Commands {
         http_host: String,
         #[arg(long, default_value = "8545")]
         http_port: u16,
-        #[arg(long, default_value = "mine")]
-        rpc_wallet: String,
         /// Mnemonic phrase for signing (not recommended - visible in process list)
         #[arg(long)]
         mnemonic: Option<String>,
@@ -1749,7 +1747,6 @@ async fn main() -> Result<()> {
             start_block,
             http_host,
             http_port,
-            rpc_wallet,
             mnemonic,
             mnemonic_file,
             electrum_url,
@@ -1757,9 +1754,7 @@ async fn main() -> Result<()> {
             // Resolve mnemonic from various sources
             let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
 
-            let wallet = rpc_wallet.to_string();
-
-            // Create read client (without wallet endpoint)
+            // Create read client
             let read_client = bitcoincore_rpc::Client::new(
                 bitcoin_rpc_read_url,
                 Auth::UserPass(
@@ -1779,9 +1774,9 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .unwrap_or(bitcoin_rpc_read_password);
 
-            // Write client connects to wallet endpoint for wallet operations
+            // Write client - user can customize the URL themselves
             let write_client = bitcoincore_rpc::Client::new(
-                &format!("{}/wallet/{}", write_url, rpc_wallet),
+                write_url,
                 Auth::UserPass(write_user.to_string(), write_password.to_string()),
             )?;
 
@@ -1805,7 +1800,7 @@ async fn main() -> Result<()> {
 
             info!("🔗 Bitcoin RPC connections configured:");
             info!("   📖 Read:  {}", bitcoin_rpc_read_url);
-            info!("   ✍️  Write: {}/wallet/{}", write_url, rpc_wallet);
+            info!("   ✍️  Write: {}", write_url);
 
             let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone());
 
@@ -1815,7 +1810,7 @@ async fn main() -> Result<()> {
                 shared_state,
                 node.bitcoin_client_write.clone(),
                 network,
-                wallet,
+                String::new(), // wallet parameter no longer used
                 mnemonic_str.clone(),
                 electrum_url.clone(),
                 cli.data_dir.clone(),
