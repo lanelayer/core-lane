@@ -1721,9 +1721,33 @@ impl RpcServer {
             }));
         }
 
-        // Parse parameters: blockCount, newestBlock, rewardPercentiles
-        let block_count = request.params[0].as_u64().unwrap_or(10);
-        let _newest_block = request.params[1].as_str().unwrap_or("latest");
+        // Parse block count from hex string
+        let block_count = match &request.params[0] {
+            Value::String(s) => {
+                let s = s.trim_start_matches("0x");
+                u64::from_str_radix(s, 16).unwrap_or(1)
+            }
+            Value::Number(n) => n.as_u64().unwrap_or(1),
+            _ => 1,
+        };
+
+        // Parse newest block
+        let newest_block = match &request.params[1] {
+            Value::String(s) if s == "latest" || s == "pending" => {
+                let state = state.state.lock().await;
+                state.blocks.len() as u64
+            }
+            Value::String(s) => {
+                let s = s.trim_start_matches("0x");
+                let state = state.state.lock().await;
+                u64::from_str_radix(s, 16).unwrap_or_else(|_| state.blocks.len() as u64)
+            }
+            _ => {
+                let state = state.state.lock().await;
+                state.blocks.len() as u64
+            }
+        };
+
         let _reward_percentiles = &request.params[2]; // Not used for now
 
         // Get state to access EIP-1559 fee manager
