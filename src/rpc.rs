@@ -1731,20 +1731,27 @@ impl RpcServer {
             _ => 1,
         };
 
-        // Parse newest block
-        let newest_block = match &request.params[1] {
-            Value::String(s) if s == "latest" || s == "pending" => {
-                let state = state.state.lock().await;
-                state.blocks.len() as u64
-            }
+        // Parse newest block parameter (may be "latest"/"pending", a hex string, or a number)
+        // We parse the caller's requested newest block first without holding the main lock,
+        // then take a short-lived lock to read the highest available block and clamp to it.
+        let parsed_newest: Option<u64> = match &request.params[1] {
+            Value::String(s) if s == "latest" || s == "pending" => None,
             Value::String(s) => {
                 let s = s.trim_start_matches("0x");
-                let state = state.state.lock().await;
-                u64::from_str_radix(s, 16).unwrap_or_else(|_| state.blocks.len() as u64)
+                u64::from_str_radix(s, 16).ok()
             }
-            _ => {
-                let state = state.state.lock().await;
-                state.blocks.len() as u64
+            Value::Number(n) => n.as_u64(),
+            _ => None,
+        };
+
+        // Short lock to determine the highest available block, then clamp the parsed value to it.
+        let newest_block = {
+            let state_guard = state.state.lock().await;
+            // highest block number present in the map (keys are block numbers)
+            let highest_block = state_guard.blocks.keys().max().copied().unwrap_or(0);
+            match parsed_newest {
+                Some(n) => std::cmp::min(n, highest_block),
+                None => highest_block,
             }
         };
 
