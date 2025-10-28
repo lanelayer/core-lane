@@ -41,7 +41,6 @@ services:
       --bitcoin-rpc-write-user ${RPC_USER:-bitcoin}
       --bitcoin-rpc-write-password ${RPC_PASSWORD:-bitcoin123}
       --start-block 916201
-      --rpc-wallet hot
       --mnemonic \"$$CORE_LANE_MNEMONIC\"
       --electrum-url \"$$ELECTRUM_URL\"
       --http-host 0.0.0.0
