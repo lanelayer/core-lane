@@ -804,10 +804,64 @@ impl BitcoinCacheRpcServer {
             tx_count
         );
 
+        // Print transaction hex for debugging
+        if let Some(tx_array) = package_txs.as_array() {
+            for (i, tx) in tx_array.iter().enumerate() {
+                if let Some(tx_hex) = tx.as_str() {
+                    info!("📝 Transaction {} hex: {}", i + 1, tx_hex);
+                }
+            }
+        }
+
         // Forward to upstream Bitcoin RPC using HTTP client
         let result = self
             .forward_rpc_call("submitpackage", vec![package_txs])
             .await?;
+
+        // Verify the submission was successful
+        if let Some(tx_results) = result.get("tx-results").and_then(|v| v.as_object()) {
+            let mut success_count = 0;
+            let mut error_count = 0;
+
+            for (wtxid, tx_result) in tx_results {
+                if let Some(result_obj) = tx_result.as_object() {
+                    // Check if there's an error field that's not null
+                    let has_error = result_obj
+                        .get("error")
+                        .map(|e| !e.is_null())
+                        .unwrap_or(false);
+
+                    if has_error {
+                        error_count += 1;
+                        if let Some(error) = result_obj.get("error") {
+                            warn!("❌ Transaction wtxid {} failed: {}", wtxid, error);
+                        }
+                    } else {
+                        success_count += 1;
+                        // Extract actual txid if available, otherwise use wtxid
+                        let display_id = result_obj
+                            .get("txid")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or(wtxid);
+                        info!(
+                            "✅ Transaction {} submitted successfully (wtxid: {})",
+                            display_id, wtxid
+                        );
+                    }
+                }
+            }
+
+            info!(
+                "📊 Package submission result: {} successful, {} failed",
+                success_count, error_count
+            );
+
+            if error_count > 0 {
+                warn!("⚠️  Some transactions in package failed to submit");
+            }
+        } else {
+            warn!("⚠️  Could not parse tx-results from submitpackage response");
+        }
 
         info!("✅ Forwarded submitpackage to upstream Bitcoin RPC");
         Ok(result)
@@ -820,10 +874,20 @@ impl BitcoinCacheRpcServer {
             &raw_tx_hex[..32.min(raw_tx_hex.len())]
         );
 
+        // Print full transaction hex for debugging
+        info!("📝 Transaction hex: {}", raw_tx_hex);
+
         // Forward to upstream Bitcoin RPC using HTTP client
         let result = self
             .forward_rpc_call("sendrawtransaction", vec![json!(raw_tx_hex)])
             .await?;
+
+        // Verify the submission was successful
+        if let Some(tx_id) = result.as_str() {
+            info!("✅ Transaction {} submitted successfully", tx_id);
+        } else {
+            warn!("⚠️  Could not parse transaction ID from sendrawtransaction response");
+        }
 
         info!("✅ Forwarded sendrawtransaction to upstream Bitcoin RPC");
         Ok(result)

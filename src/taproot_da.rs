@@ -535,6 +535,9 @@ impl TaprootDA {
         ];
 
         tracing::info!("📦 Submitting commit + reveal transactions as package...");
+        tracing::info!("📝 Commit transaction hex: {}", commit_tx_hex);
+        tracing::info!("📝 Reveal transaction hex: {}", reveal_final_hex);
+
         let package_result: Result<serde_json::Value, _> = self
             .bitcoin_client
             .call("submitpackage", &[serde_json::json!(package_txs)]);
