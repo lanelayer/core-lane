@@ -14,7 +14,7 @@ use bitcoin::{
 use bitcoincore_rpc::{Client, RpcApi};
 use tracing::{debug, info, trace, warn};
 
-use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBurn};
+use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn};
 
 pub fn process_bitcoin_block(
     bitcoin_client: Arc<Client>,
@@ -84,6 +84,41 @@ pub fn process_bitcoin_block(
                     "   ❌ Failed to decode Core Lane DA transaction in tx {}: {}",
                     tx_index, txid
                 );
+            }
+        }
+    }
+
+    // Third pass: Look for CORE_BNDL bundles
+    for (tx_index, tx) in block.txdata.iter().enumerate() {
+        let txid = tx.compute_txid();
+
+        if let Some(bundle_data) = extract_core_bndl_transaction(tx) {
+            info!(
+                "   📦 Found Core Lane Bundle (CORE_BNDL) in tx {}: {}",
+                tx_index, txid
+            );
+
+            match CoreLaneBundleCbor::from_cbor(&bundle_data) {
+                Ok(cbor_bundle) => {
+                    info!(
+                        "   📦 Bundle contains {} transactions",
+                        cbor_bundle.transactions.len()
+                    );
+                    if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
+                        warn!(
+                            "   ❌ Failed to process Core Lane Bundle in tx {}: {} - {}",
+                            tx_index, txid, e
+                        );
+                    } else {
+                        info!("   ✅ Successfully processed Core Lane Bundle");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "   ❌ Failed to parse CORE_BNDL data in tx {}: {} - {}",
+                        tx_index, txid, e
+                    );
+                }
             }
         }
     }
@@ -368,6 +403,172 @@ fn extract_envelope_data_bitcoin_da_style(script: &Script) -> Option<Vec<u8>> {
         }
 
         return Some(clean_tx_data.to_vec());
+    }
+
+    None
+}
+
+fn extract_core_bndl_transaction(tx: &Transaction) -> Option<Vec<u8>> {
+    // Look for CORE_BNDL transactions in Bitcoin DA envelopes
+    // Check inputs for witness data (revealed Taproot envelopes)
+    for (input_idx, input) in tx.input.iter().enumerate() {
+        if input.witness.len() >= 2 {
+            trace!(
+                "   🔍 Input {} has witness with {} elements (CORE_BNDL check)",
+                input_idx,
+                input.witness.len()
+            );
+
+            if let Some(script_bytes) = input.witness.to_vec().first() {
+                let script = Script::from_bytes(script_bytes);
+
+                // Use the bitcoin-data-layer extraction logic for CORE_BNDL
+                if let Some(data) = extract_envelope_data_bitcoin_da_style_core_bndl(script) {
+                    // If we got data back, it means we found a CORE_BNDL transaction
+                    if !data.is_empty() {
+                        info!("   🎯 Found CORE_BNDL transaction in Taproot envelope!");
+                        return Some(data);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check outputs (for newly created Taproot envelopes)
+    for output in &tx.output {
+        // For Taproot outputs, we need to check if this is a P2TR address
+        // and then try to extract the embedded data
+        let script_pubkey = &output.script_pubkey;
+
+        // Check if this is a P2TR output
+        if script_pubkey.as_bytes().len() == 34 && script_pubkey.as_bytes()[0] == 0x51 {
+            // This is a P2TR output, but we can't directly extract the data
+            // because it's committed in the Taproot tree
+            // We'll need to look for the actual spend transaction later
+            debug!("   🔍 Found P2TR output (potential CORE_BNDL envelope)");
+        }
+    }
+
+    None
+}
+
+// Extract CORE_BNDL data using the bitcoin-data-layer extraction logic
+fn extract_envelope_data_bitcoin_da_style_core_bndl(script: &Script) -> Option<Vec<u8>> {
+    let mut instr = script.instructions();
+
+    let first = instr.next().and_then(|r| r.ok());
+    if first != Some(Instruction::Op(OP_FALSE))
+        && first
+            != Some(Instruction::PushBytes(
+                bitcoin::blockdata::script::PushBytes::empty(),
+            ))
+    {
+        return None;
+    }
+
+    if instr.next().and_then(|r| r.ok()) != Some(Instruction::Op(OP_IF)) {
+        return None;
+    }
+
+    // Collect all push operations between OP_IF and OP_ENDIF
+    let mut push_operations: Vec<Vec<u8>> = Vec::new();
+    loop {
+        match instr.next().and_then(|r| r.ok()) {
+            Some(Instruction::Op(OP_ENDIF)) => break,
+            Some(Instruction::PushBytes(b)) => {
+                push_operations.push(b.as_bytes().to_vec());
+            }
+            _ => return None,
+        }
+    }
+
+    let last = instr.next().and_then(|r| r.ok());
+    if last != Some(Instruction::Op(OP_TRUE))
+        && last
+            != Some(Instruction::Op(
+                bitcoin::blockdata::opcodes::all::OP_PUSHNUM_1,
+            ))
+    {
+        return None;
+    }
+
+    trace!(
+        "   🔍 CORE_BNDL Script analysis: found {} push operations",
+        push_operations.len()
+    );
+    for (i, push_op) in push_operations.iter().enumerate() {
+        trace!("     Push[{}]: {} bytes", i, push_op.len());
+        if push_op.len() < 100 {
+            trace!("     Push[{}] hex: {}", i, hex::encode(push_op));
+        } else {
+            trace!(
+                "     Push[{}] (first 50): {}",
+                i,
+                hex::encode(&push_op[..50])
+            );
+            trace!(
+                "     Push[{}] (last 50): {}",
+                i,
+                hex::encode(&push_op[push_op.len() - 50..])
+            );
+        }
+    }
+
+    // Concatenate all push operations to get the complete data
+    let mut data: Vec<u8> = Vec::new();
+    for push_op in push_operations {
+        data.extend_from_slice(&push_op);
+    }
+
+    trace!("   🔍 CORE_BNDL Concatenated data: {} bytes", data.len());
+    if data.len() < 100 {
+        trace!("   🔍 CORE_BNDL Concatenated hex: {}", hex::encode(&data));
+    } else {
+        trace!(
+            "   🔍 CORE_BNDL Concatenated (first 50): {}",
+            hex::encode(&data[..50])
+        );
+        trace!(
+            "   🔍 CORE_BNDL Concatenated (last 50): {}",
+            hex::encode(&data[data.len() - 50..])
+        );
+    }
+
+    // For CORE_BNDL, check if the concatenated data starts with "CORE_BNDL"
+    if data.starts_with(b"CORE_BNDL") {
+        // Return just the CBOR data (after CORE_BNDL prefix)
+        let cbor_data = &data[9..];
+
+        // Remove padding from the end (look for 0xf0 padding pattern)
+        let mut clean_end = cbor_data.len();
+        for i in (0..cbor_data.len()).rev() {
+            if cbor_data[i] == 0xf0 {
+                clean_end = i;
+            } else {
+                break;
+            }
+        }
+
+        let clean_cbor_data = &cbor_data[..clean_end];
+        trace!(
+            "   🔍 CORE_BNDL Extracted CBOR data: {} bytes (removed {} padding bytes)",
+            clean_cbor_data.len(),
+            cbor_data.len() - clean_cbor_data.len()
+        );
+        if clean_cbor_data.len() < 100 {
+            trace!("   🔍 CORE_BNDL CBOR hex: {}", hex::encode(clean_cbor_data));
+        } else {
+            trace!(
+                "   🔍 CORE_BNDL CBOR (first 50): {}",
+                hex::encode(&clean_cbor_data[..50])
+            );
+            trace!(
+                "   🔍 CORE_BNDL CBOR (last 50): {}",
+                hex::encode(&clean_cbor_data[clean_cbor_data.len() - 50..])
+            );
+        }
+
+        return Some(clean_cbor_data.to_vec());
     }
 
     None
