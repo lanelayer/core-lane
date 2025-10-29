@@ -1188,6 +1188,7 @@ impl CoreLaneNode {
                             tx,
                             new_block.number,
                             tx_count,
+                            Some(bundle.sequencer_payment_recipient),
                         )
                         .await;
                     if let Some((stored_tx, receipt, tx_hash)) = tx {
@@ -1243,6 +1244,7 @@ impl CoreLaneNode {
         tx: &(TxEnvelope, Address, Vec<u8>),
         block_number: u64,
         tx_number: u64,
+        sequencer_payment_recipient: Option<Address>,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
@@ -1294,18 +1296,22 @@ impl CoreLaneNode {
                 base_fee_portion, state.total_burned_amount
             );
 
-            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer
+            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer_payment_recipient
+            // EIP-1559 Rule: Priority fee (max_fee_per_gas - base_fee_per_gas) goes to sequencer
+            // This incentivizes sequencers to include transactions and provides economic security
             if priority_fee_portion > U256::ZERO {
+                let sequencer_address =
+                    sequencer_payment_recipient.unwrap_or(state.sequencer_address);
                 if let Err(e) = bundle_state.add_balance(
                     &state.account_manager,
-                    state.sequencer_address,
+                    sequencer_address,
                     priority_fee_portion,
                 ) {
                     warn!("      ⚠️  Failed to pay sequencer priority fee: {}", e);
                 } else {
                     info!(
-                        "      💰 Paid sequencer priority fee: {} wei",
-                        priority_fee_portion
+                        "      💰 Paid sequencer priority fee: {} wei to {}",
+                        priority_fee_portion, sequencer_address
                     );
                 }
             }
