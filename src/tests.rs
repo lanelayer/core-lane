@@ -267,8 +267,15 @@ mod integration_tests {
         let temp_dir = std::env::temp_dir().join("core-lane-genesis-test");
         fs::create_dir_all(&temp_dir).unwrap();
 
+        // Use a test sequencer address (default test address from Hardhat/Anvil)
+        let test_sequencer_address =
+            Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+
         // Write genesis state (as would happen during node initialization)
-        if let Err(e) = crate::CoreLaneNode::write_genesis_state(temp_dir.to_str().unwrap()) {
+        if let Err(e) = crate::CoreLaneNode::write_genesis_state(
+            temp_dir.to_str().unwrap(),
+            test_sequencer_address,
+        ) {
             panic!("Failed to write genesis state: {}", e);
         }
 
