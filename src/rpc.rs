@@ -9,6 +9,7 @@ use alloy_signer_local::PrivateKeySigner;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -42,6 +43,32 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+/// Configuration for RPC server when using Bitcoin client
+pub struct BitcoinClientConfig {
+    pub wallet: Option<String>,
+    pub mnemonic: Option<String>,
+    pub electrum_url: Option<String>,
+    pub data_dir: String,
+    pub sequencer_rpc_url: Option<String>,
+}
+
+impl BitcoinClientConfig {
+    /// Validate that either bitcoin config (mnemonic) or sequencer_rpc_url is present
+    pub fn validate(&self) -> Result<(), String> {
+        let has_bitcoin_config = self.mnemonic.is_some();
+        let has_sequencer = self.sequencer_rpc_url.is_some();
+
+        if !has_bitcoin_config && !has_sequencer {
+            return Err(
+                "Either mnemonic (for Bitcoin DA) or sequencer_rpc_url must be provided"
+                    .to_string(),
+            );
+        }
+
+        Ok(())
+    }
+}
+
 pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
@@ -53,29 +80,39 @@ pub struct RpcServer {
     data_dir: String,
     core_rpc_url: Option<String>,
     da_feed_address: Option<Address>,
+    sequencer_rpc_url: Option<String>,
 }
 
 impl RpcServer {
     pub fn with_bitcoin_client(
         state: Arc<Mutex<CoreLaneState>>,
-        bitcoin_client: Arc<bitcoincore_rpc::Client>,
-        network: bitcoin::Network,
-        wallet: String,
-        mnemonic: String,
-        electrum_url: Option<String>,
-        data_dir: String,
-    ) -> Self {
-        Self {
+        bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
+        network: Option<bitcoin::Network>,
+        config: BitcoinClientConfig,
+    ) -> Result<Self, String> {
+        // Validate configuration
+        config.validate()?;
+
+        // If sequencer is configured, bitcoin client is optional
+        // If bitcoin config is provided, bitcoin_client and network should be present
+        if config.mnemonic.is_some() && (bitcoin_client.is_none() || network.is_none()) {
+            return Err(
+                "Bitcoin client and network are required when mnemonic is provided".to_string(),
+            );
+        }
+
+        Ok(Self {
             state,
-            bitcoin_client: Some(bitcoin_client),
-            network: Some(network),
-            wallet: Some(wallet),
-            mnemonic: Some(mnemonic),
-            electrum_url,
-            data_dir,
+            bitcoin_client,
+            network,
+            wallet: config.wallet,
+            mnemonic: config.mnemonic,
+            electrum_url: config.electrum_url,
+            data_dir: config.data_dir,
             core_rpc_url: None,
             da_feed_address: None,
-        }
+            sequencer_rpc_url: config.sequencer_rpc_url,
+        })
     }
 
     pub fn with_derived(
@@ -83,6 +120,7 @@ impl RpcServer {
         core_rpc_url: String,
         da_feed_address: Address,
         data_dir: String,
+        sequencer_rpc_url: Option<String>,
     ) -> Self {
         Self {
             state,
@@ -94,6 +132,7 @@ impl RpcServer {
             data_dir,
             core_rpc_url: Some(core_rpc_url),
             da_feed_address: Some(da_feed_address),
+            sequencer_rpc_url,
         }
     }
 
@@ -372,6 +411,39 @@ impl RpcServer {
             }));
         }
 
+        // Check if sequencer RPC URL is configured - forward transaction to sequencer
+        if let Some(sequencer_rpc_url) = &server.sequencer_rpc_url {
+            match Self::forward_to_sequencer_rpc(raw_tx_hex, sequencer_rpc_url).await {
+                Ok(tx_hash_hex) => {
+                    info!(
+                        sequencer_tx_hash = %tx_hash_hex,
+                        "Transaction forwarded to sequencer RPC"
+                    );
+
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: Some(json!(tx_hash_hex)),
+                        error: None,
+                        id: request.id,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!(
+                                "Failed to forward transaction to sequencer RPC: {}",
+                                e
+                            ),
+                        }),
+                        id: request.id,
+                    }));
+                }
+            }
+        }
+
         if let (Some(core_rpc_url), Some(da_feed_address)) =
             (&server.core_rpc_url, &server.da_feed_address)
         {
@@ -406,7 +478,9 @@ impl RpcServer {
             }
         }
 
-        // Check if Bitcoin client is available
+        // Check if Bitcoin client is available (only needed if sequencer is not configured)
+        // If sequencer is configured, we've already handled it above, so this should not be reached
+        // But we check anyway for safety
         let bitcoin_client = match &server.bitcoin_client {
             Some(client) => client,
             None => {
@@ -415,7 +489,7 @@ impl RpcServer {
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32601,
-                        message: "Bitcoin client not configured - cannot send to DA".to_string(),
+                        message: "Bitcoin client not configured and no sequencer RPC URL provided - cannot send transaction".to_string(),
                     }),
                     id: request.id,
                 }));
@@ -508,6 +582,76 @@ impl RpcServer {
                 data_dir,
             )
             .await
+    }
+
+    async fn forward_to_sequencer_rpc(
+        raw_tx_hex: &str,
+        sequencer_rpc_url: &str,
+    ) -> Result<String, anyhow::Error> {
+        // Create HTTP client
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+
+        // Prepare the raw transaction hex with 0x prefix
+        let tx_hex_with_prefix = if raw_tx_hex.starts_with("0x") {
+            raw_tx_hex.to_string()
+        } else {
+            format!("0x{}", raw_tx_hex)
+        };
+
+        // Forward the transaction via JSON-RPC
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [tx_hex_with_prefix]
+        });
+
+        let response = client
+            .post(sequencer_rpc_url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send request to sequencer RPC: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Sequencer RPC returned error status: {}",
+                response.status()
+            ));
+        }
+
+        let json_response: Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {}", e))?;
+
+        // Check for RPC error
+        if let Some(error) = json_response.get("error") {
+            if !error.is_null() {
+                let error_msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                return Err(anyhow::anyhow!("Sequencer RPC error: {}", error_msg));
+            }
+        }
+
+        // Extract transaction hash from result
+        let tx_hash = json_response
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No result in sequencer RPC response"))?;
+
+        info!(
+            sequencer_rpc_url = sequencer_rpc_url,
+            tx_hash = tx_hash,
+            "Transaction forwarded to sequencer RPC"
+        );
+
+        Ok(tx_hash.to_string())
     }
 
     async fn send_to_core_lane_da(

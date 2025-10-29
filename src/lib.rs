@@ -38,6 +38,7 @@ pub mod transaction;
 
 // Re-export commonly used types for convenience
 pub use account::CoreLaneAccount;
+pub use block::BundleMarker;
 pub use intents::{
     create_anchor_bitcoin_fill_intent, decode_intent_calldata, AnchorBitcoinFill, Intent,
     IntentCall, IntentCommandType, IntentData, IntentStatus, IntentSystem, IntentType,
