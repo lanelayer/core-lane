@@ -1321,7 +1321,7 @@ dependencies = [
 [[package]]
 name = "cartesi-machine"
 version = "0.19.0"
-source = "git+https://github.com/zippiehq/cm-rust-bindings?rev=80aa8ef3c76ca768c546b035a23524f72e948d47#80aa8ef3c76ca768c546b035a23524f72e948d47"
+source = "git+https://github.com/lanelayer/cm-rust-bindings?rev=80aa8ef3c76ca768c546b035a23524f72e948d47#80aa8ef3c76ca768c546b035a23524f72e948d47"
 dependencies = [
  "base64 0.22.1",
  "cartesi-machine-sys",
@@ -1335,7 +1335,7 @@ dependencies = [
 [[package]]
 name = "cartesi-machine-sys"
 version = "0.19.0"
-source = "git+https://github.com/zippiehq/cm-rust-bindings?rev=80aa8ef3c76ca768c546b035a23524f72e948d47#80aa8ef3c76ca768c546b035a23524f72e948d47"
+source = "git+https://github.com/lanelayer/cm-rust-bindings?rev=80aa8ef3c76ca768c546b035a23524f72e948d47#80aa8ef3c76ca768c546b035a23524f72e948d47"
 dependencies = [
  "bindgen 0.71.1",
  "bytes",
