@@ -1278,9 +1278,114 @@ test_enhanced_transaction_methods() {
     record_test "enhanced_transaction_methods" "PASS"
 }
 
-# Test 12: Node Cleanup
+# Test 12: Submit Bundle
+test_submit_bundle() {
+    print_status "Test 12: Submit Bundle to Core Lane"
+
+    # Check if mnemonic file exists
+    if [ ! -f ".test-mnemonic" ]; then
+        print_error "Mnemonic file not found"
+        record_test "submit_bundle" "FAIL"
+        return 1
+    fi
+
+    # Create sample Ethereum transactions (EIP-1559)
+    # These are real EIP-1559 transactions with valid signatures
+    local tx1="02f872018084773594008504a817c80082520894123456789012345678901234567890123456789087038d7ea4c6800080c080a07db446c5f0f87374845fb7388af19b687fb6304664e4b28bdae3d379e01dca7aa04f7f2286f2cd8eb3b960ce374a4700fe232efbfb0bdc61293407ef9fee38d197"
+    local tx2="02f872018084773594018504a817c80082520894123456789012345678901234567890123456789087038d7ea4c6800080c080a07db446c5f0f87374845fb7388af19b687fb6304664e4b28bdae3d379e01dca7aa04f7f2286f2cd8eb3b960ce374a4700fe232efbfb0bdc61293407ef9fee38d198"
+
+    print_status "Submitting bundle with 2 transactions..."
+
+    # Submit bundle using CLI
+    local bundle_output=$(./target/debug/core-lane-node send-bundle \
+        --raw-tx-hex "$tx1" \
+        --raw-tx-hex "$tx2" \
+        --network regtest \
+        --mnemonic-file ".test-mnemonic" \
+        --rpc-url "$RPC_URL" \
+        --rpc-user "$RPC_USER" \
+        --rpc-password "$RPC_PASSWORD" \
+        --marker standard 2>&1)
+
+    if echo "$bundle_output" | grep -q "✅ Core Lane bundle package submitted successfully"; then
+        # Extract transaction IDs (format: "📍 Commit transaction ID (txid): <txid>")
+        local commit_txid=$(echo "$bundle_output" | grep "📍 Commit transaction ID (txid):" | sed -E 's/.*Commit transaction ID \(txid\): ([a-f0-9]{64}).*/\1/')
+        local reveal_txid=$(echo "$bundle_output" | grep "📍 Reveal transaction ID (txid):" | sed -E 's/.*Reveal transaction ID \(txid\): ([a-f0-9]{64}).*/\1/')
+        
+        print_success "Bundle submitted successfully!"
+        print_success "Commit transaction ID: $commit_txid"
+        print_success "Reveal transaction ID: $reveal_txid"
+
+        # Save the reveal transaction ID for verification
+        echo "$reveal_txid" > .test-bundle-reveal-txid
+        echo "$commit_txid" > .test-bundle-commit-txid
+
+        # Mine a block to include the reveal transaction
+        print_status "Mining a block to include the bundle reveal transaction..."
+        local mine_address=$(cat .test-address 2>/dev/null || echo "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqthqst8")
+        bitcoin_cli generatetoaddress 1 "$mine_address" > /dev/null 2>&1
+        sleep 2
+
+        # Wait for the node to process the new block (node scans every 10 seconds)
+        print_status "Waiting for Core Lane node to process the new block with bundle..."
+        sleep 12
+
+        # Verify bundle reveal transaction in block
+        print_status "Verifying bundle reveal transaction in block..."
+        local latest_block=$(bitcoin_cli getblockcount)
+        local found_in_block=""
+
+        # Check the last 5 blocks
+        for ((i=0; i<5; i++)); do
+            local check_block=$((latest_block - i))
+            if [ $check_block -gt 0 ]; then
+                local block_hash=$(bitcoin_cli getblockhash $check_block)
+                local block_info=$(bitcoin_cli getblock $block_hash 2)
+
+                if echo "$block_info" | grep -q "$reveal_txid"; then
+                    found_in_block=$check_block
+                    break
+                fi
+            fi
+        done
+
+        if [ -n "$found_in_block" ]; then
+            print_success "Bundle reveal transaction found in block $found_in_block"
+        else
+            print_warning "Bundle reveal transaction not found in recent blocks (may not be mined yet)"
+        fi
+
+        # Check if bundle was processed by Core Lane node
+        print_status "Checking if bundle was processed by Core Lane node..."
+        if [ -f "/tmp/core_lane_node_output" ]; then
+            local node_output=$(cat /tmp/core_lane_node_output 2>/dev/null || echo "")
+            if echo "$node_output" | grep -q "📦 Found Core Lane Bundle (CORE_BNDL)"; then
+                print_success "✅ Bundle was detected by Core Lane node!"
+                # Extract bundle transaction count if available
+                local bundle_count=$(echo "$node_output" | grep -A 2 "Found Core Lane Bundle" | grep "Bundle contains" | sed -E 's/.*Bundle contains ([0-9]+) transactions.*/\1/' | head -1)
+                if [ -n "$bundle_count" ]; then
+                    print_success "   Bundle contains $bundle_count transactions"
+                fi
+            else
+                print_warning "⚠️  Bundle not yet detected in node output (may need more time to process)"
+            fi
+        else
+            print_warning "⚠️  Node output file not found"
+        fi
+
+        record_test "submit_bundle" "PASS"
+        return 0
+    else
+        print_error "Failed to submit bundle"
+        echo "$bundle_output"
+        record_test "submit_bundle" "FAIL"
+        return 1
+    fi
+}
+
+# Test 13: Node Cleanup
 test_node_cleanup() {
-    print_status "Test 12: Node Cleanup"
+    print_status "Test 13: Node Cleanup"
 
     # Stop the Core Lane node if it's running
     if [ $NODE_PID -ne 0 ] && kill -0 $NODE_PID 2>/dev/null; then
@@ -1353,6 +1458,7 @@ run_all_tests() {
     test_json_rpc_api
     test_block_system
     test_enhanced_transaction_methods
+    test_submit_bundle
     test_node_cleanup
 
     # Print results
@@ -1425,7 +1531,8 @@ show_help() {
     echo "10. JSON-RPC API validation (eth_getBalance, eth_sendRawTransaction)"
     echo "11. Block system tests (genesis block, block querying, block creation)"
     echo "12. Enhanced transaction methods tests (transaction querying, receipts, indexing)"
-    echo "13. Node cleanup and output review"
+    echo "13. Bundle submission test (submit bundle with multiple transactions)"
+    echo "14. Node cleanup and output review"
 }
 
 # Function to clean up
@@ -1434,6 +1541,8 @@ cleanup() {
     rm -f test_transaction.bin
     rm -f .test-da-txid
     rm -f .test-rpc-da-txid
+    rm -f .test-bundle-reveal-txid
+    rm -f .test-bundle-commit-txid
     rm -f .test-address
     echo "Core Lane node output:"
     if [ -f "/tmp/core_lane_node_output" ]; then

@@ -586,6 +586,317 @@ impl TaprootDA {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_bundle_to_da(
+        &self,
+        raw_tx_hex_vec: Vec<String>,
+        mnemonic_str: &str,
+        network: bitcoin::Network,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
+        sequencer_payment_recipient: alloy_primitives::Address,
+        marker: crate::block::BundleMarker,
+    ) -> Result<String> {
+        use crate::block::CoreLaneBundleCbor;
+
+        tracing::info!("🚀 Creating Core Lane bundle in Bitcoin DA (commit + reveal in one tx)...");
+        tracing::info!("📦 Bundle contains {} transactions", raw_tx_hex_vec.len());
+
+        // Convert raw transaction hexes to Vec<Vec<u8>>
+        let transactions: Vec<Vec<u8>> = raw_tx_hex_vec
+            .iter()
+            .map(|tx_hex| {
+                hex::decode(tx_hex.trim_start_matches("0x"))
+                    .map_err(|e| anyhow!("Invalid transaction hex: {}", e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Create CoreLaneBundleCbor
+        let mut bundle =
+            CoreLaneBundleCbor::new_with_sequencer(transactions, sequencer_payment_recipient);
+        bundle.marker = marker;
+
+        // Serialize bundle to CBOR
+        let bundle_cbor = bundle.to_cbor()?;
+        tracing::info!("📦 Bundle CBOR size: {} bytes", bundle_cbor.len());
+
+        // Create payload with CORE_BNDL prefix
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"CORE_BNDL");
+        payload.extend_from_slice(&bundle_cbor);
+
+        tracing::info!("📦 Core Lane bundle payload size: {} bytes", payload.len());
+
+        // Load BDK wallet for commit transaction (same logic as send_transaction_to_da)
+        tracing::info!("🔑 Loading BDK wallet for commit transaction...");
+
+        // Parse mnemonic and derive signing keys
+        let mnemonic =
+            Mnemonic::parse(mnemonic_str).map_err(|e| anyhow!("Invalid mnemonic: {}", e))?;
+
+        let xkey: ExtendedKey = mnemonic
+            .into_extended_key()
+            .map_err(|_| anyhow!("Failed to derive extended key"))?;
+        let xprv = xkey
+            .into_xprv(network)
+            .ok_or_else(|| anyhow!("Failed to get xprv"))?;
+
+        // Reconstruct descriptors with xprv for signing
+        let external_descriptor = format!("wpkh({}/0/*)", xprv);
+        let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+        // Ensure data directory exists
+        std::fs::create_dir_all(data_dir)?;
+
+        // Load wallet
+        let wallet_path =
+            std::path::Path::new(data_dir).join(format!("wallet_{}.sqlite3", network_str));
+        let mut conn = Connection::open(&wallet_path)?;
+
+        let wallet_opt = Wallet::load()
+            .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
+            .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
+            .extract_keys()
+            .check_network(network)
+            .load_wallet(&mut conn)?;
+
+        let mut wallet = match wallet_opt {
+            Some(w) => {
+                tracing::info!("📂 Existing wallet database loaded");
+                w
+            }
+            None => {
+                tracing::info!("📝 Wallet database not found, creating from mnemonic...");
+
+                let created_wallet =
+                    Wallet::create(external_descriptor.clone(), internal_descriptor.clone())
+                        .network(network)
+                        .create_wallet(&mut conn)?;
+
+                drop(created_wallet);
+
+                Wallet::load()
+                    .descriptor(KeychainKind::External, Some(external_descriptor))
+                    .descriptor(KeychainKind::Internal, Some(internal_descriptor))
+                    .extract_keys()
+                    .check_network(network)
+                    .load_wallet(&mut conn)?
+                    .expect("Wallet we just created must exist")
+            }
+        };
+
+        tracing::info!("✅ BDK wallet loaded");
+
+        // Sync wallet based on network
+        tracing::info!("🔗 Syncing wallet...");
+        if network_str == "regtest" {
+            use bdk_bitcoind_rpc::Emitter;
+            let mut emitter = Emitter::new(
+                self.bitcoin_client.as_ref(),
+                wallet.latest_checkpoint().clone(),
+                0,
+                std::iter::empty::<Arc<Transaction>>(),
+            );
+
+            while let Some(block_emission) = emitter.next_block()? {
+                wallet.apply_block(&block_emission.block, block_emission.block_height())?;
+            }
+
+            wallet.persist(&mut conn)?;
+        } else {
+            use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+            let electrum_url = electrum_url
+                .ok_or_else(|| anyhow!("--electrum-url required for network: {}", network_str))?;
+
+            tracing::info!("🔗 Connecting to Electrum: {}", electrum_url);
+
+            let electrum_client = electrum_client::Client::new(electrum_url)?;
+            let electrum = BdkElectrumClient::new(electrum_client);
+
+            tracing::info!("🔄 Performing soft sync (updating revealed addresses)...");
+
+            let request = wallet.start_sync_with_revealed_spks().build();
+            let response = electrum.sync(request, 5, false)?;
+
+            wallet.apply_update(response)?;
+            wallet.persist(&mut conn)?;
+        }
+        tracing::info!("✅ Wallet synced");
+
+        // Calculate optimal fee rate
+        let sat_per_vb = self.calculate_optimal_fee_rate().await?;
+        tracing::info!("💰 Fee rate: {} sat/vB", sat_per_vb);
+
+        // Create a Taproot output with Core Lane bundle data embedded
+        let envelope_script = self.create_taproot_envelope_script(&payload)?;
+        let (taproot_address, _internal_key, control_block) =
+            self.create_taproot_address_with_info(&payload, network)?;
+
+        tracing::info!("🎯 Created Taproot address: {}", taproot_address);
+
+        // Calculate exact Taproot output amount needed for the reveal transaction
+        let exact_reveal_fee = self.calculate_exact_reveal_fee(
+            &envelope_script,
+            &control_block,
+            sat_per_vb,
+            u64::MAX,
+        )?;
+
+        let dust_threshold = 330;
+        let min_taproot_output = exact_reveal_fee.max(dust_threshold);
+
+        tracing::info!(
+            "🔍 Calculated exact Taproot output: {} sats for reveal tx needs",
+            min_taproot_output
+        );
+
+        // Check wallet balance
+        let balance = wallet.balance();
+        tracing::info!(
+            "💰 Wallet balance: {} sats (confirmed: {})",
+            balance.total().to_sat(),
+            balance.confirmed.to_sat()
+        );
+
+        // Build commit transaction using BDK
+        tracing::info!("🔨 Building commit transaction with BDK...");
+
+        let mut tx_builder = wallet.build_tx();
+
+        let fee_rate = FeeRate::from_sat_per_vb(sat_per_vb).expect("valid fee rate");
+        tx_builder.fee_rate(fee_rate);
+
+        tx_builder.add_recipient(
+            taproot_address.script_pubkey(),
+            Amount::from_sat(min_taproot_output),
+        );
+
+        let mut psbt = tx_builder.finish()?;
+
+        tracing::info!("📝 Commit transaction built, signing...");
+
+        #[allow(deprecated)]
+        let finalized = wallet.sign(&mut psbt, bdk_wallet::SignOptions::default())?;
+
+        if !finalized {
+            use bdk_wallet::bitcoin::secp256k1::Secp256k1;
+            use bdk_wallet::miniscript::psbt::PsbtExt;
+            psbt.finalize_mut(&Secp256k1::new())
+                .map_err(|e| anyhow!("Failed to finalize commit PSBT: {:?}", e))?;
+        }
+
+        let commit_tx = psbt
+            .extract_tx()
+            .map_err(|e| anyhow!("Failed to extract commit transaction: {:?}", e))?;
+        let commit_tx_hex = hex::encode(bitcoin::consensus::serialize(&commit_tx));
+
+        tracing::info!("✅ Commit transaction signed");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        wallet.apply_unconfirmed_txs([(commit_tx.clone(), now)]);
+        wallet.persist(&mut conn)?;
+
+        // Create reveal transaction
+        tracing::info!("🔍 Creating reveal transaction to expose Core Lane bundle data...");
+
+        let commit_tx_bytes = hex::decode(&commit_tx_hex)?;
+        let commit_tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&commit_tx_bytes)?;
+
+        let mut taproot_output_amount = 0u64;
+        let mut taproot_vout_index = 0;
+        for (vout_index, vout) in commit_tx.output.iter().enumerate() {
+            if vout.script_pubkey == taproot_address.script_pubkey() {
+                taproot_output_amount = vout.value.to_sat();
+                taproot_vout_index = vout_index;
+                break;
+            }
+        }
+
+        if taproot_output_amount == 0 {
+            return Err(anyhow!(
+                "Could not find Taproot output in commit transaction"
+            ));
+        }
+
+        let commit_txid = commit_tx.compute_txid();
+
+        let exact_reveal_fee = self.calculate_exact_reveal_fee(
+            &envelope_script,
+            &control_block,
+            sat_per_vb,
+            taproot_output_amount,
+        )?;
+
+        tracing::info!("🔍 Using exact reveal fee: {} sats", exact_reveal_fee);
+
+        let op_return_data = b"CORELANE";
+        let op_return_script = Builder::new()
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_RETURN)
+            .push_slice(op_return_data)
+            .into_script();
+
+        let mut reveal_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint {
+                    txid: commit_txid,
+                    vout: taproot_vout_index as u32,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(0),
+                script_pubkey: op_return_script,
+            }],
+        };
+
+        let mut witness = Witness::new();
+        witness.push(envelope_script.as_bytes());
+        witness.push(&control_block);
+        reveal_tx.input[0].witness = witness;
+
+        let reveal_final_hex = hex::encode(bitcoin::consensus::serialize(&reveal_tx));
+
+        // Submit both transactions as a package
+        let package_txs = vec![
+            serde_json::json!(commit_tx_hex),
+            serde_json::json!(reveal_final_hex),
+        ];
+
+        tracing::info!("📦 Submitting commit + reveal transactions as package...");
+
+        let package_result: Result<serde_json::Value, _> = self
+            .bitcoin_client
+            .call("submitpackage", &[serde_json::json!(package_txs)]);
+
+        match package_result {
+            Ok(_result) => {
+                let commit_txid_tx = commit_tx.compute_txid();
+                let reveal_txid_tx = reveal_tx.compute_txid();
+
+                tracing::info!("✅ Core Lane bundle package submitted successfully!");
+                tracing::info!("📍 Commit transaction ID (txid): {}", commit_txid_tx);
+                tracing::info!("📍 Reveal transaction ID (txid): {}", reveal_txid_tx);
+                tracing::info!("📦 Bundle contains {} transactions", raw_tx_hex_vec.len());
+                tracing::info!("🎯 Bundle marker: {:?}", marker);
+
+                Ok(commit_txid_tx.to_string())
+            }
+            Err(e) => {
+                tracing::error!("❌ Failed to submit bundle package: {}", e);
+                Err(anyhow!("Failed to submit bundle package: {}", e))
+            }
+        }
+    }
+
     fn create_taproot_envelope_script(&self, data: &[u8]) -> Result<ScriptBuf> {
         // Create Taproot envelope script: OP_FALSE OP_IF <data> OP_ENDIF OP_TRUE
         let mut script = Builder::new();

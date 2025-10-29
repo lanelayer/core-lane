@@ -14,7 +14,7 @@ use bitcoin::{
 use bitcoincore_rpc::{Client, RpcApi};
 use tracing::{debug, info, trace, warn};
 
-use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBurn};
+use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn};
 
 pub fn process_bitcoin_block(
     bitcoin_client: Arc<Client>,
@@ -84,6 +84,41 @@ pub fn process_bitcoin_block(
                     "   ❌ Failed to decode Core Lane DA transaction in tx {}: {}",
                     tx_index, txid
                 );
+            }
+        }
+    }
+
+    // Third pass: Look for CORE_BNDL bundles
+    for (tx_index, tx) in block.txdata.iter().enumerate() {
+        let txid = tx.compute_txid();
+
+        if let Some(bundle_data) = extract_core_bndl_transaction(tx) {
+            info!(
+                "   📦 Found Core Lane Bundle (CORE_BNDL) in tx {}: {}",
+                tx_index, txid
+            );
+
+            match CoreLaneBundleCbor::from_cbor(&bundle_data) {
+                Ok(cbor_bundle) => {
+                    info!(
+                        "   📦 Bundle contains {} transactions",
+                        cbor_bundle.transactions.len()
+                    );
+                    if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
+                        warn!(
+                            "   ❌ Failed to process Core Lane Bundle in tx {}: {} - {}",
+                            tx_index, txid, e
+                        );
+                    } else {
+                        info!("   ✅ Successfully processed Core Lane Bundle");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "   ❌ Failed to parse CORE_BNDL data in tx {}: {} - {}",
+                        tx_index, txid, e
+                    );
+                }
             }
         }
     }
@@ -207,25 +242,31 @@ fn is_p2wsh_script(script: &Script) -> bool {
     bytes.len() == 34 && bytes[0] == 0x00
 }
 
-fn extract_core_lane_transaction(tx: &Transaction) -> Option<Vec<u8>> {
-    // Look for Core Lane transactions in Bitcoin DA envelopes
+/// Generic function to extract prefixed transaction data from Bitcoin Taproot witnesses/outputs
+/// Scans a Transaction for Taproot witnesses and outputs, looking for the specified prefix
+fn extract_prefixed_transaction(tx: &Transaction, prefix: &[u8]) -> Option<Vec<u8>> {
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("UNKNOWN");
+
     // Check inputs for witness data (revealed Taproot envelopes)
     for (input_idx, input) in tx.input.iter().enumerate() {
         if input.witness.len() >= 2 {
             trace!(
-                "   🔍 Input {} has witness with {} elements",
+                "   🔍 Input {} has witness with {} elements ({} check)",
                 input_idx,
-                input.witness.len()
+                input.witness.len(),
+                prefix_str
             );
 
-            if let Some(script_bytes) = input.witness.to_vec().first() {
-                let script = Script::from_bytes(script_bytes);
-
-                // Use the bitcoin-data-layer extraction logic
-                if let Some(data) = extract_envelope_data_bitcoin_da_style(script) {
-                    // If we got data back, it means we found a Core Lane transaction
+            // Use zero-copy taproot_leaf_script() to avoid duplicating potentially large payloads
+            if let Some(leaf_script) = input.witness.taproot_leaf_script() {
+                // Use the generic extraction logic with prefix (zero-copy)
+                if let Some(data) = extract_envelope_data_with_prefix(leaf_script.script, prefix) {
+                    // If we got data back, it means we found a transaction with the prefix
                     if !data.is_empty() {
-                        info!("   🎯 Found Core Lane transaction in Taproot envelope!");
+                        info!(
+                            "   🎯 Found {} transaction in Taproot envelope!",
+                            prefix_str
+                        );
                         return Some(data);
                     }
                 }
@@ -235,8 +276,6 @@ fn extract_core_lane_transaction(tx: &Transaction) -> Option<Vec<u8>> {
 
     // Also check outputs (for newly created Taproot envelopes)
     for output in &tx.output {
-        // For Taproot outputs, we need to check if this is a P2TR address
-        // and then try to extract the embedded data
         let script_pubkey = &output.script_pubkey;
 
         // Check if this is a P2TR output
@@ -244,15 +283,24 @@ fn extract_core_lane_transaction(tx: &Transaction) -> Option<Vec<u8>> {
             // This is a P2TR output, but we can't directly extract the data
             // because it's committed in the Taproot tree
             // We'll need to look for the actual spend transaction later
-            debug!("   🔍 Found P2TR output (potential Core Lane envelope)");
+            debug!(
+                "   🔍 Found P2TR output (potential {} envelope)",
+                prefix_str
+            );
         }
     }
 
     None
 }
 
-// Use the bitcoin-data-layer extraction logic but be more selective about data extraction
-fn extract_envelope_data_bitcoin_da_style(script: &Script) -> Option<Vec<u8>> {
+fn extract_core_lane_transaction(tx: &Transaction) -> Option<Vec<u8>> {
+    extract_prefixed_transaction(tx, b"CORE_LANE")
+}
+
+/// Generic function to extract envelope data with a specified prefix
+/// Parses a Script and returns the payload after validating the provided prefix
+fn extract_envelope_data_with_prefix(script: &Script, prefix: &[u8]) -> Option<Vec<u8>> {
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("UNKNOWN");
     let mut instr = script.instructions();
 
     let first = instr.next().and_then(|r| r.ok());
@@ -292,7 +340,8 @@ fn extract_envelope_data_bitcoin_da_style(script: &Script) -> Option<Vec<u8>> {
     }
 
     trace!(
-        "   🔍 Script analysis: found {} push operations",
+        "   🔍 {} Script analysis: found {} push operations",
+        prefix_str,
         push_operations.len()
     );
     for (i, push_op) in push_operations.iter().enumerate() {
@@ -319,56 +368,78 @@ fn extract_envelope_data_bitcoin_da_style(script: &Script) -> Option<Vec<u8>> {
         data.extend_from_slice(&push_op);
     }
 
-    trace!("   🔍 Concatenated data: {} bytes", data.len());
+    trace!(
+        "   🔍 {} Concatenated data: {} bytes",
+        prefix_str,
+        data.len()
+    );
     if data.len() < 100 {
-        trace!("   🔍 Concatenated hex: {}", hex::encode(&data));
+        trace!(
+            "   🔍 {} Concatenated hex: {}",
+            prefix_str,
+            hex::encode(&data)
+        );
     } else {
         trace!(
-            "   🔍 Concatenated (first 50): {}",
+            "   🔍 {} Concatenated (first 50): {}",
+            prefix_str,
             hex::encode(&data[..50])
         );
         trace!(
-            "   🔍 Concatenated (last 50): {}",
+            "   🔍 {} Concatenated (last 50): {}",
+            prefix_str,
             hex::encode(&data[data.len() - 50..])
         );
     }
 
-    // For Core Lane, check if the concatenated data starts with "CORE_LANE"
-    if data.starts_with(b"CORE_LANE") {
-        // Return just the transaction data (after CORE_LANE prefix)
-        let tx_data = &data[9..];
+    // Check if the concatenated data starts with the specified prefix
+    if data.starts_with(prefix) {
+        // Return just the payload data (after prefix)
+        let prefix_len = prefix.len();
+        let payload_data = &data[prefix_len..];
 
         // Remove padding from the end (look for 0xf0 padding pattern)
-        let mut clean_end = tx_data.len();
-        for i in (0..tx_data.len()).rev() {
-            if tx_data[i] == 0xf0 {
+        let mut clean_end = payload_data.len();
+        for i in (0..payload_data.len()).rev() {
+            if payload_data[i] == 0xf0 {
                 clean_end = i;
             } else {
                 break;
             }
         }
 
-        let clean_tx_data = &tx_data[..clean_end];
+        let clean_payload = &payload_data[..clean_end];
         trace!(
-            "   🔍 Extracted transaction data: {} bytes (removed {} padding bytes)",
-            clean_tx_data.len(),
-            tx_data.len() - clean_tx_data.len()
+            "   🔍 {} Extracted payload: {} bytes (removed {} padding bytes)",
+            prefix_str,
+            clean_payload.len(),
+            payload_data.len() - clean_payload.len()
         );
-        if clean_tx_data.len() < 100 {
-            trace!("   🔍 Transaction hex: {}", hex::encode(clean_tx_data));
+        if clean_payload.len() < 100 {
+            trace!(
+                "   🔍 {} Payload hex: {}",
+                prefix_str,
+                hex::encode(clean_payload)
+            );
         } else {
             trace!(
-                "   🔍 Transaction (first 50): {}",
-                hex::encode(&clean_tx_data[..50])
+                "   🔍 {} Payload (first 50): {}",
+                prefix_str,
+                hex::encode(&clean_payload[..50])
             );
             trace!(
-                "   🔍 Transaction (last 50): {}",
-                hex::encode(&clean_tx_data[clean_tx_data.len() - 50..])
+                "   🔍 {} Payload (last 50): {}",
+                prefix_str,
+                hex::encode(&clean_payload[clean_payload.len() - 50..])
             );
         }
 
-        return Some(clean_tx_data.to_vec());
+        return Some(clean_payload.to_vec());
     }
 
     None
+}
+
+fn extract_core_bndl_transaction(tx: &Transaction) -> Option<Vec<u8>> {
+    extract_prefixed_transaction(tx, b"CORE_BNDL")
 }

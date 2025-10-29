@@ -29,6 +29,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct MetaState {
     eip1559_fee_manager: eip1559::Eip1559FeeManager,
     total_burned_amount: U256,
+    sequencer_address: Address,
+}
+
+impl MetaState {
+    /// Get the sequencer address for a given Core Lane block number
+    /// In the future, this could support sequencer rotation based on block height
+    #[allow(dead_code)]
+    pub fn get_sequencer_address_for_block(&self, _block_number: u64) -> Address {
+        // Currently returns a single sequencer address
+        // Future enhancement: could implement rotation logic based on block_number
+        self.sequencer_address
+    }
 }
 
 // Import modules from the library
@@ -40,6 +52,14 @@ use core_lane::{
 mod derived;
 mod eip1559;
 mod rpc;
+
+// Default sequencer address that gets priority for bundle processing
+// This is the first address from the default Hardhat/Anvil test accounts
+// Used for initialization and testing
+const DEFAULT_SEQUENCER_ADDRESS: Address = Address::new([
+    0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
+    0xFF, 0xb9, 0x22, 0x66,
+]);
 
 #[cfg(test)]
 mod tests;
@@ -258,6 +278,13 @@ enum Commands {
         /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
+        /// Sequencer RPC URL - if set, eth_sendRawTransaction will forward transactions to this endpoint
+        #[arg(long)]
+        sequencer_rpc_url: Option<String>,
+        /// Sequencer address that receives priority fees (hex format, e.g., 0x...)
+        /// If not provided, defaults to a well-known test address (insecure for production)
+        #[arg(long)]
+        sequencer_address: Option<String>,
     },
 
     Burn {
@@ -312,6 +339,38 @@ enum Commands {
         /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
+    },
+    SendBundle {
+        /// Raw transaction hex strings (comma-separated or one per --raw-tx-hex flag)
+        #[arg(long)]
+        raw_tx_hex: Vec<String>,
+        /// Network for the transaction (bitcoin, testnet, testnet4, signet, regtest)
+        #[arg(long, default_value = "regtest")]
+        network: String,
+        /// Mnemonic phrase for signing (not recommended - visible in process list)
+        #[arg(long)]
+        mnemonic: Option<String>,
+        /// Path to file containing mnemonic phrase (recommended, more secure)
+        #[arg(long)]
+        mnemonic_file: Option<String>,
+        /// Bitcoin RPC URL (for regtest)
+        #[arg(long, default_value = "http://127.0.0.1:18443")]
+        rpc_url: String,
+        /// Bitcoin RPC user (for regtest)
+        #[arg(long, default_value = "bitcoin")]
+        rpc_user: String,
+        /// Bitcoin RPC password (for regtest)
+        #[arg(long)]
+        rpc_password: Option<String>,
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet)
+        #[arg(long)]
+        electrum_url: Option<String>,
+        /// Sequencer payment recipient address (hex format)
+        #[arg(long)]
+        sequencer_payment_recipient: Option<String>,
+        /// Bundle marker: "head" or "standard" (default: standard)
+        #[arg(long, default_value = "standard")]
+        marker: String,
     },
     ConstructExitIntent {
         #[arg(long)]
@@ -412,6 +471,13 @@ enum Commands {
         http_host: String,
         #[arg(long, default_value = "8545")]
         http_port: u16,
+        /// Sequencer RPC URL - if set, eth_sendRawTransaction will forward transactions to this endpoint
+        #[arg(long)]
+        sequencer_rpc_url: Option<String>,
+        /// Sequencer address that receives priority fees (hex format, e.g., 0x...)
+        /// If not provided, defaults to a well-known test address (insecure for production)
+        #[arg(long)]
+        sequencer_address: Option<String>,
     },
 }
 
@@ -747,17 +813,23 @@ impl CoreLaneNode {
         bitcoin_client_write: Client,
         data_dir: String,
         network: bitcoin::Network,
+        sequencer_address: Option<Address>,
     ) -> Self {
         Self::new_with_clients(
             Some(bitcoin_client_read),
             Some(bitcoin_client_write),
             data_dir,
             network,
+            sequencer_address,
         )
     }
 
-    fn new_derived(data_dir: String, network: bitcoin::Network) -> Self {
-        Self::new_with_clients(None, None, data_dir, network)
+    fn new_derived(
+        data_dir: String,
+        network: bitcoin::Network,
+        sequencer_address: Option<Address>,
+    ) -> Self {
+        Self::new_with_clients(None, None, data_dir, network, sequencer_address)
     }
 
     fn new_with_clients(
@@ -765,6 +837,7 @@ impl CoreLaneNode {
         bitcoin_client_write: Option<Client>,
         data_dir: String,
         network: bitcoin::Network,
+        sequencer_address: Option<Address>,
     ) -> Self {
         // Create genesis block with EIP-1559 default configuration
         let eip1559_config = eip1559::Eip1559Config::default();
@@ -789,6 +862,8 @@ impl CoreLaneNode {
         // Initialize bitcoin_height_to_core_block mapping
         let bitcoin_height_to_core_block = HashMap::new();
 
+        let sequencer_addr = sequencer_address.unwrap_or(DEFAULT_SEQUENCER_ADDRESS);
+
         let state = Arc::new(Mutex::new(CoreLaneState {
             account_manager: StateManager::new(),
             last_processed_bitcoin_height: None,
@@ -801,16 +876,13 @@ impl CoreLaneNode {
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
             eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
-            sequencer_address: Address::from([
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            ]), // Sequencer address
+            sequencer_address: sequencer_addr,
             total_burned_amount: U256::ZERO,
             bitcoin_network: network,
         }));
 
         // Write genesis state to disk
-        if let Err(e) = Self::write_genesis_state(&data_dir) {
+        if let Err(e) = Self::write_genesis_state(&data_dir, sequencer_addr) {
             error!("Failed to write genesis state to disk: {}", e);
         }
 
@@ -849,6 +921,12 @@ impl CoreLaneNode {
         let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
         let current_base_fee = state.eip1559_fee_manager.current_base_fee();
 
+        // Get bundle count before moving block_origin
+        let bundle_count = block_origin
+            .as_ref()
+            .map(|bo| bo.bundles.len())
+            .unwrap_or(0);
+
         // Create new block with Bitcoin block timestamp and EIP-1559 gas limits
         let mut new_block = CoreLaneBlock::new(
             next_number,
@@ -862,12 +940,13 @@ impl CoreLaneNode {
         new_block.hash = new_block.calculate_hash();
         // Set as current block
         info!(
-            "🆕 Created Core Lane block {} (parent: {}) with timestamp {} (EIP-1559 max gas: {}, base fee: {} gwei)",
+            "🆕 Created Core Lane block {} (parent: {}) with timestamp {} (EIP-1559 max gas: {}, base fee: {} gwei) - {} bundle(s)",
             next_number,
             latest_number,
             new_block.timestamp,
             max_gas_limit,
-            current_base_fee / U256::from(1_000_000_000u64)
+            current_base_fee / U256::from(1_000_000_000u64),
+            bundle_count
         );
         Ok(new_block)
     }
@@ -969,7 +1048,7 @@ impl CoreLaneNode {
     }
 
     /// Write the genesis state (block 0) to disk
-    pub fn write_genesis_state(data_dir: &str) -> Result<()> {
+    pub fn write_genesis_state(data_dir: &str, sequencer_address: Address) -> Result<()> {
         use std::fs;
         use std::path::Path;
 
@@ -998,6 +1077,7 @@ impl CoreLaneNode {
         let genesis_metastate = MetaState {
             eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
             total_burned_amount: U256::ZERO,
+            sequencer_address,
         };
 
         // Write the genesis metastate using bincode serialization
@@ -1104,10 +1184,11 @@ impl CoreLaneNode {
 
         // Transactions and receipts are already in bundle state and applied via apply_changes.
 
-        // Create metastate with current EIP-1559 fee manager and total burned amount
+        // Create metastate with current EIP-1559 fee manager, total burned amount, and sequencer address
         let metastate = MetaState {
             eip1559_fee_manager: state.eip1559_fee_manager.clone(),
             total_burned_amount: state.total_burned_amount,
+            sequencer_address: state.sequencer_address,
         };
 
         // Persist metastate to disk
@@ -1407,10 +1488,12 @@ impl CoreLaneNode {
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
 
-        // Get EIP-1559 configuration for gas limit enforcement
+        // Get EIP-1559 configuration and sequencer address for this block
         let state = self.state.lock().await;
         let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
         let target_gas_usage = state.eip1559_fee_manager.target_gas_usage();
+        // Get the expected sequencer address for this block number
+        let expected_sequencer_address = state.sequencer_address;
         drop(state);
 
         // Track cumulative gas used for this block (EIP-1559 maximum enforcement)
@@ -1420,21 +1503,64 @@ impl CoreLaneNode {
         let mut bundle_state = state::BundleStateManager::new();
 
         if let Some(block_origin) = new_block_clone.block_origin {
-            debug!("🔥 Phase 1: Processing burns...");
-            let state = self.state.lock().await;
-            for burn in block_origin.burns.iter() {
-                info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
-                bundle_state.add_balance(&state.account_manager, burn.address, burn.amount)?;
-            }
-            drop(state);
-
             let mut tx_count = 0;
-            for bundle in block_origin.bundles.iter() {
-                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
-                {
-                    // skip this bundle because it's not valid for this block
+
+            // Phase 1: Process single HEAD bundle by sequencer only
+            debug!("📦 Phase 1: Processing sequencer HEAD bundle...");
+
+            let mut sequencer_bundle_processed = false;
+            for (bundle_idx, bundle) in block_origin.bundles.iter().enumerate() {
+                // Only process Head marker bundles
+                if bundle.marker != block::BundleMarker::Head {
                     continue;
                 }
+
+                info!(
+                    "📦 Processing bundle #{} (HEAD): {} transactions, sequencer_payment_recipient: {:?}, valid_for_block: {}, marker: {:?}",
+                    bundle_idx,
+                    bundle.transactions.len(),
+                    bundle.sequencer_payment_recipient,
+                    bundle.valid_for_block,
+                    bundle.marker
+                );
+
+                // Check if valid for this block
+                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
+                {
+                    continue;
+                }
+
+                // Verify this bundle is signed by the sequencer
+                if let Some(_signature) = bundle.signature {
+                    match bundle.recover_signer_address() {
+                        Ok(signer) => {
+                            if signer != expected_sequencer_address {
+                                warn!(
+                                    "HEAD bundle from non-sequencer address {}, expected {}",
+                                    signer, expected_sequencer_address
+                                );
+                                continue;
+                            }
+                            info!("✅ Processing HEAD bundle from sequencer: {}", signer);
+                        }
+                        Err(e) => {
+                            error!("Failed to recover signer from HEAD bundle: {}", e);
+                            continue;
+                        }
+                    }
+                } else {
+                    warn!("Skipping unsigned HEAD bundle (expected signature from sequencer)");
+                    continue;
+                }
+
+                // Process only the first sequencer HEAD bundle
+                if sequencer_bundle_processed {
+                    warn!(
+                        "⚠️  Multiple sequencer HEAD bundles found, processing only the first one"
+                    );
+                    break;
+                }
+
                 for tx in bundle.transactions.iter() {
                     // EIP-1559: Check if adding this transaction would exceed maximum block gas limit
                     let tx_gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
@@ -1473,6 +1599,7 @@ impl CoreLaneNode {
                             tx_count,
                             max_gas_limit,
                             cumulative_gas_used,
+                            Some(bundle.sequencer_payment_recipient),
                         )
                         .await;
 
@@ -1505,9 +1632,122 @@ impl CoreLaneNode {
                     }
                 }
 
-                // If we've hit the maximum, stop processing remaining bundles
+                // Mark sequencer bundle as processed
+                sequencer_bundle_processed = true;
+
+                // If we've hit the maximum, stop processing
                 if cumulative_gas_used >= max_gas_limit {
                     break;
+                }
+            }
+
+            // Phase 2: Process burns
+            debug!("🔥 Phase 2: Processing burns...");
+            let state = self.state.lock().await;
+            for burn in block_origin.burns.iter() {
+                info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
+                if let Err(e) =
+                    bundle_state.add_balance(&state.account_manager, burn.address, burn.amount)
+                {
+                    error!("Failed to process burn: {}", e);
+                }
+            }
+            drop(state);
+
+            // Phase 3: Process non-sequencer bundles
+            if cumulative_gas_used < max_gas_limit {
+                debug!("📦 Phase 3: Processing non-sequencer bundles...");
+
+                for (bundle_idx, bundle) in block_origin.bundles.iter().enumerate() {
+                    // Skip HEAD bundles (already processed in Phase 1)
+                    if bundle.marker == block::BundleMarker::Head {
+                        continue;
+                    }
+
+                    // Check if valid for this block
+                    if bundle.valid_for_block != u64::MAX
+                        && bundle.valid_for_block != new_block.number
+                    {
+                        continue;
+                    }
+
+                    info!(
+                        "📦 Processing bundle #{} (STANDARD): {} transactions, sequencer_payment_recipient: {:?}, valid_for_block: {}, marker: {:?}",
+                        bundle_idx,
+                        bundle.transactions.len(),
+                        bundle.sequencer_payment_recipient,
+                        bundle.valid_for_block,
+                        bundle.marker
+                    );
+
+                    for tx in bundle.transactions.iter() {
+                        let tx_gas_limit =
+                            U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
+
+                        if cumulative_gas_used + tx_gas_limit > max_gas_limit {
+                            warn!(
+                                    "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
+                                    new_block.number,
+                                    cumulative_gas_used,
+                                    max_gas_limit,
+                                    tx_gas_limit
+                                );
+                            break;
+                        }
+
+                        if cumulative_gas_used >= target_gas_usage
+                            && cumulative_gas_used < target_gas_usage + tx_gas_limit
+                        {
+                            info!(
+                                    "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
+                                    new_block.number,
+                                    target_gas_usage,
+                                    max_gas_limit,
+                                    cumulative_gas_used
+                                );
+                        }
+
+                        let tx_result = self
+                            .process_core_lane_transaction(
+                                &mut bundle_state,
+                                tx,
+                                new_block.number,
+                                tx_count,
+                                max_gas_limit,
+                                cumulative_gas_used,
+                                Some(bundle.sequencer_payment_recipient),
+                            )
+                            .await;
+
+                        if let Some((stored_tx, receipt, tx_hash)) = tx_result {
+                            let gas_used_str = receipt.gas_used.as_str();
+                            let actual_gas_used = if let Some(hex) = gas_used_str.strip_prefix("0x")
+                            {
+                                let bytes = hex::decode(hex).unwrap_or_default();
+                                U256::from_be_slice(&bytes)
+                            } else {
+                                U256::from_str(gas_used_str).unwrap_or(tx_gas_limit)
+                            };
+
+                            cumulative_gas_used += actual_gas_used;
+                            core_lane_transactions.push((stored_tx, receipt, tx_hash));
+                            tx_count += 1;
+
+                            if cumulative_gas_used > max_gas_limit {
+                                warn!(
+                                        "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
+                                        new_block.number,
+                                        cumulative_gas_used,
+                                        max_gas_limit
+                                    );
+                                break;
+                            }
+                        }
+                    }
+
+                    if cumulative_gas_used >= max_gas_limit {
+                        break;
+                    }
                 }
             }
         }
@@ -1551,6 +1791,7 @@ impl CoreLaneNode {
         Ok(core_lane_block_number)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_core_lane_transaction(
         &self,
         bundle_state: &mut state::BundleStateManager,
@@ -1559,6 +1800,7 @@ impl CoreLaneNode {
         tx_number: u64,
         max_block_gas_limit: U256,
         cumulative_gas_used: U256,
+        sequencer_payment_recipient: Option<Address>,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
@@ -1623,18 +1865,23 @@ impl CoreLaneNode {
                 base_fee_portion, state.total_burned_amount
             );
 
-            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer
+            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer_payment_recipient
+            // EIP-1559 Rule: Priority fee (max_fee_per_gas - base_fee_per_gas) goes to sequencer
+            // This incentivizes sequencers to include transactions and provides economic security
             if priority_fee_portion > U256::ZERO {
+                let sequencer_address = sequencer_payment_recipient
+                    .filter(|addr| *addr != Address::ZERO)
+                    .unwrap_or(state.sequencer_address);
                 if let Err(e) = bundle_state.add_balance(
                     &state.account_manager,
-                    state.sequencer_address,
+                    sequencer_address,
                     priority_fee_portion,
                 ) {
                     warn!("      ⚠️  Failed to pay sequencer priority fee: {}", e);
                 } else {
                     info!(
-                        "      💰 Paid sequencer priority fee: {} wei",
-                        priority_fee_portion
+                        "      💰 Paid sequencer priority fee: {} wei to {}",
+                        priority_fee_portion, sequencer_address
                     );
                 }
             }
@@ -1808,6 +2055,40 @@ impl CoreLaneNode {
                 network_str,
                 electrum_url,
                 data_dir,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_bundle_to_da(
+        &self,
+        raw_tx_hex_vec: Vec<String>,
+        mnemonic: &str,
+        network: bitcoin::Network,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
+        sequencer_payment_recipient: alloy_primitives::Address,
+        marker: crate::block::BundleMarker,
+    ) -> Result<()> {
+        // Delegate to the TaprootDA implementation which handles all validation and logic
+        // Use write client for DA transactions (wallet operations)
+        let bitcoin_client = self
+            .bitcoin_client_write
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC write client not configured"))?;
+        let taproot_da = TaprootDA::new(bitcoin_client);
+        let _bitcoin_txid = taproot_da
+            .send_bundle_to_da(
+                raw_tx_hex_vec,
+                mnemonic,
+                network,
+                network_str,
+                electrum_url,
+                data_dir,
+                sequencer_payment_recipient,
+                marker,
             )
             .await?;
         Ok(())
@@ -1991,7 +2272,8 @@ impl CoreLaneNode {
                     );
                     state_mut.eip1559_fee_manager = metastate.eip1559_fee_manager;
                     state_mut.total_burned_amount = metastate.total_burned_amount;
-                    info!("✅ Restored EIP-1559 fee manager and total burned amount");
+                    state_mut.sequencer_address = metastate.sequencer_address;
+                    info!("✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address");
                 }
                 Err(e) => {
                     warn!(
@@ -2146,11 +2428,76 @@ async fn main() -> Result<()> {
             mnemonic,
             mnemonic_file,
             electrum_url,
+            sequencer_rpc_url,
+            sequencer_address,
         } => {
-            // Resolve mnemonic from various sources
-            let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
+            // Parse sequencer address if provided
+            let sequencer_addr = sequencer_address
+                .as_ref()
+                .map(|addr_str| {
+                    Address::from_str(addr_str).map_err(|e| {
+                        anyhow::anyhow!("Invalid sequencer address '{}': {}", addr_str, e)
+                    })
+                })
+                .transpose()?;
 
-            // Create read client
+            if sequencer_addr.is_none() {
+                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+            } else {
+                info!("✅ Using sequencer address: {:?}", sequencer_addr);
+            }
+
+            // Resolve mnemonic from various sources (optional if sequencer_rpc_url is provided)
+            // If mnemonic parameters are explicitly provided, require successful resolution
+            let mnemonic_str_opt = if mnemonic.is_some() || mnemonic_file.is_some() {
+                // User explicitly provided mnemonic parameters - require successful resolution
+                Some(resolve_mnemonic(
+                    mnemonic.as_deref(),
+                    mnemonic_file.as_deref(),
+                )?)
+            } else {
+                // No explicit mnemonic parameters - try environment variable
+                // Only allow failure if env var is not set
+                match resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref()) {
+                    Ok(m) => {
+                        // Validate that resolved mnemonic is non-empty
+                        // Empty/whitespace-only mnemonics will fail later during BDK operations
+                        if m.trim().is_empty() {
+                            // If env var is set (even if empty), return error
+                            // Otherwise, return None to allow sequencer_rpc_url path
+                            if std::env::var("CORE_LANE_MNEMONIC").is_ok() {
+                                return Err(anyhow::anyhow!(
+                                    "CORE_LANE_MNEMONIC environment variable is set but contains only whitespace or is empty"
+                                ));
+                            }
+                            None
+                        } else {
+                            Some(m)
+                        }
+                    }
+                    Err(e) => {
+                        // If env var exists but is invalid, propagate error
+                        if std::env::var("CORE_LANE_MNEMONIC")
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                        {
+                            return Err(e);
+                        }
+                        None
+                    }
+                }
+            };
+
+            // Validate: either mnemonic or sequencer_rpc_url must be provided
+            if mnemonic_str_opt.is_none() && sequencer_rpc_url.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Either mnemonic (for Bitcoin DA) or sequencer_rpc_url must be provided"
+                ));
+            }
+
+            let mnemonic_str = mnemonic_str_opt.unwrap_or_default();
+
+            // Always create read client (needed for reading blockchain data)
             let read_client = bitcoincore_rpc::Client::new(
                 bitcoin_rpc_read_url,
                 Auth::UserPass(
@@ -2159,24 +2506,7 @@ async fn main() -> Result<()> {
                 ),
             )?;
 
-            // Create write client - use write params if provided, otherwise use read params
-            let write_url = bitcoin_rpc_write_url
-                .as_ref()
-                .unwrap_or(bitcoin_rpc_read_url);
-            let write_user = bitcoin_rpc_write_user
-                .as_ref()
-                .unwrap_or(bitcoin_rpc_read_user);
-            let write_password = bitcoin_rpc_write_password
-                .as_ref()
-                .unwrap_or(bitcoin_rpc_read_password);
-
-            // Write client - user can customize the URL themselves
-            let write_client = bitcoincore_rpc::Client::new(
-                write_url,
-                Auth::UserPass(write_user.to_string(), write_password.to_string()),
-            )?;
-
-            // Get blockchain info from read client
+            // Get blockchain info from read client to determine network
             let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
@@ -2197,25 +2527,84 @@ async fn main() -> Result<()> {
 
             info!("🔗 Bitcoin RPC connections configured:");
             info!("   📖 Read:  {}", bitcoin_rpc_read_url);
-            info!("   ✍️  Write: {}", write_url);
 
-            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone(), network);
+            // If sequencer is configured and mnemonic is not, we can skip write client setup
+            let (shared_state, bitcoin_client_write, node_opt) =
+                if sequencer_rpc_url.is_some() && mnemonic_str.is_empty() {
+                    // Sequencer-only mode: read-only bitcoin client, no write client needed
+                    // No block scanner needed in sequencer-only mode
+                    let node = CoreLaneNode::new_with_clients(
+                        Some(read_client),
+                        None,
+                        cli.data_dir.clone(),
+                        network,
+                        sequencer_addr,
+                    );
+                    (Arc::clone(&node.state), None, None) // node_opt = None to skip block scanner
+                } else {
+                    // Bitcoin DA mode: require write client and mnemonic
+                    if mnemonic_str.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "Mnemonic is required when sequencer_rpc_url is not provided"
+                        ));
+                    }
 
-            // Start HTTP server for JSON-RPC - share the same state
-            let shared_state = Arc::clone(&node.state);
-            let bitcoin_client_write = node
-                .bitcoin_client_write
-                .clone()
-                .expect("Bitcoin write client must be configured in start mode");
+                    // Create write client - use write params if provided, otherwise use read params
+                    let write_url = bitcoin_rpc_write_url
+                        .as_ref()
+                        .unwrap_or(bitcoin_rpc_read_url);
+                    let write_user = bitcoin_rpc_write_user
+                        .as_ref()
+                        .unwrap_or(bitcoin_rpc_read_user);
+                    let write_password = bitcoin_rpc_write_password
+                        .as_ref()
+                        .unwrap_or(bitcoin_rpc_read_password);
+
+                    // Write client - user can customize the URL themselves
+                    let write_client = bitcoincore_rpc::Client::new(
+                        write_url,
+                        Auth::UserPass(write_user.to_string(), write_password.to_string()),
+                    )?;
+
+                    info!("   ✍️  Write: {}", write_url);
+
+                    let node = CoreLaneNode::new(
+                        read_client,
+                        write_client,
+                        cli.data_dir.clone(),
+                        network,
+                        sequencer_addr,
+                    );
+                    let shared_state = Arc::clone(&node.state);
+                    let bitcoin_client_write = node
+                        .bitcoin_client_write
+                        .clone()
+                        .expect("Bitcoin write client must be configured in start mode");
+                    (shared_state, Some(bitcoin_client_write), Some(node))
+                };
+
+            let rpc_config = crate::rpc::BitcoinClientConfig {
+                wallet: None, // wallet parameter no longer used
+                mnemonic: if mnemonic_str.is_empty() {
+                    None
+                } else {
+                    Some(mnemonic_str.clone())
+                },
+                electrum_url: electrum_url.clone(),
+                data_dir: cli.data_dir.clone(),
+                sequencer_rpc_url: sequencer_rpc_url.clone(),
+            };
             let rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
                 bitcoin_client_write,
-                network,
-                String::new(), // wallet parameter no longer used
-                mnemonic_str.clone(),
-                electrum_url.clone(),
-                cli.data_dir.clone(),
-            );
+                Some(network),
+                rpc_config,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create RPC server: {}", e))?;
+
+            if let Some(ref url) = sequencer_rpc_url {
+                info!("🔄 Sequencer RPC forwarding enabled: {}", url);
+            }
 
             let app = rpc_server.router();
 
@@ -2228,13 +2617,19 @@ async fn main() -> Result<()> {
                 axum::serve(listener, app).await.unwrap();
             });
 
-            // Start block scanner in main task
+            // Start block scanner in main task (only if bitcoin client is available)
             let start_block = *start_block;
-            let scanner_handle =
-                tokio::spawn(async move { node.start_block_scanner(start_block).await });
-
-            // Wait for both tasks
-            let _ = tokio::try_join!(server_handle, scanner_handle)?;
+            if let Some(node) = node_opt {
+                let scanner_handle =
+                    tokio::spawn(async move { node.start_block_scanner(start_block).await });
+                let (_server_result, scanner_result) =
+                    tokio::try_join!(server_handle, scanner_handle)?;
+                scanner_result?;
+            } else {
+                // Sequencer-only mode: no block scanner needed
+                info!("⏭️  Skipping block scanner (sequencer-only mode)");
+                server_handle.await?;
+            }
         }
 
         Commands::Burn {
@@ -2716,7 +3111,13 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone(), network);
+            let node = CoreLaneNode::new(
+                read_client,
+                write_client,
+                cli.data_dir.clone(),
+                network,
+                None,
+            );
             node.send_transaction_to_da(
                 raw_tx_hex,
                 &mnemonic_str,
@@ -2724,6 +3125,92 @@ async fn main() -> Result<()> {
                 network_str,
                 electrum_url.as_deref(),
                 &cli.data_dir,
+            )
+            .await?;
+        }
+
+        Commands::SendBundle {
+            raw_tx_hex: raw_tx_hex_vec,
+            network: network_str,
+            mnemonic,
+            mnemonic_file,
+            rpc_url,
+            rpc_user,
+            rpc_password,
+            electrum_url,
+            sequencer_payment_recipient,
+            marker,
+        } => {
+            if raw_tx_hex_vec.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "At least one transaction is required for a bundle"
+                ));
+            }
+
+            // Resolve mnemonic from various sources
+            let mnemonic_str = resolve_mnemonic(mnemonic.as_deref(), mnemonic_file.as_deref())?;
+
+            // Parse network
+            let network = match network_str.as_str() {
+                "bitcoin" | "mainnet" => bitcoincore_rpc::bitcoin::Network::Bitcoin,
+                "testnet" => bitcoincore_rpc::bitcoin::Network::Testnet,
+                "testnet4" => bitcoincore_rpc::bitcoin::Network::Testnet4,
+                "signet" => bitcoincore_rpc::bitcoin::Network::Signet,
+                "regtest" => bitcoincore_rpc::bitcoin::Network::Regtest,
+                _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
+            };
+
+            // Parse sequencer payment recipient
+            let sequencer_addr = if let Some(addr_str) = sequencer_payment_recipient {
+                alloy_primitives::Address::from_str(addr_str.trim_start_matches("0x")).map_err(
+                    |e| anyhow::anyhow!("Invalid sequencer payment recipient address: {}", e),
+                )?
+            } else {
+                alloy_primitives::Address::ZERO
+            };
+
+            // Parse bundle marker
+            let bundle_marker = match marker.to_lowercase().as_str() {
+                "head" => crate::block::BundleMarker::Head,
+                "standard" => crate::block::BundleMarker::Standard,
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid bundle marker: {}. Must be 'head' or 'standard'",
+                        marker
+                    ))
+                }
+            };
+
+            // Create Bitcoin RPC clients (only used for regtest)
+            let rpc_pass = rpc_password
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("bitcoin123");
+            let read_client = bitcoincore_rpc::Client::new(
+                rpc_url,
+                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+            )?;
+            let write_client = bitcoincore_rpc::Client::new(
+                rpc_url,
+                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
+            )?;
+
+            let node = CoreLaneNode::new(
+                read_client,
+                write_client,
+                cli.data_dir.clone(),
+                network,
+                None,
+            );
+            node.send_bundle_to_da(
+                raw_tx_hex_vec.clone(),
+                &mnemonic_str,
+                network,
+                network_str,
+                electrum_url.as_deref(),
+                &cli.data_dir,
+                sequencer_addr,
+                bundle_marker,
             )
             .await?;
         }
@@ -3249,8 +3736,27 @@ async fn main() -> Result<()> {
             derived_da_address,
             http_host,
             http_port,
+            sequencer_rpc_url,
+            sequencer_address,
         } => {
-            let node = CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest);
+            // Parse sequencer address if provided
+            let sequencer_addr = sequencer_address
+                .as_ref()
+                .map(|addr_str| {
+                    Address::from_str(addr_str).map_err(|e| {
+                        anyhow::anyhow!("Invalid sequencer address '{}': {}", addr_str, e)
+                    })
+                })
+                .transpose()?;
+
+            if sequencer_addr.is_none() {
+                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+            } else {
+                info!("✅ Using sequencer address: {:?}", sequencer_addr);
+            }
+
+            let node =
+                CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
 
             let da_address = Address::from_str(derived_da_address).map_err(|err| {
                 anyhow::anyhow!(
@@ -3266,7 +3772,12 @@ async fn main() -> Result<()> {
                 core_rpc_url.clone(),
                 da_address,
                 cli.data_dir.clone(),
+                sequencer_rpc_url.clone(),
             );
+
+            if let Some(ref url) = sequencer_rpc_url {
+                info!("🔄 Sequencer RPC forwarding enabled: {}", url);
+            }
 
             let app = rpc_server.router();
             let addr = format!("{}:{}", http_host, http_port);
