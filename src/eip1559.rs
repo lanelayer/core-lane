@@ -254,6 +254,16 @@ impl Eip1559FeeManager {
         self.config = config;
     }
 
+    /// Get the maximum block gas limit (EIP-1559 maximum)
+    pub fn max_gas_limit(&self) -> U256 {
+        self.config.gas_limit
+    }
+
+    /// Get the target gas usage per block (EIP-1559 target)
+    pub fn target_gas_usage(&self) -> U256 {
+        self.config.target_gas_usage
+    }
+
     /// Get the base fee history for a range of blocks
     pub fn get_base_fee_history(&self, start_block: u64, end_block: u64) -> Vec<(u64, U256)> {
         (start_block..=end_block)

@@ -380,6 +380,8 @@ impl CoreLaneBlock {
         parent_hash: B256,
         timestamp: u64,
         block_origin: Option<CoreLaneBlockParsed>,
+        gas_limit: U256,
+        base_fee_per_gas: U256,
     ) -> Self {
         let mut extra_data = vec![0u8; 32];
         extra_data[0] = b'C';
@@ -399,8 +401,8 @@ impl CoreLaneBlock {
             transactions: Vec::new(),
             transaction_count: 0,
             gas_used: U256::ZERO,
-            gas_limit: U256::from(30_000_000u64), // 30M gas limit
-            base_fee_per_gas: Some(U256::from(1_000_000_000u64)), // 1 gwei - will be updated dynamically
+            gas_limit, // EIP-1559 maximum block gas limit
+            base_fee_per_gas: Some(base_fee_per_gas),
             difficulty: U256::from(1u64),
             total_difficulty: U256::from(number),
             extra_data,
@@ -414,12 +416,14 @@ impl CoreLaneBlock {
         }
     }
 
-    fn genesis() -> Self {
+    fn genesis(max_gas_limit: U256, initial_base_fee: U256) -> Self {
         let mut block = Self::new(
             0,
             B256::default(), // Genesis has no parent
             1704067200,      // January 1, 2024 00:00:00 UTC
             None,
+            max_gas_limit,
+            initial_base_fee,
         );
 
         // Set genesis-specific values
@@ -668,7 +672,10 @@ struct CoreLaneNode {
 
 impl CoreLaneNode {
     fn new(bitcoin_client_read: Client, bitcoin_client_write: Client, data_dir: String) -> Self {
-        let genesis_block = CoreLaneBlock::genesis();
+        // Create genesis block with EIP-1559 default configuration
+        let eip1559_config = eip1559::Eip1559Config::default();
+        let genesis_block =
+            CoreLaneBlock::genesis(eip1559_config.gas_limit, eip1559_config.initial_base_fee);
         let genesis_hash = genesis_block.hash;
 
         let mut blocks = HashMap::new();
@@ -743,19 +750,29 @@ impl CoreLaneNode {
             0
         };
 
-        // Create new block with Bitcoin block timestamp
+        // Get EIP-1559 maximum gas limit and current base fee
+        let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
+        let current_base_fee = state.eip1559_fee_manager.current_base_fee();
+
+        // Create new block with Bitcoin block timestamp and EIP-1559 gas limits
         let mut new_block = CoreLaneBlock::new(
             next_number,
             parent_hash,
             anchor_block_timestamp,
             block_origin,
+            max_gas_limit,
+            current_base_fee,
         );
         // Calculate hash
         new_block.hash = new_block.calculate_hash();
         // Set as current block
         info!(
-            "🆕 Created Core Lane block {} (parent: {}) with timestamp {}",
-            next_number, latest_number, new_block.timestamp
+            "🆕 Created Core Lane block {} (parent: {}) with timestamp {} (EIP-1559 max gas: {}, base fee: {} gwei)",
+            next_number,
+            latest_number,
+            new_block.timestamp,
+            max_gas_limit,
+            current_base_fee / U256::from(1_000_000_000u64)
         );
         Ok(new_block)
     }
@@ -921,19 +938,56 @@ impl CoreLaneNode {
                 acc + val
             });
 
+        // EIP-1559: Validate and enforce maximum gas limit
+        let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
+        let target_gas_usage = state.eip1559_fee_manager.target_gas_usage();
+
+        // Ensure gas_used doesn't exceed maximum (shouldn't happen due to pre-validation, but double-check)
+        let final_gas_used = if total_gas_used > max_gas_limit {
+            warn!(
+                "⚠️  Block {} gas used ({}) exceeds EIP-1559 maximum gas limit ({}). Clamping to maximum.",
+                new_block.number, total_gas_used, max_gas_limit
+            );
+            max_gas_limit
+        } else {
+            total_gas_used
+        };
+
         // Update block gas usage
-        new_block.gas_used = total_gas_used;
+        new_block.gas_used = final_gas_used;
+        new_block.gas_limit = max_gas_limit; // Ensure block reflects EIP-1559 maximum gas limit
 
         // Update base fee for the NEXT block using this block's gas usage
         let next_base_fee = state
             .eip1559_fee_manager
-            .update_base_fee(new_block.number + 1, total_gas_used);
+            .update_base_fee(new_block.number + 1, final_gas_used);
+
+        // Log gas usage with EIP-1559 target/max information
+        let gas_usage_ratio = if max_gas_limit > U256::ZERO {
+            let used_u64 = final_gas_used.to::<u64>() as f64;
+            let max_u64 = max_gas_limit.to::<u64>() as f64;
+            (used_u64 / max_u64) * 100.0
+        } else {
+            0.0
+        };
+
+        let target_percentage = if target_gas_usage > U256::ZERO {
+            let used_u64 = final_gas_used.to::<u64>() as f64;
+            let target_u64 = target_gas_usage.to::<u64>() as f64;
+            (used_u64 / target_u64) * 100.0
+        } else {
+            0.0
+        };
 
         info!(
-            "⛽ Block {} gas usage: {} / {} (base fee used: {} gwei, next: {} gwei)",
+            "⛽ Block {} gas usage: {} / {} (EIP-1559 target: {}, max: {}) - {:.1}% of max, {:.1}% of target (base fee used: {} gwei, next: {} gwei)",
             new_block.number,
-            total_gas_used,
-            new_block.gas_limit,
+            final_gas_used,
+            max_gas_limit,
+            target_gas_usage,
+            max_gas_limit,
+            gas_usage_ratio,
+            target_percentage,
             new_block.base_fee_per_gas.unwrap_or_default() / U256::from(1_000_000_000u64),
             next_base_fee / U256::from(1_000_000_000u64)
         );
@@ -1162,6 +1216,15 @@ impl CoreLaneNode {
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
 
+        // Get EIP-1559 configuration for gas limit enforcement
+        let state = self.state.lock().await;
+        let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
+        let target_gas_usage = state.eip1559_fee_manager.target_gas_usage();
+        drop(state);
+
+        // Track cumulative gas used for this block (EIP-1559 maximum enforcement)
+        let mut cumulative_gas_used = U256::ZERO;
+
         // Create a single bundle state manager for the entire block
         let mut bundle_state = state::BundleStateManager::new();
 
@@ -1182,18 +1245,78 @@ impl CoreLaneNode {
                     continue;
                 }
                 for tx in bundle.transactions.iter() {
-                    let tx = self
+                    // EIP-1559: Check if adding this transaction would exceed maximum block gas limit
+                    let tx_gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
+
+                    // Check if this transaction would exceed the maximum block gas limit
+                    if cumulative_gas_used + tx_gas_limit > max_gas_limit {
+                        warn!(
+                            "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping transaction with gas_limit: {}",
+                            new_block.number,
+                            cumulative_gas_used,
+                            max_gas_limit,
+                            tx_gas_limit
+                        );
+                        // Skip remaining transactions as we've hit the maximum
+                        break;
+                    }
+
+                    // Log when we exceed target (for informational purposes)
+                    if cumulative_gas_used >= target_gas_usage
+                        && cumulative_gas_used < target_gas_usage + tx_gas_limit
+                    {
+                        info!(
+                            "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
+                            new_block.number,
+                            target_gas_usage,
+                            max_gas_limit,
+                            cumulative_gas_used
+                        );
+                    }
+
+                    let tx_result = self
                         .process_core_lane_transaction(
                             &mut bundle_state,
                             tx,
                             new_block.number,
                             tx_count,
+                            max_gas_limit,
+                            cumulative_gas_used,
                         )
                         .await;
-                    if let Some((stored_tx, receipt, tx_hash)) = tx {
+
+                    if let Some((stored_tx, receipt, tx_hash)) = tx_result {
+                        // Parse actual gas used from receipt
+                        let gas_used_str = receipt.gas_used.as_str();
+                        let actual_gas_used = if let Some(hex) = gas_used_str.strip_prefix("0x") {
+                            let bytes = hex::decode(hex).unwrap_or_default();
+                            U256::from_be_slice(&bytes)
+                        } else {
+                            U256::from_str(gas_used_str).unwrap_or(tx_gas_limit)
+                        };
+
+                        // Update cumulative gas used with actual gas consumed
+                        cumulative_gas_used += actual_gas_used;
+
                         core_lane_transactions.push((stored_tx, receipt, tx_hash));
                         tx_count += 1;
+
+                        // Double-check: if we've now exceeded the maximum after execution, stop
+                        if cumulative_gas_used > max_gas_limit {
+                            warn!(
+                                "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
+                                new_block.number,
+                                cumulative_gas_used,
+                                max_gas_limit
+                            );
+                            break;
+                        }
                     }
+                }
+
+                // If we've hit the maximum, stop processing remaining bundles
+                if cumulative_gas_used >= max_gas_limit {
+                    break;
                 }
             }
         }
@@ -1243,11 +1366,22 @@ impl CoreLaneNode {
         tx: &(TxEnvelope, Address, Vec<u8>),
         block_number: u64,
         tx_number: u64,
+        max_block_gas_limit: U256,
+        cumulative_gas_used: U256,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
         let mut state = self.state.lock().await;
         let gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
+
+        // EIP-1559: Validate transaction doesn't exceed block maximum gas limit
+        if cumulative_gas_used + gas_limit > max_block_gas_limit {
+            warn!(
+                "      ⚠️  Transaction would exceed EIP-1559 block maximum gas limit (current: {}, tx: {}, max: {}), skipping",
+                cumulative_gas_used, gas_limit, max_block_gas_limit
+            );
+            return None;
+        }
 
         // Handle EIP-1559 transactions with proper fee calculation and burning
         if tx.0.is_eip1559() {
