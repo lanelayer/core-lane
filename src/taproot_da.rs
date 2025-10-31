@@ -561,16 +561,13 @@ impl TaprootDA {
                     ));
                 }
 
-                // Get the transaction IDs from the tx-results object keys
-                let mut tx_ids: Vec<&str> = tx_results.keys().map(|k| k.as_str()).collect();
-                tx_ids.sort(); // Sort for consistent ordering
-
-                let commit_txid = tx_ids[0];
-                let reveal_txid = tx_ids[1];
+                // Compute actual txids (non-witness IDs) from our constructed transactions
+                let commit_txid_tx = commit_tx.compute_txid();
+                let reveal_txid_tx = reveal_tx.compute_txid();
 
                 tracing::info!("✅ Core Lane transaction package submitted successfully!");
-                tracing::info!("📍 Commit transaction ID: {}", commit_txid);
-                tracing::info!("📍 Reveal transaction ID: {}", reveal_txid);
+                tracing::info!("📍 Commit transaction ID (txid): {}", commit_txid_tx);
+                tracing::info!("📍 Reveal transaction ID (txid): {}", reveal_txid_tx);
                 tracing::info!(
                     "📦 Core Lane data embedded AND revealed atomically in the same block"
                 );
@@ -579,7 +576,7 @@ impl TaprootDA {
                     "\n🔍 Core Lane node will detect the reveal transaction when scanning blocks!"
                 );
 
-                Ok(commit_txid.to_string())
+                Ok(commit_txid_tx.to_string())
             }
             Err(e) => {
                 tracing::error!("❌ Failed to submit transaction package: {}", e);
