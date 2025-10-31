@@ -1827,8 +1827,9 @@ async fn main() -> Result<()> {
     if !cli.plain {
         tracing_subscriber::registry()
             .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "core_lane_node=info,core_lane=info,tower_http=debug".into()),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "core_lane_node=info,core_lane=info,tower_http=debug".into()
+                }),
             )
             .with(tracing_subscriber::fmt::layer())
             .init();
