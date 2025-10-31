@@ -1371,6 +1371,10 @@ impl CoreLaneNode {
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
+        // Compute and log transaction hash early
+        let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
+        info!("   📝 Processing transaction: {}", tx_hash);
+
         let mut state = self.state.lock().await;
         let gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
 
@@ -1507,8 +1511,7 @@ impl CoreLaneNode {
             raw_data: tx.2.clone(),
             block_number,
         };
-        // Create and store transaction receipt in bundle state
-        let tx_hash = format!("0x{}", hex::encode(alloy_primitives::keccak256(&tx.2)));
+        // Create and store transaction receipt in bundle state (tx_hash already computed above)
 
         // Calculate effective gas price and gas used for receipt
         let (effective_gas_price, _gas_used) = if tx.0.is_eip1559() {
