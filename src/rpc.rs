@@ -490,6 +490,7 @@ impl RpcServer {
                 // Extract transaction data based on envelope type
                 match &stored_tx.envelope {
                     alloy_consensus::TxEnvelope::Legacy(tx) => {
+                        result.insert("type".to_string(), json!("0x0"));
                         result.insert("nonce".to_string(), json!(format!("0x{:x}", tx.tx().nonce)));
                         result.insert(
                             "gasPrice".to_string(),
@@ -499,7 +500,11 @@ impl RpcServer {
                             "gas".to_string(),
                             json!(format!("0x{:x}", tx.tx().gas_limit)),
                         );
-                        result.insert("type".to_string(), json!("0x0"));
+                        // Add chainId for EIP-155 transactions
+                        if let Some(chain_id) = tx.tx().chain_id {
+                            result
+                                .insert("chainId".to_string(), json!(format!("0x{:x}", chain_id)));
+                        }
 
                         // Handle 'to' field - it's a TxKind enum
                         let to_address = match tx.tx().to {
@@ -542,6 +547,10 @@ impl RpcServer {
                     }
                     alloy_consensus::TxEnvelope::Eip1559(tx) => {
                         result.insert("type".to_string(), json!("0x2"));
+                        result.insert(
+                            "chainId".to_string(),
+                            json!(format!("0x{:x}", tx.tx().chain_id)),
+                        );
                         result.insert("nonce".to_string(), json!(format!("0x{:x}", tx.tx().nonce)));
                         result.insert(
                             "maxFeePerGas".to_string(),
@@ -580,6 +589,14 @@ impl RpcServer {
                             "s".to_string(),
                             json!(format!("0x{:x}", tx.signature().s())),
                         );
+                        // Serialize the actual access list
+                        let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                            json!({
+                                "address": format!("0x{:x}", item.address),
+                                "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                            })
+                        }).collect();
+                        result.insert("accessList".to_string(), json!(access_list));
 
                         // Try to recover sender address
                         if let Ok(sender) = tx.recover_signer() {
@@ -593,6 +610,10 @@ impl RpcServer {
                     }
                     alloy_consensus::TxEnvelope::Eip2930(tx) => {
                         result.insert("type".to_string(), json!("0x1"));
+                        result.insert(
+                            "chainId".to_string(),
+                            json!(format!("0x{:x}", tx.tx().chain_id)),
+                        );
                         result.insert("nonce".to_string(), json!(format!("0x{:x}", tx.tx().nonce)));
                         result.insert(
                             "gasPrice".to_string(),
@@ -627,6 +648,14 @@ impl RpcServer {
                             "s".to_string(),
                             json!(format!("0x{:x}", tx.signature().s())),
                         );
+                        // Serialize the actual access list
+                        let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                            json!({
+                                "address": format!("0x{:x}", item.address),
+                                "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                            })
+                        }).collect();
+                        result.insert("accessList".to_string(), json!(access_list));
 
                         // Try to recover sender address
                         if let Ok(sender) = tx.recover_signer() {
@@ -852,6 +881,7 @@ impl RpcServer {
                             // Extract transaction data based on envelope type
                             match &stored_tx.envelope {
                                 alloy_consensus::TxEnvelope::Legacy(tx) => {
+                                    result.insert("type".to_string(), json!("0x0"));
                                     result.insert(
                                         "nonce".to_string(),
                                         json!(format!("0x{:x}", tx.tx().nonce)),
@@ -864,6 +894,13 @@ impl RpcServer {
                                         "gas".to_string(),
                                         json!(format!("0x{:x}", tx.tx().gas_limit)),
                                     );
+                                    // Add chainId for EIP-155 transactions
+                                    if let Some(chain_id) = tx.tx().chain_id {
+                                        result.insert(
+                                            "chainId".to_string(),
+                                            json!(format!("0x{:x}", chain_id)),
+                                        );
+                                    }
 
                                     // Handle 'to' field - it's a TxKind enum
                                     let to_address = match tx.tx().to {
@@ -916,6 +953,10 @@ impl RpcServer {
                                 alloy_consensus::TxEnvelope::Eip1559(tx) => {
                                     result.insert("type".to_string(), json!("0x2"));
                                     result.insert(
+                                        "chainId".to_string(),
+                                        json!(format!("0x{:x}", tx.tx().chain_id)),
+                                    );
+                                    result.insert(
                                         "nonce".to_string(),
                                         json!(format!("0x{:x}", tx.tx().nonce)),
                                     );
@@ -964,6 +1005,14 @@ impl RpcServer {
                                         "s".to_string(),
                                         json!(format!("0x{:x}", tx.signature().s())),
                                     );
+                                    // Serialize the actual access list
+                                    let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                                        json!({
+                                            "address": format!("0x{:x}", item.address),
+                                            "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                                        })
+                                    }).collect();
+                                    result.insert("accessList".to_string(), json!(access_list));
 
                                     // Try to recover sender address
                                     if let Ok(sender) = tx.recover_signer() {
@@ -980,6 +1029,10 @@ impl RpcServer {
                                 }
                                 alloy_consensus::TxEnvelope::Eip2930(tx) => {
                                     result.insert("type".to_string(), json!("0x1"));
+                                    result.insert(
+                                        "chainId".to_string(),
+                                        json!(format!("0x{:x}", tx.tx().chain_id)),
+                                    );
                                     result.insert(
                                         "nonce".to_string(),
                                         json!(format!("0x{:x}", tx.tx().nonce)),
@@ -1025,6 +1078,14 @@ impl RpcServer {
                                         "s".to_string(),
                                         json!(format!("0x{:x}", tx.signature().s())),
                                     );
+                                    // Serialize the actual access list
+                                    let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                                        json!({
+                                            "address": format!("0x{:x}", item.address),
+                                            "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                                        })
+                                    }).collect();
+                                    result.insert("accessList".to_string(), json!(access_list));
 
                                     // Try to recover sender address
                                     if let Ok(sender) = tx.recover_signer() {
@@ -1154,6 +1215,7 @@ impl RpcServer {
                         // Extract transaction data based on envelope type
                         match &stored_tx.envelope {
                             alloy_consensus::TxEnvelope::Legacy(tx) => {
+                                result.insert("type".to_string(), json!("0x0"));
                                 result.insert(
                                     "nonce".to_string(),
                                     json!(format!("0x{:x}", tx.tx().nonce)),
@@ -1166,6 +1228,13 @@ impl RpcServer {
                                     "gas".to_string(),
                                     json!(format!("0x{:x}", tx.tx().gas_limit)),
                                 );
+                                // Add chainId for EIP-155 transactions
+                                if let Some(chain_id) = tx.tx().chain_id {
+                                    result.insert(
+                                        "chainId".to_string(),
+                                        json!(format!("0x{:x}", chain_id)),
+                                    );
+                                }
 
                                 // Handle 'to' field - it's a TxKind enum
                                 let to_address = match tx.tx().to {
@@ -1215,6 +1284,10 @@ impl RpcServer {
                             alloy_consensus::TxEnvelope::Eip1559(tx) => {
                                 result.insert("type".to_string(), json!("0x2"));
                                 result.insert(
+                                    "chainId".to_string(),
+                                    json!(format!("0x{:x}", tx.tx().chain_id)),
+                                );
+                                result.insert(
                                     "nonce".to_string(),
                                     json!(format!("0x{:x}", tx.tx().nonce)),
                                 );
@@ -1261,6 +1334,14 @@ impl RpcServer {
                                     "s".to_string(),
                                     json!(format!("0x{:x}", tx.signature().s())),
                                 );
+                                // Serialize the actual access list
+                                let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                                    json!({
+                                        "address": format!("0x{:x}", item.address),
+                                        "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                                    })
+                                }).collect();
+                                result.insert("accessList".to_string(), json!(access_list));
 
                                 // Try to recover sender address
                                 if let Ok(sender) = tx.recover_signer() {
@@ -1277,6 +1358,10 @@ impl RpcServer {
                             }
                             alloy_consensus::TxEnvelope::Eip2930(tx) => {
                                 result.insert("type".to_string(), json!("0x1"));
+                                result.insert(
+                                    "chainId".to_string(),
+                                    json!(format!("0x{:x}", tx.tx().chain_id)),
+                                );
                                 result.insert(
                                     "nonce".to_string(),
                                     json!(format!("0x{:x}", tx.tx().nonce)),
@@ -1320,6 +1405,14 @@ impl RpcServer {
                                     "s".to_string(),
                                     json!(format!("0x{:x}", tx.signature().s())),
                                 );
+                                // Serialize the actual access list
+                                let access_list: Vec<_> = tx.tx().access_list.0.iter().map(|item| {
+                                    json!({
+                                        "address": format!("0x{:x}", item.address),
+                                        "storageKeys": item.storage_keys.iter().map(|key| format!("0x{:x}", key)).collect::<Vec<_>>()
+                                    })
+                                }).collect();
+                                result.insert("accessList".to_string(), json!(access_list));
 
                                 // Try to recover sender address
                                 if let Ok(sender) = tx.recover_signer() {
