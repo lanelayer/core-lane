@@ -513,10 +513,14 @@ impl RpcServer {
                             "input".to_string(),
                             json!(format!("0x{}", hex::encode(&tx.tx().input))),
                         );
-                        result.insert(
-                            "v".to_string(),
-                            json!(format!("0x{:x}", if tx.signature().v() { 1 } else { 0 })),
-                        );
+                        // Calculate proper EIP-155 v value: chain_id * 2 + 35 + parity
+                        let v_value = if let Some(chain_id) = tx.tx().chain_id {
+                            chain_id * 2 + 35 + if tx.signature().v() { 1 } else { 0 }
+                        } else {
+                            // Pre-EIP-155: 27 + parity
+                            27 + if tx.signature().v() { 1 } else { 0 }
+                        };
+                        result.insert("v".to_string(), json!(format!("0x{:x}", v_value)));
                         result.insert(
                             "r".to_string(),
                             json!(format!("0x{:x}", tx.signature().r())),
@@ -537,6 +541,7 @@ impl RpcServer {
                         }
                     }
                     alloy_consensus::TxEnvelope::Eip1559(tx) => {
+                        result.insert("type".to_string(), json!("0x2"));
                         result.insert("nonce".to_string(), json!(format!("0x{:x}", tx.tx().nonce)));
                         result.insert(
                             "maxFeePerGas".to_string(),
@@ -587,6 +592,7 @@ impl RpcServer {
                         }
                     }
                     alloy_consensus::TxEnvelope::Eip2930(tx) => {
+                        result.insert("type".to_string(), json!("0x1"));
                         result.insert("nonce".to_string(), json!(format!("0x{:x}", tx.tx().nonce)));
                         result.insert(
                             "gasPrice".to_string(),
@@ -876,13 +882,15 @@ impl RpcServer {
                                         "input".to_string(),
                                         json!(format!("0x{}", hex::encode(&tx.tx().input))),
                                     );
-                                    result.insert(
-                                        "v".to_string(),
-                                        json!(format!(
-                                            "0x{:x}",
-                                            if tx.signature().v() { 1 } else { 0 }
-                                        )),
-                                    );
+                                    // Calculate proper EIP-155 v value: chain_id * 2 + 35 + parity
+                                    let v_value = if let Some(chain_id) = tx.tx().chain_id {
+                                        chain_id * 2 + 35 + if tx.signature().v() { 1 } else { 0 }
+                                    } else {
+                                        // Pre-EIP-155: 27 + parity
+                                        27 + if tx.signature().v() { 1 } else { 0 }
+                                    };
+                                    result
+                                        .insert("v".to_string(), json!(format!("0x{:x}", v_value)));
                                     result.insert(
                                         "r".to_string(),
                                         json!(format!("0x{:x}", tx.signature().r())),
@@ -906,6 +914,7 @@ impl RpcServer {
                                     }
                                 }
                                 alloy_consensus::TxEnvelope::Eip1559(tx) => {
+                                    result.insert("type".to_string(), json!("0x2"));
                                     result.insert(
                                         "nonce".to_string(),
                                         json!(format!("0x{:x}", tx.tx().nonce)),
@@ -970,6 +979,7 @@ impl RpcServer {
                                     }
                                 }
                                 alloy_consensus::TxEnvelope::Eip2930(tx) => {
+                                    result.insert("type".to_string(), json!("0x1"));
                                     result.insert(
                                         "nonce".to_string(),
                                         json!(format!("0x{:x}", tx.tx().nonce)),
@@ -1172,13 +1182,14 @@ impl RpcServer {
                                     "input".to_string(),
                                     json!(format!("0x{}", hex::encode(&tx.tx().input))),
                                 );
-                                result.insert(
-                                    "v".to_string(),
-                                    json!(format!(
-                                        "0x{:x}",
-                                        if tx.signature().v() { 1 } else { 0 }
-                                    )),
-                                );
+                                // Calculate proper EIP-155 v value: chain_id * 2 + 35 + parity
+                                let v_value = if let Some(chain_id) = tx.tx().chain_id {
+                                    chain_id * 2 + 35 + if tx.signature().v() { 1 } else { 0 }
+                                } else {
+                                    // Pre-EIP-155: 27 + parity
+                                    27 + if tx.signature().v() { 1 } else { 0 }
+                                };
+                                result.insert("v".to_string(), json!(format!("0x{:x}", v_value)));
                                 result.insert(
                                     "r".to_string(),
                                     json!(format!("0x{:x}", tx.signature().r())),
@@ -1202,6 +1213,7 @@ impl RpcServer {
                                 }
                             }
                             alloy_consensus::TxEnvelope::Eip1559(tx) => {
+                                result.insert("type".to_string(), json!("0x2"));
                                 result.insert(
                                     "nonce".to_string(),
                                     json!(format!("0x{:x}", tx.tx().nonce)),
@@ -1264,6 +1276,7 @@ impl RpcServer {
                                 }
                             }
                             alloy_consensus::TxEnvelope::Eip2930(tx) => {
+                                result.insert("type".to_string(), json!("0x1"));
                                 result.insert(
                                     "nonce".to_string(),
                                     json!(format!("0x{:x}", tx.tx().nonce)),
@@ -2090,8 +2103,10 @@ impl RpcServer {
             }
         };
 
+        // Support both "data" and "input" fields (both are valid in Ethereum RPC)
         let data_str = call_obj
             .get("data")
+            .or_else(|| call_obj.get("input"))
             .and_then(|v| v.as_str())
             .unwrap_or("0x");
 

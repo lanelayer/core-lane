@@ -475,6 +475,7 @@ impl CoreLaneBlock {
             "receiptsRoot": format!("0x{:x}", self.receipts_root),
             "transactionsRoot": format!("0x{:x}", self.transactions_root),
             "logsBloom": format!("0x{}", hex::encode(&self.logs_bloom)),
+            "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000", // Not used in non-PoW chains
             "sha3Uncles": "0x0000000000000000000000000000000000000000000000000000000000000000", // Hash of empty array (32 zero bytes)
             "size": format!("0x{:x}", self.transaction_count * 32), // Approximate size
             "uncles": [],
