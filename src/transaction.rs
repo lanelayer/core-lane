@@ -50,6 +50,7 @@ pub trait ProcessingContext {
     fn state_manager(&self) -> &StateManager;
     fn state_manager_mut(&mut self) -> &mut StateManager;
     fn bitcoin_client_read(&self) -> Arc<Client>;
+    fn bitcoin_network(&self) -> bitcoin::Network;
     fn handle_cmio_query(
         &mut self,
         message: CmioMessage,
@@ -424,18 +425,21 @@ fn execute_transfer<T: ProcessingContext>(
                         None => (None, None),
                     };
 
-                if status_snapshot.is_none() {
-                    return Ok(ExecutionResult {
-                        success: false,
-                        gas_used,
-                        gas_refund: U256::ZERO,
-                        output: Bytes::new(),
-                        logs: vec!["lockIntentForSolving: intent not found".to_string()],
-                        error: Some("Intent not found".to_string()),
-                    });
-                }
+                let status = match status_snapshot {
+                    Some(s) => s,
+                    None => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["lockIntentForSolving: intent not found".to_string()],
+                            error: Some("Intent not found".to_string()),
+                        });
+                    }
+                };
 
-                match status_snapshot.unwrap() {
+                match status {
                     IntentStatus::Submitted => {
                         let original_main_intent =
                             state.state_manager().get_intent(&intent_id).cloned();
@@ -974,7 +978,7 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
 ) -> Result<bool> {
     let client = state.bitcoin_client_read();
 
-    let network = bitcoin::Network::Regtest;
+    let network = state.bitcoin_network();
     let intent = state
         .state_manager()
         .get_intent(&intent_id)
@@ -983,8 +987,16 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     let fill = cbor_intent.parse_anchor_bitcoin_fill()?;
     let dest_script = {
         let addr_str = fill.parse_bitcoin_address()?;
-        let addr = BitcoinAddress::from_str(&addr_str).unwrap();
-        let addr_checked = addr.require_network(network).unwrap();
+        let addr = BitcoinAddress::from_str(&addr_str)
+            .map_err(|e| anyhow!("Invalid Bitcoin address '{}': {}", addr_str, e))?;
+        let addr_checked = addr.require_network(network).map_err(|e| {
+            anyhow!(
+                "Bitcoin address network mismatch: expected {:?}, got address {} ({})",
+                network,
+                addr_str,
+                e
+            )
+        })?;
         addr_checked.script_pubkey()
     };
     let expected_amount_u256 = fill.amount;
