@@ -927,6 +927,31 @@ impl BitcoinCacheRpcServer {
         Ok(result)
     }
 
+    /// Handle getrawtransaction RPC call - forward to upstream Bitcoin RPC
+    async fn handle_getrawtransaction(
+        &self,
+        txid: String,
+        verbose: bool,
+        blockhash: Option<String>,
+    ) -> Result<Value> {
+        info!(
+            "🔍 Bitcoin Cache: getrawtransaction called for txid={}, verbose={}, blockhash={:?}",
+            txid, verbose, blockhash
+        );
+
+        // Build params array based on what was provided
+        let mut params = vec![json!(txid), json!(verbose)];
+        if let Some(hash) = blockhash {
+            params.push(json!(hash));
+        }
+
+        // Forward to upstream Bitcoin RPC using HTTP client
+        let result = self.forward_rpc_call("getrawtransaction", params).await?;
+
+        debug!("✅ Forwarded getrawtransaction to upstream Bitcoin RPC");
+        Ok(result)
+    }
+
     /// Forward RPC call to upstream Bitcoin RPC server
     async fn forward_rpc_call(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         match &self.state.bitcoin_client {
@@ -1087,6 +1112,36 @@ async fn handle_rpc(
                 .unwrap_or("ECONOMICAL");
             server
                 .handle_estimatesmartfee(conf_target, estimate_mode)
+                .await
+        }
+        "getrawtransaction" => {
+            let txid = match params.and_then(|p| p.first()).and_then(|v| v.as_str()) {
+                Some(t) => t.to_string(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "jsonrpc": "2.0",
+                            "error": {
+                                "code": -32602,
+                                "message": "Invalid params: transaction ID required"
+                            },
+                            "id": id
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            let verbose = params
+                .and_then(|p| p.get(1))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let blockhash = params
+                .and_then(|p| p.get(2))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            server
+                .handle_getrawtransaction(txid, verbose, blockhash)
                 .await
         }
         _ => {
