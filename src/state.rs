@@ -11,6 +11,24 @@ use crate::account::CoreLaneAccount;
 use crate::intents::Intent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub struct Log {
+    pub address: String,
+    pub topics: Vec<String>,
+    pub data: String,
+    #[serde(rename = "blockNumber")]
+    pub block_number: String,
+    #[serde(rename = "transactionHash")]
+    pub transaction_hash: String,
+    #[serde(rename = "transactionIndex")]
+    pub transaction_index: String,
+    #[serde(rename = "blockHash")]
+    pub block_hash: String,
+    #[serde(rename = "logIndex")]
+    pub log_index: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct TransactionReceipt {
     pub transaction_hash: String,
     pub block_number: u64,
@@ -20,7 +38,7 @@ pub struct TransactionReceipt {
     pub cumulative_gas_used: String,
     pub gas_used: String,
     pub contract_address: Option<String>,
-    pub logs: Vec<String>,
+    pub logs: Vec<Log>,
     pub status: String,
     pub effective_gas_price: String,
     pub tx_type: String,
