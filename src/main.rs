@@ -1542,6 +1542,25 @@ impl CoreLaneNode {
             (U256::from(214285714u64), gas_limit) // Default fallback
         };
 
+        // Convert string logs to proper Log objects
+        let logs: Vec<state::Log> = execution_result
+            .logs
+            .iter()
+            .enumerate()
+            .map(|(idx, log_str)| state::Log {
+                address: "0x0000000000000000000000000000000000000000".to_string(), // Intent contract address
+                topics: vec![], // No topics for now
+                data: format!("0x{}", hex::encode(log_str.as_bytes())), // Encode log message as hex data
+                block_number: format!("0x{:x}", block_number),
+                transaction_hash: tx_hash.clone(),
+                transaction_index: format!("0x{:x}", tx_number),
+                block_hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(), // Placeholder, will be updated when block is finalized
+                log_index: format!("0x{:x}", idx),
+                removed: false,
+            })
+            .collect();
+
         let receipt = TransactionReceipt {
             transaction_hash: tx_hash.clone(),
             block_number,
@@ -1551,7 +1570,7 @@ impl CoreLaneNode {
             cumulative_gas_used: format!("0x{:x}", execution_result.gas_used),
             gas_used: format!("0x{:x}", execution_result.gas_used),
             contract_address: None,
-            logs: execution_result.logs.clone(),
+            logs,
             status: if execution_result.success {
                 "0x1"
             } else {
