@@ -127,6 +127,7 @@ impl RpcServer {
 
             // Network and chain methods
             "eth_chainId" => Self::handle_chain_id(request).await,
+            "eth_syncing" => Self::handle_syncing(request, &state).await,
             "net_version" => Self::handle_net_version(request).await,
             "net_listening" => Self::handle_net_listening(request).await,
             "net_peerCount" => Self::handle_net_peer_count(request).await,
@@ -1691,6 +1692,97 @@ impl RpcServer {
             error: None,
             id: request.id,
         }))
+    }
+
+    async fn handle_syncing(
+        request: JsonRpcRequest,
+        server: &Arc<RpcServer>,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        use bitcoincore_rpc::RpcApi;
+
+        // Get bitcoin client from server
+        let bitcoin_client = match &server.bitcoin_client {
+            Some(client) => client.clone(),
+            None => {
+                // If no bitcoin client, we can't determine syncing status
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: Some(json!(false)),
+                    error: None,
+                    id: request.id,
+                }));
+            }
+        };
+
+        // Get current Bitcoin tip
+        let bitcoin_tip = match bitcoin_client.get_block_count() {
+            Ok(tip) => tip,
+            Err(e) => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: format!("Failed to get Bitcoin block count: {}", e),
+                    }),
+                    id: request.id,
+                }));
+            }
+        };
+
+        // Get last processed Bitcoin height and current Core Lane block number
+        let state_guard = server.state.lock().await;
+        let last_processed_bitcoin = state_guard.last_processed_bitcoin_height;
+        let current_core_lane_block = state_guard.blocks.keys().max().copied().unwrap_or(0);
+        drop(state_guard);
+
+        match last_processed_bitcoin {
+            None => {
+                // Haven't processed any blocks yet - definitely syncing
+                Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: Some(json!({
+                        "startingBlock": "0x0",
+                        "currentBlock": "0x0",
+                        "highestBlock": "0x0",
+                    })),
+                    error: None,
+                    id: request.id,
+                }))
+            }
+            Some(current_bitcoin_height) => {
+                // Consider synced if we're within 1 block of the Bitcoin tip
+                // (allows for network propagation delay)
+                if bitcoin_tip <= current_bitcoin_height
+                    || bitcoin_tip - current_bitcoin_height <= 1
+                {
+                    // Synced
+                    Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: Some(json!(false)),
+                        error: None,
+                        id: request.id,
+                    }))
+                } else {
+                    // Still syncing - estimate the highest Core Lane block
+                    // We can't know the exact highest block until we sync,
+                    // but we can estimate based on the difference
+                    let blocks_behind = bitcoin_tip - current_bitcoin_height;
+                    let estimated_highest = current_core_lane_block + blocks_behind;
+
+                    Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: Some(json!({
+                            "startingBlock": "0x0",
+                            "currentBlock": format!("0x{:x}", current_core_lane_block),
+                            "highestBlock": format!("0x{:x}", estimated_highest),
+                        })),
+                        error: None,
+                        id: request.id,
+                    }))
+                }
+            }
+        }
     }
 
     async fn handle_net_version(
