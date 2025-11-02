@@ -504,6 +504,7 @@ struct CoreLaneState {
     eip1559_fee_manager: eip1559::Eip1559FeeManager, // EIP-1559 fee management
     sequencer_address: Address,       // Address that receives priority fees
     total_burned_amount: U256,        // Total amount burned from base fees
+    bitcoin_network: bitcoin::Network, // Bitcoin network (mainnet, testnet, regtest, etc.)
 }
 
 impl CoreLaneState {
@@ -654,6 +655,10 @@ impl transaction::ProcessingContext for CoreLaneState {
         self.bitcoin_client_read.clone()
     }
 
+    fn bitcoin_network(&self) -> bitcoin::Network {
+        self.bitcoin_network
+    }
+
     fn handle_cmio_query(
         &mut self,
         message: CmioMessage,
@@ -672,7 +677,12 @@ struct CoreLaneNode {
 }
 
 impl CoreLaneNode {
-    fn new(bitcoin_client_read: Client, bitcoin_client_write: Client, data_dir: String) -> Self {
+    fn new(
+        bitcoin_client_read: Client,
+        bitcoin_client_write: Client,
+        data_dir: String,
+        network: bitcoin::Network,
+    ) -> Self {
         // Create genesis block with EIP-1559 default configuration
         let eip1559_config = eip1559::Eip1559Config::default();
         let genesis_block =
@@ -713,6 +723,7 @@ impl CoreLaneNode {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
             ]), // Sequencer address
             total_burned_amount: U256::ZERO,
+            bitcoin_network: network,
         }));
 
         // Write genesis state to disk
@@ -1967,7 +1978,7 @@ async fn main() -> Result<()> {
             info!("   📖 Read:  {}", bitcoin_rpc_read_url);
             info!("   ✍️  Write: {}", write_url);
 
-            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone());
+            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone(), network);
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
@@ -2477,7 +2488,7 @@ async fn main() -> Result<()> {
                 Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
             )?;
 
-            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone());
+            let node = CoreLaneNode::new(read_client, write_client, cli.data_dir.clone(), network);
             node.send_transaction_to_da(
                 raw_tx_hex,
                 &mnemonic_str,

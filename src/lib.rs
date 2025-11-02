@@ -77,7 +77,8 @@ use std::sync::Arc;
 ///
 /// let mut state = CoreLaneStateForLib::new(
 ///     StateManager::new(),
-///     Arc::new(bitcoin_client.clone())
+///     Arc::new(bitcoin_client.clone()),
+///     bitcoincore_rpc::bitcoin::Network::Regtest
 /// );
 ///
 /// let mut bundle = BundleStateManager::new();
@@ -87,15 +88,21 @@ pub struct CoreLaneStateForLib {
     account_manager: StateManager,
     bitcoin_client_read: Arc<Client>,
     bitcoin_client_write: Arc<Client>,
+    bitcoin_network: bitcoin::Network,
 }
 
 impl CoreLaneStateForLib {
     /// Create a new state context with the given state manager and Bitcoin client
-    pub fn new(state_manager: StateManager, bitcoin_client: Arc<Client>) -> Self {
+    pub fn new(
+        state_manager: StateManager,
+        bitcoin_client: Arc<Client>,
+        network: bitcoin::Network,
+    ) -> Self {
         Self {
             account_manager: state_manager,
             bitcoin_client_read: bitcoin_client.clone(),
             bitcoin_client_write: bitcoin_client,
+            bitcoin_network: network,
         }
     }
 }
@@ -130,6 +137,10 @@ impl transaction::ProcessingContext for CoreLaneStateForLib {
 
     fn bitcoin_client_read(&self) -> Arc<Client> {
         self.bitcoin_client_read.clone()
+    }
+
+    fn bitcoin_network(&self) -> bitcoin::Network {
+        self.bitcoin_network
     }
 
     fn handle_cmio_query(

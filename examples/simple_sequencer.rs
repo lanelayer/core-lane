@@ -37,7 +37,11 @@ async fn main() -> Result<()> {
             // 2. Initialize state manager and context (same pattern as the main node)
             println!("💾 Initializing state manager...");
             let mut state = StateManager::new();
-            let mut state_context = CoreLaneStateForLib::new(state.clone(), Arc::clone(&client));
+            let mut state_context = CoreLaneStateForLib::new(
+                state.clone(),
+                Arc::clone(&client),
+                bitcoincore_rpc::bitcoin::Network::Regtest,
+            );
             println!("✅ State manager initialized\n");
 
             // 3. Show account balances
