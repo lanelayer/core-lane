@@ -1,0 +1,56 @@
+# fly.toml app configuration file generated for core-lane-rpc on 2025-11-04T08:54:51+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'core-lane-rpc'
+primary_region = 'cdg'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  CACHE_DIR = '/storage/cache'
+  DATA_DIR = '/storage/data'
+  HTTP_HOST = '0.0.0.0'
+  HTTP_PORT = '8545'
+  NETWORK = 'mainnet'
+
+[processes]
+  app = '/app/entrypoint-rpc.sh'
+
+[[mounts]]
+  source = 'core_lane_storage'
+  destination = '/storage'
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8545
+  processes = ['app']
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
+
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 500
+    soft_limit = 200
+
+  [[services.http_checks]]
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '1m0s'
+    method = 'get'
+    path = '/health'
+    protocol = 'http'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 2
+  memory_mb = 2048
