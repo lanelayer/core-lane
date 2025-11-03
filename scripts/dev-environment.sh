@@ -222,19 +222,19 @@ start_core_lane_node() {
 
 start_core_lane_tail() {
     print_status "Starting Core Lane log viewer..."
-    
+
     # Wait for log file to exist
     local wait_count=0
     while [ ! -f "core-lane.log" ] && [ $wait_count -lt 10 ]; do
         sleep 1
         wait_count=$((wait_count + 1))
     done
-    
+
     if [ ! -f "core-lane.log" ]; then
         print_warning "Core Lane log file not found, skipping log viewer"
         return 0
     fi
-    
+
     # Start tailing the log with a prefix
     (
         tail -f core-lane.log 2>/dev/null | while IFS= read -r line; do
@@ -243,14 +243,14 @@ start_core_lane_tail() {
             echo -e "${GREEN}[CORE-LANE]${NC} $clean_line"
         done
     ) &
-    
+
     CORE_LANE_TAIL_PID=$!
     print_success "Core Lane log viewer started (PID: $CORE_LANE_TAIL_PID)"
 }
 
 setup_filler_bot() {
     print_status "Setting up Filler Bot..."
-    
+
     # Clone filler-bot if it doesn't exist
     if [ ! -d "$FILLER_BOT_DIR" ]; then
         print_status "Cloning filler-bot repository..."
@@ -259,31 +259,31 @@ setup_filler_bot() {
     else
         print_status "Filler-bot repository already exists at $FILLER_BOT_DIR"
     fi
-    
+
     # Clean up old wallet database for fresh start (created in project root)
     print_status "Cleaning up old bot wallet database..."
     rm -f "$BOT_WALLET-wallet.db"
-    
+
     # Build filler-bot
     print_status "Building filler-bot..."
     (cd "$FILLER_BOT_DIR" && cargo build)
-    
+
     if [ ! -f "$FILLER_BOT_DIR/target/debug/lanelayer-filler-bot" ]; then
         print_error "Failed to build filler-bot"
         return 1
     fi
-    
+
     print_success "Filler bot setup complete"
 }
 
 start_filler_bot() {
     print_status "Starting Filler Bot..."
-    
+
     if [ ! -f "$FILLER_BOT_DIR/target/debug/lanelayer-filler-bot" ]; then
         print_error "Filler bot is not built. Run setup_filler_bot first."
         return 1
     fi
-    
+
     # Start the filler bot with debug logging
     RUST_LOG=debug "$FILLER_BOT_DIR/target/debug/lanelayer-filler-bot" start \
         --core-lane-url "$JSON_RPC_URL" \
@@ -296,15 +296,15 @@ start_filler_bot() {
         --bitcoin-mnemonic "$FILLER_BOT_MNEMONIC" \
         --bitcoin-wallet "$BOT_WALLET" \
         > external/filler-bot.log 2>&1 &
-    
+
     FILLER_BOT_PID=$!
-    
+
     print_status "Waiting for Filler Bot to start..."
     sleep 5
-    
+
     print_success "Filler Bot started with PID: $FILLER_BOT_PID"
     print_status "Logs available at: external/filler-bot.log"
-    
+
     # Get the first receive address from the bot logs if file exists
     if [ -f "external/filler-bot.log" ]; then
         print_status "Checking bot's Bitcoin receive address from logs..."
@@ -317,19 +317,19 @@ start_filler_bot() {
 
 start_filler_bot_tail() {
     print_status "Starting Filler Bot log viewer..."
-    
+
     # Wait for log file to exist
     local wait_count=0
     while [ ! -f "external/filler-bot.log" ] && [ $wait_count -lt 10 ]; do
         sleep 1
         wait_count=$((wait_count + 1))
     done
-    
+
     if [ ! -f "external/filler-bot.log" ]; then
         print_warning "Filler bot log file not found, skipping log viewer"
         return 0
     fi
-    
+
     # Start tailing the log with a prefix
     (
         tail -f external/filler-bot.log 2>/dev/null | while IFS= read -r line; do
@@ -338,31 +338,31 @@ start_filler_bot_tail() {
             echo -e "${BLUE}[FILLER-BOT]${NC} $clean_line"
         done
     ) &
-    
+
     FILLER_BOT_TAIL_PID=$!
     print_success "Filler Bot log viewer started (PID: $FILLER_BOT_TAIL_PID)"
 }
 
 fund_filler_bot_wallet() {
     print_status "Funding Filler Bot wallet..."
-    
+
     # Wait a bit more for the bot to initialize and log its address
     sleep 3
-    
+
     # Try to extract the actual Bitcoin receive address from the filler bot logs
     local bot_btc_address=""
-    
+
     if [ -f "external/filler-bot.log" ]; then
         # Look for Bitcoin address patterns in the logs
         # Try to find bech32 regtest addresses (bcrt1...)
         bot_btc_address=$(grep -o "bcrt1[a-z0-9]\{39,\}" external/filler-bot.log 2>/dev/null | head -1 || echo "")
-        
+
         if [ -z "$bot_btc_address" ]; then
             # Try to find any address-like pattern
             bot_btc_address=$(grep -i "address.*bcrt1\|receive.*bcrt1" external/filler-bot.log 2>/dev/null | grep -o "bcrt1[a-z0-9]\{39,\}" | head -1 || echo "")
         fi
     fi
-    
+
     if [ -z "$bot_btc_address" ]; then
         print_warning "Could not find bot's Bitcoin address in logs"
         print_status "Checking external/filler-bot.log for address information..."
@@ -372,21 +372,21 @@ fund_filler_bot_wallet() {
         print_warning "Skipping automatic funding - please fund the bot manually once you identify its address"
         return 0
     fi
-    
+
     print_success "Found bot's Bitcoin address: $bot_btc_address"
     print_status "Mining 100 blocks to bot wallet..."
-    
+
     # Temporarily disable exit on error to handle failure gracefully
     set +e
-    
+
     # Mine blocks directly to the bot's address
     local mine_result
     mine_result=$(bitcoin_cli generatetoaddress 100 "$bot_btc_address" 2>&1)
     local mine_exit_code=$?
-    
+
     # Re-enable exit on error
     set -e
-    
+
     if [ $mine_exit_code -eq 0 ]; then
         print_success "Successfully mined 100 blocks to filler bot wallet"
         local block_count=$(bitcoin_cli getblockcount)
@@ -620,24 +620,24 @@ start_dev_environment() {
     setup_bdk_wallet
 
     start_core_lane_node
-    
+
     # Start tailing core lane logs
     start_core_lane_tail
 
     # Setup and start filler bot
     setup_filler_bot
     start_filler_bot
-    
+
     # Fund the filler bot's Bitcoin wallet
     fund_filler_bot_wallet
-    
+
     # Start tailing filler bot logs
     start_filler_bot_tail
 
     start_mining_loop
     print_status "Burning BTC to test addresses..."
     for address in "${ANVIL_ADDRESSES[@]}"; do
-        burn_btc_to_address "$address" 1000000 1
+        burn_btc_to_address "$address" 1000000 1281453634
     done
     sleep 5
     check_balances
@@ -648,7 +648,7 @@ start_dev_environment() {
     echo "🔗 Connect with MetaMask, Cast, or other wallets using:"
     echo "   Network Name: Core Lane Dev"
     echo "   RPC URL: $JSON_RPC_URL"
-    echo "   Chain ID: 1"
+    echo "   Chain ID: 1281453634"
     echo "   Currency Symbol: MEL"
     echo ""
     echo "📱 Test addresses with balances:"
