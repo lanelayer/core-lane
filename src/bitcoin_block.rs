@@ -114,8 +114,8 @@ fn process_bitcoin_burn(
         info!("   Chain ID: {}", chain_id);
         info!("   ETH Address: {}", eth_address);
 
-        // Check if this is for Core Lane (chain ID 1 for example)
-        if chain_id == 1 {
+        // Check if this is for Core Lane chain ID 1281453634 or Ethereum mainnet chain ID 1
+        if chain_id == 1281453634 || chain_id == 1 {
             // Convert Bitcoin sats to Core Lane tokens with proper decimal scaling
             // Bitcoin: 1 BTC = 100,000,000 sats (8 decimals)
             // Core Lane: 1 CMEL = 10^18 wei (18 decimals)
