@@ -32,10 +32,15 @@ WORKDIR /app
 
 
 COPY --from=builder /app/target/release/core-lane-node .
-EXPOSE 8545
+COPY scripts/entrypoint-rpc.sh /app/entrypoint-rpc.sh
+RUN chmod +x /app/entrypoint-rpc.sh
 
-ENV RPC_URL=http://127.0.0.1:18443
+# Expose RPC and bitcoin-cache ports used in rpc entrypoint
+EXPOSE 8545 8332
+
+# Default envs for combined rpc entrypoint
 ENV HTTP_HOST=0.0.0.0
 ENV HTTP_PORT=8545
+
 
 CMD ["./core-lane-node", "start", "--rpc-url", "http://127.0.0.1:18443", "--http-host", "0.0.0.0", "--http-port", "8545"]
