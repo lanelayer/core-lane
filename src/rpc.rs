@@ -1683,8 +1683,7 @@ impl RpcServer {
     async fn handle_chain_id(
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        // Core Lane chain ID = 1 (for testing)
-        let chain_id = "0x1";
+        let chain_id = "0x4c616e42";
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
@@ -1788,8 +1787,7 @@ impl RpcServer {
     async fn handle_net_version(
         request: JsonRpcRequest,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        // Network version same as chain ID
-        let net_version = "1";
+        let net_version = "1281453634";
 
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
