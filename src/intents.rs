@@ -22,6 +22,7 @@ sol! {
         function isIntentSolved(bytes32 intentId) view returns (bool);
         function intentLocker(bytes32 intentId) view returns (address);
         function valueStoredInIntent(bytes32 intentId) view returns (uint256);
+        function createIntentAndLock(bytes eip712sig, bytes lockData) returns (bytes32 intentId);
     }
 }
 
@@ -209,6 +210,10 @@ pub enum IntentCall {
     ValueStoredInIntent {
         intent_id: B256,
     },
+    CreateIntentAndLock {
+        eip712sig: Vec<u8>,
+        lock_data: Vec<u8>,
+    },
 }
 
 fn extract_selector(calldata: &[u8]) -> Option<[u8; 4]> {
@@ -329,6 +334,15 @@ pub fn decode_intent_calldata(calldata: &[u8]) -> Option<IntentCall> {
             };
             Some(IntentCall::ValueStoredInIntent {
                 intent_id: B256::from_slice(call.intentId.as_slice()),
+            })
+        }
+        IntentSystem::createIntentAndLockCall::SELECTOR => {
+            let Ok(call) = IntentSystem::createIntentAndLockCall::abi_decode(calldata) else {
+                return None;
+            };
+            Some(IntentCall::CreateIntentAndLock {
+                eip712sig: call.eip712sig.to_vec(),
+                lock_data: call.lockData.to_vec(),
             })
         }
         _ => {

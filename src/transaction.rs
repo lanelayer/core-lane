@@ -11,6 +11,7 @@ use cartesi_machine::types::cmio::CmioResponseReason;
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_sol_types::{Eip712Domain, SolStruct};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::Client;
@@ -19,9 +20,19 @@ use cartesi_machine::types::cmio::AutomaticReason;
 use cartesi_machine::types::cmio::CmioRequest;
 use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info};
+
+alloy_sol_types::sol! {
+    #[derive(Debug)]
+    struct CreateIntent {
+        bytes intent;
+        uint256 nonce;
+        uint256 value;
+    }
+}
 
 /// Get the calldata bytes from a transaction envelope (the EVM input payload)
 pub fn get_transaction_input_bytes(tx: &TxEnvelope) -> Vec<u8> {
@@ -225,6 +236,162 @@ fn execute_transfer<T: ProcessingContext>(
         }
 
         match decode_intent_calldata(&input) {
+            Some(IntentCall::CreateIntentAndLock {
+                eip712sig,
+                lock_data,
+            }) => {
+                if value != U256::ZERO {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec![
+                            "CreateIntentAndLock: outer transaction must have zero value"
+                                .to_string(),
+                        ],
+                        error: Some("Unexpected transaction value".to_string()),
+                    });
+                }
+                #[derive(serde::Deserialize)]
+                struct SignedPayload {
+                    intent: Vec<u8>,
+                    nonce: U256,
+                    value: U256,
+                }
+
+                let signed_payload: SignedPayload =
+                    match ciborium::de::from_reader(lock_data.as_slice()) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Ok(ExecutionResult {
+                                success: false,
+                                gas_used,
+                                gas_refund: U256::ZERO,
+                                output: Bytes::new(),
+                                logs: vec!["Invalid payload format (expected CBOR)".to_string()],
+                                error: Some("Invalid payload".to_string()),
+                            });
+                        }
+                    };
+
+                let domain = Eip712Domain {
+                    name: Some(Cow::Borrowed("CoreLaneIntent")),
+                    version: Some(Cow::Borrowed("1")),
+                    chain_id: Some(alloy_primitives::U256::from(1281453634u64)),
+                    verifying_contract: Some(CoreLaneAddresses::exit_marketplace()),
+                    salt: None,
+                };
+
+                let digest = eip712_digest(
+                    &domain,
+                    &signed_payload.intent,
+                    signed_payload.nonce,
+                    signed_payload.value,
+                );
+
+                let signer = match recover_signer_from_digest(&digest, &eip712sig) {
+                    Ok(addr) => addr,
+                    Err(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["Invalid signature".to_string()],
+                            error: Some("Invalid signature".to_string()),
+                        });
+                    }
+                };
+
+                let expected_nonce = bundle_state.get_nonce(state.state_manager(), signer);
+                if expected_nonce != signed_payload.nonce {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec![format!(
+                            "Invalid nonce: expected 0x{:x}, got 0x{:x}",
+                            expected_nonce, signed_payload.nonce
+                        )],
+                        error: Some("Invalid nonce".to_string()),
+                    });
+                }
+
+                if bundle_state.get_balance(state.state_manager(), signer) < signed_payload.value {
+                    return Ok(ExecutionResult {
+                        success: false,
+                        gas_used,
+                        gas_refund: U256::ZERO,
+                        output: Bytes::new(),
+                        logs: vec!["Insufficient balance".to_string()],
+                        error: Some("Insufficient balance".to_string()),
+                    });
+                }
+
+                let value_u64: u64 = match u64::try_from(signed_payload.value) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["Value too large (exceeds u64::MAX)".to_string()],
+                            error: Some("Value too large".to_string()),
+                        });
+                    }
+                };
+
+                let nonce_u64: u64 = match signed_payload.nonce.try_into() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Ok(ExecutionResult {
+                            success: false,
+                            gas_used,
+                            gas_refund: U256::ZERO,
+                            output: Bytes::new(),
+                            logs: vec!["Nonce exceeds u64::MAX".to_string()],
+                            error: Some("Nonce too large".to_string()),
+                        });
+                    }
+                };
+
+                bundle_state.sub_balance(state.state_manager(), signer, signed_payload.value)?;
+
+                let intent_id = calculate_intent_id(
+                    signer,
+                    nonce_u64,
+                    Bytes::from(signed_payload.intent.clone()),
+                );
+
+                bundle_state.insert_intent(
+                    intent_id,
+                    Intent {
+                        data: Bytes::from(signed_payload.intent),
+                        value: value_u64,
+                        status: IntentStatus::Locked(signer),
+                        last_command: IntentCommandType::LockIntentForSolving,
+                        creator: signer,
+                    },
+                );
+
+                bundle_state.increment_nonce(state.state_manager(), signer)?;
+
+                info!("Intent created and locked: intent_id = {}", intent_id);
+                return Ok(ExecutionResult {
+                    success: true,
+                    gas_used,
+                    gas_refund: U256::ZERO,
+                    output: Bytes::new(),
+                    logs: vec![format!(
+                        "Intent created and locked: intent_id = {}",
+                        intent_id
+                    )],
+                    error: None,
+                });
+            }
             Some(IntentCall::StoreBlob { data, .. }) => {
                 let blob_hash = keccak256(&data);
                 if bundle_state.contains_blob(state.state_manager(), &blob_hash) {
@@ -577,7 +744,6 @@ fn execute_transfer<T: ProcessingContext>(
                     match bundle_state.get_intent(state.state_manager(), &intent_id) {
                         Some(i) => i,
                         None => {
-                            info!("solveIntent: intent disappeared");
                             return Ok(ExecutionResult {
                                 success: false,
                                 gas_used,
@@ -626,6 +792,7 @@ fn execute_transfer<T: ProcessingContext>(
                                             error: Some(e.to_string()),
                                         });
                                     }
+                                    info!("solveIntent: intent solved");
                                     return Ok(ExecutionResult {
                                         success: true,
                                         gas_used,
@@ -954,7 +1121,24 @@ fn execute_transfer<T: ProcessingContext>(
     })
 }
 
-fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
+fn eip712_digest(domain: &Eip712Domain, intent: &[u8], nonce: U256, value: U256) -> B256 {
+    let create_intent = CreateIntent {
+        intent: Bytes::from(intent.to_vec()),
+        nonce,
+        value,
+    };
+    create_intent.eip712_signing_hash(domain)
+}
+
+fn recover_signer_from_digest(digest: &B256, sig: &[u8]) -> Result<Address, ()> {
+    use alloy_primitives::Signature;
+    Signature::try_from(sig)
+        .map_err(|_| ())?
+        .recover_address_from_prehash(digest)
+        .map_err(|_| ())
+}
+
+pub fn calculate_intent_id(sender: Address, nonce: u64, input: Bytes) -> B256 {
     let mut preimage = Vec::new();
     preimage.extend_from_slice(sender.as_slice());
     preimage.extend_from_slice(&nonce.to_be_bytes());
