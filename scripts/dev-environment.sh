@@ -649,7 +649,7 @@ start_dev_environment() {
     echo "   Network Name: Core Lane Dev"
     echo "   RPC URL: $JSON_RPC_URL"
     echo "   Chain ID: 1281453634"
-    echo "   Currency Symbol: MEL"
+    echo "   Currency Symbol: laneBTC"
     echo ""
     echo "📱 Test addresses with balances:"
     for i in "${!ANVIL_ADDRESSES[@]}"; do
