@@ -7,7 +7,7 @@ app = 'core-lane-rpc'
 primary_region = 'cdg'
 
 [build]
-  dockerfile = 'Dockerfile'
+  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
 
 [env]
   CACHE_DIR = '/storage/cache'
