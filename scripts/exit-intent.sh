@@ -46,12 +46,12 @@ show_usage() {
     echo "  --help                       Show this help message"
     echo ""
     echo "Note:"
-    echo "  The script will automatically lock (amount + max_fee) worth of MEL/ETH in the intent."
+    echo "  The script will automatically lock (amount + max_fee) worth of laneBTC/ETH in the intent."
     echo "  This locked value pays the filler bot for executing the Bitcoin withdrawal."
     echo ""
     echo "Example:"
     echo "  $0 --bitcoin-address bcrt1qjx6x6ra7k3gwcmmcpgcm8cejjppcxqpjl0fkfr --amount 50000 --expire-by 1000"
-    echo "  (This will lock 51000 sats worth of MEL and request a 50000 sat Bitcoin withdrawal)"
+    echo "  (This will lock 51000 sats worth of laneBTC and request a 50000 sat Bitcoin withdrawal)"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -176,22 +176,22 @@ CAST_OUTPUT=$($CAST_BIN send --legacy \
 
 if [ $? -eq 0 ]; then
     print_success "Exit intent submitted successfully!"
-    
+
     # Extract transaction hash
     TX_HASH=$(echo "$CAST_OUTPUT" | grep "transactionHash" | awk '{print $2}')
     if [ -n "$TX_HASH" ]; then
         print_success "Transaction hash: $TX_HASH"
     fi
-    
+
     # Try to extract the intent ID from logs
     print_status "Checking for intent ID in transaction receipt..."
     sleep 2
-    
+
     RECEIPT=$($CAST_BIN receipt --rpc-url "$RPC_URL" "$TX_HASH" 2>/dev/null || echo "")
     if [ -n "$RECEIPT" ]; then
         echo "$RECEIPT"
     fi
-    
+
     print_success "✅ Exit intent created successfully!"
     print_status "The filler bot should detect and process this intent."
 else

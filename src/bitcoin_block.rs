@@ -118,7 +118,7 @@ fn process_bitcoin_burn(
         if chain_id == 1 {
             // Convert Bitcoin sats to Core Lane tokens with proper decimal scaling
             // Bitcoin: 1 BTC = 100,000,000 sats (8 decimals)
-            // Core Lane: 1 CMEL = 10^18 wei (18 decimals)
+            // Core Lane: 1 laneBTC = 10^18 wei (18 decimals)
             // Conversion: 1 sat = 10^10 wei (to maintain reasonable exchange rate)
             let conversion_factor = U256::from(10_000_000_000u64); // 10^10
             let mint_amount = U256::from(burn_value) * conversion_factor;
