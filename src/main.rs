@@ -44,7 +44,7 @@ mod rpc;
 mod tests;
 
 use alloy_consensus::TxEnvelope;
-use bitcoin_cache_rpc::BitcoinCacheRpcServer;
+use bitcoin_cache_rpc::{BitcoinCacheRpcServer, S3Config};
 use cmio::CmioMessage;
 use intents::create_anchor_bitcoin_fill_intent;
 use rpc::RpcServer;
@@ -302,6 +302,14 @@ enum Commands {
         block_archive: String,
         #[arg(long)]
         starting_block_count: Option<u64>,
+        #[arg(long, default_value = "false")]
+        disable_archive_fetch: bool,
+        #[arg(long, default_value = "")]
+        s3_bucket: String,
+        #[arg(long, default_value = "us-east-1")]
+        s3_region: String,
+        #[arg(long, default_value = "")]
+        s3_endpoint: String,
     },
     CreateWallet {
         /// Network to create wallet for (bitcoin, testnet, signet, regtest)
@@ -2571,6 +2579,10 @@ async fn main() -> Result<()> {
             no_rpc_auth,
             block_archive,
             starting_block_count,
+            disable_archive_fetch,
+            s3_bucket,
+            s3_region,
+            s3_endpoint,
         } => {
             info!("🚀 Starting Bitcoin Cache RPC server...");
             info!("📁 Cache directory: {}", cache_dir);
@@ -2657,6 +2669,12 @@ async fn main() -> Result<()> {
                     bitcoin_rpc_url.to_string(),
                     block_archive.to_string(),
                     *starting_block_count,
+                    *disable_archive_fetch,
+                    S3Config::new(
+                        s3_bucket.to_string(),
+                        s3_region.to_string(),
+                        s3_endpoint.to_string(),
+                    ),
                 )?
             } else {
                 info!(
@@ -2699,6 +2717,12 @@ async fn main() -> Result<()> {
                     bitcoin_client,
                     block_archive.to_string(),
                     *starting_block_count,
+                    *disable_archive_fetch,
+                    S3Config::new(
+                        s3_bucket.to_string(),
+                        s3_region.to_string(),
+                        s3_endpoint.to_string(),
+                    ),
                 )?
             };
 

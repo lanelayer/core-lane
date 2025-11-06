@@ -20,6 +20,16 @@ CACHE_DIR="${CACHE_DIR:-/cache}"
 ELECTRUM_URL="${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}"
 CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC:-}"
 
+
+# S3 configuration for uploading cached blocks to S3 storage
+DISABLE_ARCHIVE_FETCH="${DISABLE_ARCHIVE_FETCH:-false}"
+
+S3_BUCKET="${S3_BUCKET:-}"
+S3_REGION="${S3_REGION:-us-east-1}"
+S3_ENDPOINT="${S3_ENDPOINT:-}"
+S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
+S3_SECRET_KEY="${S3_SECRET_KEY:-}"
+
 mkdir -p "$DATA_DIR" "$CACHE_DIR"
 
 # Ensure both children are terminated on signals
@@ -30,6 +40,10 @@ trap 'kill 0 2>/dev/null || true' TERM INT
 
 if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
   echo "[entrypoint] starting bitcoin-cache on ${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}"
+  # Pass S3 credentials via environment variables (not CLI args) for security
+  # This prevents credentials from appearing in process listings and shell history
+  S3_ACCESS_KEY="${S3_ACCESS_KEY}" \
+  S3_SECRET_KEY="${S3_SECRET_KEY}" \
   "/app/core-lane-node" bitcoin-cache \
     --host "${BITCOIN_CACHE_HOST}" \
     --port "${BITCOIN_CACHE_PORT}" \
@@ -37,6 +51,10 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
     --bitcoin-rpc-url "${BITCOIN_UPSTREAM_RPC_URL}" \
     --block-archive "${BLOCK_ARCHIVE_URL}" \
     --starting-block-count "${STARTING_BLOCK_COUNT}" \
+    --disable-archive-fetch "${DISABLE_ARCHIVE_FETCH}" \
+    --s3-bucket "${S3_BUCKET}" \
+    --s3-region "${S3_REGION}" \
+    --s3-endpoint "${S3_ENDPOINT}" \
     --no-rpc-auth &
 fi
 
