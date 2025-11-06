@@ -8,6 +8,8 @@ use axum::{
 };
 use bitcoin::Block;
 use bitcoincore_rpc::{Client, RpcApi};
+use s3::creds::Credentials;
+use s3::{Bucket, Region};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -164,6 +166,51 @@ enum BitcoinRpcClient {
     Http(HttpRpcClient),
 }
 
+/// S3 configuration for block uploads
+pub struct S3Config {
+    bucket: Option<String>,
+    region: Option<String>,
+    endpoint: Option<String>, // None for AWS, Some(url) for custom S3-compatible services
+    access_key: Option<String>,
+    secret_key: Option<String>,
+}
+
+impl S3Config {
+    /// Normalize a string to Option<String>: empty strings become None
+    fn normalize_optional_string(s: String) -> Option<String> {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    pub fn new(bucket: String, region: String, endpoint: String) -> Self {
+        // Read S3 credentials from environment variables for security
+        // This prevents credentials from appearing in process listings and shell history
+        let access_key = std::env::var("S3_ACCESS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let secret_key = std::env::var("S3_SECRET_KEY")
+            .ok()
+            .filter(|s| !s.is_empty());
+        // Also read endpoint from environment variable if not provided via CLI
+        let endpoint = if endpoint.is_empty() {
+            std::env::var("S3_ENDPOINT").ok().filter(|s| !s.is_empty())
+        } else {
+            Self::normalize_optional_string(endpoint)
+        };
+
+        Self {
+            bucket: Self::normalize_optional_string(bucket),
+            region: Self::normalize_optional_string(region),
+            endpoint,
+            access_key,
+            secret_key,
+        }
+    }
+}
+
 /// Bitcoin Cache RPC Server
 /// Exposes a minimal set of Bitcoin RPC methods for caching purposes
 #[derive(Clone)]
@@ -177,6 +224,12 @@ struct BitcoinCacheState {
     bitcoin_client: BitcoinRpcClient,
     block_archive_url: String,
     archive_http_client: reqwest::Client,
+    disable_archive_fetch: bool,
+    s3_bucket: Option<String>,
+    s3_region: Option<String>,
+    s3_endpoint: Option<String>,
+    s3_access_key: Option<String>,
+    s3_secret_key: Option<String>,
 }
 
 impl BitcoinCacheRpcServer {
@@ -185,6 +238,8 @@ impl BitcoinCacheRpcServer {
         bitcoin_client: Client,
         block_archive_url: String,
         _starting_block_count: Option<u64>,
+        disable_archive_fetch: bool,
+        s3_config: S3Config,
     ) -> Result<Self> {
         let cache_path = PathBuf::from(cache_dir);
 
@@ -217,6 +272,12 @@ impl BitcoinCacheRpcServer {
                 bitcoin_client: BitcoinRpcClient::BitcoinCore(Arc::new(bitcoin_client)),
                 block_archive_url,
                 archive_http_client,
+                disable_archive_fetch,
+                s3_bucket: s3_config.bucket,
+                s3_region: s3_config.region,
+                s3_endpoint: s3_config.endpoint,
+                s3_access_key: s3_config.access_key,
+                s3_secret_key: s3_config.secret_key,
             }),
         })
     }
@@ -226,6 +287,8 @@ impl BitcoinCacheRpcServer {
         rpc_url: String,
         block_archive_url: String,
         starting_block_count: Option<u64>,
+        disable_archive_fetch: bool,
+        s3_config: S3Config,
     ) -> Result<Self> {
         let cache_path = PathBuf::from(cache_dir);
 
@@ -260,6 +323,12 @@ impl BitcoinCacheRpcServer {
                 bitcoin_client: BitcoinRpcClient::Http(http_client.clone()),
                 block_archive_url: block_archive_url.clone(),
                 archive_http_client,
+                disable_archive_fetch,
+                s3_bucket: s3_config.bucket,
+                s3_region: s3_config.region,
+                s3_endpoint: s3_config.endpoint,
+                s3_access_key: s3_config.access_key,
+                s3_secret_key: s3_config.secret_key,
             }),
         };
 
@@ -649,8 +718,100 @@ impl BitcoinCacheRpcServer {
 
         info!("💾 Saved block to cache ({} bytes)", block_data.len());
 
+        // Upload to S3 if configured
+        if let (Some(_), Some(_), Some(_), Some(_)) = (
+            &self.state.s3_bucket,
+            &self.state.s3_region,
+            &self.state.s3_access_key,
+            &self.state.s3_secret_key,
+        ) {
+            if let Err(e) = self.upload_block_to_s3(block_data, expected_hash).await {
+                warn!("⚠️  Failed to upload block {} to S3: {}", expected_hash, e);
+                // Don't fail the whole operation if S3 upload fails
+            }
+        }
+
         // Return hex-encoded block
         Ok(hex::encode(block_data))
+    }
+
+    /// Upload block to S3 bucket
+    /// Supports both AWS S3 (when endpoint is None) and S3-compatible services (when endpoint is Some)
+    /// S3 configuration is read from the server state
+    async fn upload_block_to_s3(&self, block_data: &[u8], block_hash: &str) -> Result<()> {
+        // Extract S3 configuration from state (we know these are Some from the caller's check)
+        let bucket_name = self
+            .state
+            .s3_bucket
+            .as_ref()
+            .ok_or_else(|| anyhow!("S3 bucket not configured"))?;
+        let region_str = self
+            .state
+            .s3_region
+            .as_ref()
+            .ok_or_else(|| anyhow!("S3 region not configured"))?;
+        let access_key = self
+            .state
+            .s3_access_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("S3 access key not configured"))?;
+        let secret_key = self
+            .state
+            .s3_secret_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("S3 secret key not configured"))?;
+
+        // Use custom endpoint for S3-compatible services, or AWS region for AWS S3
+        let region = if let Some(endpoint_url) = self.state.s3_endpoint.as_deref() {
+            // Custom S3-compatible service (MinIO, DigitalOcean Spaces, Backblaze B2, etc.)
+            Region::Custom {
+                region: region_str.to_string(),
+                endpoint: endpoint_url.to_string(),
+            }
+        } else {
+            // AWS S3 - parse the region string to use proper AWS region
+            Region::from_str(region_str)
+                .map_err(|_| anyhow!("Invalid AWS region: {}", region_str))?
+        };
+
+        let credentials = Credentials::new(
+            Some(access_key.as_str()),
+            Some(secret_key.as_str()),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow!("Failed to create S3 credentials: {}", e))?;
+
+        let mut bucket = Bucket::new(bucket_name, region, credentials)
+            .map_err(|e| anyhow!("Failed to create S3 bucket: {}", e))?;
+
+        if self.state.s3_endpoint.is_some() {
+            bucket.set_path_style();
+        }
+
+        let object_path = format!("{}.bin", block_hash);
+        info!(
+            "☁️  Uploading block {} to S3: s3://{}/{}",
+            block_hash, bucket_name, object_path
+        );
+
+        // put_object returns ResponseData
+        let response_data = bucket
+            .put_object(&object_path, block_data)
+            .await
+            .map_err(|e| anyhow!("Failed to upload block to S3: {}", e))?;
+
+        let status_code = response_data.status_code();
+        if (200..300).contains(&status_code) {
+            info!("✅ Successfully uploaded block {} to S3", block_hash);
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "S3 upload returned non-2xx status code: {}",
+                status_code
+            ))
+        }
     }
 
     /// Fetch block from Bitcoin RPC and save to cache with exponential backoff retry
@@ -661,29 +822,33 @@ impl BitcoinCacheRpcServer {
         block_file: &Path,
         _lock_file: &Path,
     ) -> Result<String> {
-        // First, try to fetch from the block archive server using the shared HTTP client
-        let archive_url = format!("{}/{}.bin", self.state.block_archive_url, block_hash);
-        info!("📦 Trying block archive: {}", archive_url);
+        // Try to fetch from the block archive server if not disabled
+        if !self.state.disable_archive_fetch {
+            let archive_url = format!("{}/{}.bin", self.state.block_archive_url, block_hash);
+            info!("📦 Trying block archive: {}", archive_url);
 
-        if let Ok(response) = self
-            .state
-            .archive_http_client
-            .get(&archive_url)
-            .send()
-            .await
-        {
-            if response.status().is_success() {
-                if let Ok(block_data) = response.bytes().await {
-                    info!("✅ Found block in archive ({} bytes)", block_data.len());
-                    match self
-                        .verify_and_cache_block(&block_data, block_hash, block_file)
-                        .await
-                    {
-                        Ok(hex) => return Ok(hex),
-                        Err(e) => warn!("⚠️  Archive block verification failed: {}", e),
+            if let Ok(response) = self
+                .state
+                .archive_http_client
+                .get(&archive_url)
+                .send()
+                .await
+            {
+                if response.status().is_success() {
+                    if let Ok(block_data) = response.bytes().await {
+                        info!("✅ Found block in archive ({} bytes)", block_data.len());
+                        match self
+                            .verify_and_cache_block(&block_data, block_hash, block_file)
+                            .await
+                        {
+                            Ok(hex) => return Ok(hex),
+                            Err(e) => warn!("⚠️  Archive block verification failed: {}", e),
+                        }
                     }
                 }
             }
+        } else {
+            info!("⏭️  Archive fetch disabled, skipping archive lookup");
         }
 
         info!("📡 Fetching block {} from Bitcoin RPC...", block_hash);
