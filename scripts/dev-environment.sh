@@ -2,7 +2,7 @@
 
 set -e
 
-trap cleanup EXIT
+# Trap will be set only when starting the environment
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -429,6 +429,8 @@ start_mining_loop() {
     ) &
 
     MINING_PID=$!
+    # Write PID to file for reliable cleanup from other shell sessions
+    echo $MINING_PID > .dev-mining-loop.pid 2>/dev/null || true
     print_success "Mining loop started with PID: $MINING_PID"
 }
 
@@ -506,29 +508,85 @@ check_balances() {
 cleanup() {
     print_status "Cleaning up development environment..."
 
-    if [ $FILLER_BOT_TAIL_PID -ne 0 ]; then
+    # Stop Filler Bot log viewer - try PID first, then find by pattern
+    if [ $FILLER_BOT_TAIL_PID -ne 0 ] && kill -0 $FILLER_BOT_TAIL_PID 2>/dev/null; then
         print_status "Stopping Filler Bot log viewer (PID: $FILLER_BOT_TAIL_PID)..."
         kill $FILLER_BOT_TAIL_PID 2>/dev/null || true
+    else
+        local filler_tail_pids=$(pgrep -f "tail -f external/filler-bot.log" 2>/dev/null || true)
+        if [ -n "$filler_tail_pids" ]; then
+            print_status "Stopping Filler Bot log viewer (found by pattern)..."
+            echo "$filler_tail_pids" | xargs kill 2>/dev/null || true
+        fi
     fi
 
-    if [ $FILLER_BOT_PID -ne 0 ]; then
+    # Stop Filler Bot - try PID first, then find by pattern
+    if [ $FILLER_BOT_PID -ne 0 ] && kill -0 $FILLER_BOT_PID 2>/dev/null; then
         print_status "Stopping Filler Bot (PID: $FILLER_BOT_PID)..."
         kill $FILLER_BOT_PID 2>/dev/null || true
+    else
+        local filler_bot_pids=$(pgrep -f "lanelayer-filler-bot.*start" 2>/dev/null || true)
+        if [ -n "$filler_bot_pids" ]; then
+            print_status "Stopping Filler Bot (found by pattern)..."
+            echo "$filler_bot_pids" | xargs kill 2>/dev/null || true
+        fi
     fi
 
-    if [ $CORE_LANE_TAIL_PID -ne 0 ]; then
+    # Stop Core Lane log viewer - try PID first, then find by pattern
+    if [ $CORE_LANE_TAIL_PID -ne 0 ] && kill -0 $CORE_LANE_TAIL_PID 2>/dev/null; then
         print_status "Stopping Core Lane log viewer (PID: $CORE_LANE_TAIL_PID)..."
         kill $CORE_LANE_TAIL_PID 2>/dev/null || true
+    else
+        local core_tail_pids=$(pgrep -f "tail -f core-lane.log" 2>/dev/null || true)
+        if [ -n "$core_tail_pids" ]; then
+            print_status "Stopping Core Lane log viewer (found by pattern)..."
+            echo "$core_tail_pids" | xargs kill 2>/dev/null || true
+        fi
     fi
 
-    if [ $MINING_PID -ne 0 ]; then
+    # Stop mining loop - try PID first, then read from PID file, then find by pattern
+    if [ $MINING_PID -ne 0 ] && kill -0 $MINING_PID 2>/dev/null; then
         print_status "Stopping mining loop (PID: $MINING_PID)..."
         kill $MINING_PID 2>/dev/null || true
+        rm -f .dev-mining-loop.pid 2>/dev/null || true
+    elif [ -f ".dev-mining-loop.pid" ]; then
+        local mining_loop_pid=$(cat .dev-mining-loop.pid 2>/dev/null | head -1 || true)
+        if [ -n "$mining_loop_pid" ] && kill -0 $mining_loop_pid 2>/dev/null; then
+            print_status "Stopping mining loop (PID from file: $mining_loop_pid)..."
+            kill $mining_loop_pid 2>/dev/null || true
+        fi
+        rm -f .dev-mining-loop.pid 2>/dev/null || true
+    else
+        local mining_pids=$(pgrep -f "bitcoin_cli.*generatetoaddress.*1" 2>/dev/null | head -1 || true)
+        if [ -n "$mining_pids" ]; then
+            print_status "Stopping mining loop (found by pattern, PID: $mining_pids)..."
+            kill $mining_pids 2>/dev/null || true
+        fi
     fi
 
-    if [ $CORE_LANE_NODE_PID -ne 0 ]; then
+    if [ $CORE_LANE_NODE_PID -ne 0 ] && kill -0 $CORE_LANE_NODE_PID 2>/dev/null; then
         print_status "Stopping Core Lane node (PID: $CORE_LANE_NODE_PID)..."
         kill $CORE_LANE_NODE_PID 2>/dev/null || true
+    else
+        local core_lane_pids=$(pgrep -f "core-lane-node.*start" 2>/dev/null || true)
+        if [ -n "$core_lane_pids" ]; then
+            print_status "Stopping Core Lane node (found by pattern)..."
+            echo "$core_lane_pids" | xargs kill 2>/dev/null || true
+        fi
+    fi
+
+    sleep 1
+
+    local remaining_filler=$(pgrep -f "lanelayer-filler-bot" 2>/dev/null || true)
+    if [ -n "$remaining_filler" ]; then
+        print_status "Force killing remaining Filler Bot processes..."
+        echo "$remaining_filler" | xargs kill -9 2>/dev/null || true
+    fi
+
+    local remaining_core_lane=$(pgrep -f "core-lane-node.*start" 2>/dev/null || true)
+    if [ -n "$remaining_core_lane" ]; then
+        print_status "Force killing remaining Core Lane node processes..."
+        echo "$remaining_core_lane" | xargs kill -9 2>/dev/null || true
     fi
 
     if is_bitcoin_running; then
@@ -571,29 +629,84 @@ show_status() {
         echo "❌ Bitcoin: Not running"
     fi
 
-    if [ $CORE_LANE_NODE_PID -ne 0 ] && kill -0 $CORE_LANE_NODE_PID 2>/dev/null; then
-        echo "✅ Core Lane Node: Running (PID: $CORE_LANE_NODE_PID)"
+    # Check Core Lane Node by checking if port is listening or process exists
+    local core_lane_pid=$(pgrep -f "core-lane-node.*start" | head -1)
+    if [ -n "$core_lane_pid" ] || (curl -s "$JSON_RPC_URL" > /dev/null 2>&1); then
+        if [ -n "$core_lane_pid" ]; then
+            echo "✅ Core Lane Node: Running (PID: $core_lane_pid)"
+        else
+            echo "✅ Core Lane Node: Running (detected via JSON-RPC)"
+        fi
         echo "   JSON-RPC: $JSON_RPC_URL"
         echo "   Logs: core-lane.log"
-        if [ $CORE_LANE_TAIL_PID -ne 0 ] && kill -0 $CORE_LANE_TAIL_PID 2>/dev/null; then
-            echo "   Log viewer: Running (PID: $CORE_LANE_TAIL_PID)"
-        fi
     else
         echo "❌ Core Lane Node: Not running"
     fi
 
-    if [ $MINING_PID -ne 0 ] && kill -0 $MINING_PID 2>/dev/null; then
-        echo "✅ Mining Loop: Running (PID: $MINING_PID)"
+    local mining_pid=""
+    if [ -f ".dev-mining-loop.pid" ]; then
+        local pid_from_file=$(cat .dev-mining-loop.pid 2>/dev/null | head -1 || true)
+        if [ -n "$pid_from_file" ] && kill -0 $pid_from_file 2>/dev/null; then
+            mining_pid=$pid_from_file
+        fi
+    fi
+
+    if is_bitcoin_running; then
+        local mining_active=false
+        local block1=$(bitcoin_cli getblockcount 2>/dev/null)
+        sleep 2
+        local block2=$(bitcoin_cli getblockcount 2>/dev/null)
+
+        if [ -n "$block1" ] && [ -n "$block2" ] && [ "$block2" -le "$block1" ] 2>/dev/null; then
+            block1=$block2
+            sleep 2
+            block2=$(bitcoin_cli getblockcount 2>/dev/null)
+        fi
+
+        if [ -n "$block1" ] && [ -n "$block2" ] && [ "$block2" -gt "$block1" ] 2>/dev/null; then
+            mining_active=true
+        else
+            local secondary_check=false
+
+            local mining_process=$(pgrep -f "bitcoin_cli.*generatetoaddress.*1" 2>/dev/null | head -1 || true)
+            if [ -n "$mining_process" ]; then
+                secondary_check=true
+            fi
+
+            if [ -f ".dev-mining-loop.pid" ]; then
+                local pid_file_mtime=$(stat -c %Y ".dev-mining-loop.pid" 2>/dev/null || echo "0")
+                local current_time=$(date +%s)
+                local age=$((current_time - pid_file_mtime))
+                if [ "$age" -lt 40 ] && [ -n "$mining_pid" ]; then
+                    secondary_check=true
+                fi
+            fi
+
+            if [ "$secondary_check" = true ]; then
+                mining_active=true
+            fi
+        fi
+
+        if [ "$mining_active" = true ]; then
+            if [ -n "$mining_pid" ]; then
+                echo "✅ Mining Loop: Running (PID: $mining_pid)"
+            else
+                echo "✅ Mining Loop: Running (detected via active mining)"
+            fi
+        elif [ -n "$mining_pid" ]; then
+            echo "✅ Mining Loop: Running (PID: $mining_pid)"
+        else
+            echo "❌ Mining Loop: Not running"
+        fi
     else
         echo "❌ Mining Loop: Not running"
     fi
 
-    if [ $FILLER_BOT_PID -ne 0 ] && kill -0 $FILLER_BOT_PID 2>/dev/null; then
-        echo "✅ Filler Bot: Running (PID: $FILLER_BOT_PID)"
+    # Check Filler Bot by looking for the process
+    local filler_bot_pid=$(pgrep -f "lanelayer-filler-bot.*start" | head -1)
+    if [ -n "$filler_bot_pid" ]; then
+        echo "✅ Filler Bot: Running (PID: $filler_bot_pid)"
         echo "   Logs: external/filler-bot.log"
-        if [ $FILLER_BOT_TAIL_PID -ne 0 ] && kill -0 $FILLER_BOT_TAIL_PID 2>/dev/null; then
-            echo "   Log viewer: Running (PID: $FILLER_BOT_TAIL_PID)"
-        fi
     else
         echo "❌ Filler Bot: Not running"
     fi
@@ -607,6 +720,9 @@ show_status() {
 
 start_dev_environment() {
     print_status "Starting Core Lane Development Environment..."
+
+    # Set trap for cleanup on exit (only when starting)
+    trap cleanup EXIT
 
     check_docker
 
@@ -685,12 +801,14 @@ case "${1:-start}" in
         ;;
     status)
         show_status
+        exit 0
         ;;
     balances)
         check_balances
         ;;
     help|--help|-h)
         show_usage
+        exit 0
         ;;
     *)
         print_error "Unknown command: $1"
