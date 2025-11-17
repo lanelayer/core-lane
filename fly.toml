@@ -1,4 +1,4 @@
-# fly.toml app configuration file generated for core-lane-rpc on 2025-11-14T11:25:53+01:00
+# fly.toml app configuration file generated for core-lane-rpc on 2025-11-17T09:30:08+01:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
@@ -7,7 +7,7 @@ app = 'core-lane-rpc'
 primary_region = 'cdg'
 
 [build]
-  dockerfile = 'Dockerfile'
+  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
 
 [[mounts]]
   source = 'core_lane_storage'
