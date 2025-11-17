@@ -156,8 +156,8 @@ else
 fi
 
 # Calculate the value to send (amount + max_fee in wei, converted from sats)
-# Each sat = 1 gwei (10^9 wei) on Core Lane
-VALUE_WEI=$((($AMOUNT + $MAX_FEE) * 1000000000))
+# Each sat = 10^10 wei on Core Lane
+VALUE_WEI=$((($AMOUNT + $MAX_FEE) * 10000000000))
 
 # Call the intent function on the exit marketplace
 print_status "Submitting exit intent to marketplace at $EXIT_MARKETPLACE..."
