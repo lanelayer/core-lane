@@ -7,7 +7,7 @@ app = 'bitcoin-cache'
 primary_region = 'cdg'
 
 [build]
-  dockerfile = 'Dockerfile'
+  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
 
 [env]
   BITCOIN_CACHE_HOST = '0.0.0.0'
