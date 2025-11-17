@@ -5,6 +5,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use ciborium::de::from_reader;
 use ciborium::into_writer;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
+use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use tracing::debug;
 
 sol! {
@@ -27,7 +29,15 @@ sol! {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize_repr,
+    Deserialize_repr,
+    BorshSerialize,
+    BorshDeserialize,
 )]
 #[repr(u8)]
 #[borsh(use_discriminant = true)]
@@ -35,8 +45,16 @@ pub enum IntentType {
     AnchorBitcoinFill = 1,
     RiscVProgram = 2,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize_tuple,
+    Deserialize_tuple,
+    BorshSerialize,
+    BorshDeserialize,
+)]
 pub struct IntentData {
     pub intent_type: IntentType,
     pub data: Vec<u8>,
@@ -56,7 +74,16 @@ impl IntentData {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize_tuple,
+    Deserialize_tuple,
+    BorshSerialize,
+    BorshDeserialize,
+)]
 pub struct AnchorBitcoinFill {
     pub bitcoin_address: Vec<u8>,
     pub amount: U256,
@@ -64,7 +91,7 @@ pub struct AnchorBitcoinFill {
     pub expire_by: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize_tuple, Deserialize_tuple)]
 pub struct RiscVProgramIntent {
     pub blob_hash: [u8; 32],
     pub extra_data: Vec<u8>,
