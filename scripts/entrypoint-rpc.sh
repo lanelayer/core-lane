@@ -32,13 +32,85 @@ S3_SECRET_KEY="${S3_SECRET_KEY:-}"
 
 mkdir -p "$DATA_DIR" "$CACHE_DIR"
 
-# Ensure both children are terminated on signals
-trap 'kill 0 2>/dev/null || true' TERM INT
+declare -a child_pids=()
+received_signal=""
+
+cleanup_children() {
+  local signal="${1:-TERM}"
+  for pid in "${child_pids[@]}"; do
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "[entrypoint] Forwarding SIG${signal} to child process ${pid}"
+      kill "-$signal" "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+handle_signal() {
+  local signal="${1:-TERM}"
+  echo "[entrypoint] Caught ${signal}, shutting down children..."
+  received_signal="$signal"
+  cleanup_children "$signal"
+}
+
+trap 'handle_signal TERM' TERM
+trap 'handle_signal INT' INT
+
+# Wait for a service to be ready on a given host:port
+wait_for_service() {
+  local host="${1:-127.0.0.1}"
+  local port="${2:-8332}"
+  local timeout="${3:-30}"
+  local elapsed=0
+  
+  echo "[entrypoint] Waiting for service on ${host}:${port} to be ready..."
+  
+  while [ $elapsed -lt $timeout ]; do
+    # Check if process is still running (if PID was provided)
+    if [ -n "${4:-}" ]; then
+      if ! kill -0 "${4}" 2>/dev/null; then
+        echo "[entrypoint] Service process ${4} is not running!"
+        return 1
+      fi
+    fi
+    
+    # Try to connect to the port
+    if command -v nc >/dev/null 2>&1; then
+      if nc -z "$host" "$port" 2>/dev/null; then
+        echo "[entrypoint] Service on ${host}:${port} is ready!"
+        return 0
+      fi
+    elif command -v timeout >/dev/null 2>&1; then
+      if timeout 1 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
+        echo "[entrypoint] Service on ${host}:${port} is ready!"
+        return 0
+      fi
+    else
+      # Fallback: try to use /dev/tcp directly
+      if (exec 3<>/dev/tcp/${host}/${port}) 2>/dev/null; then
+        exec 3<&-
+        exec 3>&-
+        echo "[entrypoint] Service on ${host}:${port} is ready!"
+        return 0
+      fi
+    fi
+    
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  
+  echo "[entrypoint] Timeout waiting for service on ${host}:${port} after ${timeout} seconds"
+  return 1
+}
 
 # --- NEW: handle selective startup via ONLY_START ---
 
 
 if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
+  disable_archive_flag=()
+  disable_archive_fetch_normalized="${DISABLE_ARCHIVE_FETCH,,}"
+  if [ "$disable_archive_fetch_normalized" = "true" ] || [ "$disable_archive_fetch_normalized" = "1" ]; then
+    disable_archive_flag=(--disable-archive-fetch)
+  fi
   echo "[entrypoint] starting bitcoin-cache on ${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}"
   # Pass S3 credentials via environment variables (not CLI args) for security
   # This prevents credentials from appearing in process listings and shell history
@@ -51,20 +123,25 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
     --bitcoin-rpc-url "${BITCOIN_UPSTREAM_RPC_URL}" \
     --block-archive "${BLOCK_ARCHIVE_URL}" \
     --starting-block-count "${STARTING_BLOCK_COUNT}" \
-    --disable-archive-fetch "${DISABLE_ARCHIVE_FETCH}" \
     --s3-bucket "${S3_BUCKET}" \
     --s3-region "${S3_REGION}" \
     --s3-endpoint "${S3_ENDPOINT}" \
+    "${disable_archive_flag[@]}" \
     --no-rpc-auth &
-fi
-
-# head start for cache
-if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
-  sleep 2
+  BITCOIN_CACHE_PID=$!
+  child_pids+=("$BITCOIN_CACHE_PID")
+  
+  # Wait for bitcoin-cache to be ready before starting core-lane
+  if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" != "bitcoin-cache" ]; then
+    if ! wait_for_service "${BITCOIN_CACHE_HOST}" "${BITCOIN_CACHE_PORT}" 30 "${BITCOIN_CACHE_PID}"; then
+      echo "[entrypoint] Failed to wait for bitcoin-cache, but continuing anyway..."
+    fi
+  fi
 fi
 
 if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "core-lane" ]; then
   echo "[entrypoint] starting core-lane RPC on ${HTTP_HOST}:${HTTP_PORT}"
+  CORE_LANE_PID=""
   if [ -n "${CORE_LANE_MNEMONIC}" ]; then
     "/app/core-lane-node" start \
       --data-dir "${DATA_DIR}" \
@@ -76,6 +153,7 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "core-lane" ]; then
       --electrum-url "${ELECTRUM_URL}" \
       --http-host "${HTTP_HOST}" \
       --http-port "${HTTP_PORT}" &
+    CORE_LANE_PID=$!
   else
     "/app/core-lane-node" start \
       --data-dir "${DATA_DIR}" \
@@ -86,13 +164,61 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "core-lane" ]; then
       --electrum-url "${ELECTRUM_URL}" \
       --http-host "${HTTP_HOST}" \
       --http-port "${HTTP_PORT}" &
+    CORE_LANE_PID=$!
+  fi
+  child_pids+=("$CORE_LANE_PID")
+  
+  # Wait a moment and verify core-lane started successfully
+  sleep 2
+  if ! kill -0 "$CORE_LANE_PID" 2>/dev/null; then
+    echo "[entrypoint] ERROR: core-lane process ${CORE_LANE_PID} exited immediately after start!"
+    wait "$CORE_LANE_PID" 2>/dev/null || true
+    exit_status=$?
+    echo "[entrypoint] core-lane exit status: ${exit_status}"
+    # Don't exit here - let bitcoin-cache keep running if ONLY_START is not set
+    if [ -z "${ONLY_START:-}" ]; then
+      echo "[entrypoint] Continuing with bitcoin-cache only..."
+      # Remove from child_pids so we don't wait for it
+      remaining_pids=()
+      for pid in "${child_pids[@]}"; do
+        if [ "$pid" != "$CORE_LANE_PID" ]; then
+          remaining_pids+=("$pid")
+        fi
+      done
+      child_pids=("${remaining_pids[@]}")
+    else
+      echo "[entrypoint] ONLY_START=core-lane was set, exiting..."
+      exit "$exit_status"
+    fi
+  else
+    # Wait for core-lane HTTP server to be ready
+    echo "[entrypoint] Waiting for core-lane RPC server to be ready on ${HTTP_HOST}:${HTTP_PORT}..."
+    if ! wait_for_service "${HTTP_HOST}" "${HTTP_PORT}" 60 "${CORE_LANE_PID}"; then
+      echo "[entrypoint] WARNING: core-lane RPC server did not become ready, but process is still running"
+    else
+      echo "[entrypoint] core-lane RPC server is ready!"
+    fi
   fi
 fi
 
-# If any child exits, stop the rest and propagate status
+# Monitor child processes and handle exits gracefully
 set +e
+
+if [ "${#child_pids[@]}" -eq 0 ]; then
+  echo "[entrypoint] No child processes started; exiting."
+  exit 0
+fi
+
 wait -n
 STATUS=$?
-kill 0 2>/dev/null || true
+cleanup_children TERM
 wait || true
+
+if [ -n "$received_signal" ]; then
+  case "$received_signal" in
+    TERM) STATUS=143 ;;
+    INT) STATUS=130 ;;
+  esac
+fi
+
 exit "$STATUS"

@@ -362,6 +362,7 @@ impl BitcoinCacheRpcServer {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/", post(handle_rpc))
+            .route("/health", axum::routing::get(handle_health))
             .with_state(self.clone())
     }
 
@@ -1137,6 +1138,17 @@ impl BitcoinCacheRpcServer {
             }
         }
     }
+}
+
+async fn handle_health() -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "service": "bitcoin-cache-rpc"
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_rpc(

@@ -41,6 +41,4 @@ EXPOSE 8545 8332
 # Default envs for combined rpc entrypoint
 ENV HTTP_HOST=0.0.0.0
 ENV HTTP_PORT=8545
-
-
-CMD ["./core-lane-node", "start", "--rpc-url", "http://127.0.0.1:18443", "--http-host", "0.0.0.0", "--http-port", "8545"]
+ENTRYPOINT ["/app/entrypoint-rpc.sh"]

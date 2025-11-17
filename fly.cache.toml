@@ -1,0 +1,68 @@
+# fly.toml app configuration file generated for bitcoin-cache on 2025-11-14T11:31:37+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'bitcoin-cache'
+primary_region = 'cdg'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  BITCOIN_CACHE_HOST = '0.0.0.0'
+  BITCOIN_CACHE_PORT = '8332'
+  BITCOIN_UPSTREAM_RPC_URL = 'https://bitcoin-rpc.publicnode.com'
+  BLOCK_ARCHIVE_URL = 'http://144.76.56.210/blocks'
+  CACHE_DIR = '/storage/cache'
+  DATA_DIR = '/storage/data'
+  DISABLE_ARCHIVE_FETCH = 'false'
+  ONLY_START = 'bitcoin-cache'
+  RPC_PASSWORD = 'bitcoin123'
+  RPC_USER = 'bitcoin'
+  STARTING_BLOCK_COUNT = '916201'
+
+[processes]
+  app = '/app/entrypoint-rpc.sh'
+
+[[mounts]]
+  source = 'core_lane_cache_storage'
+  destination = '/storage'
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 8332
+  processes = ['app']
+
+  [[services.ports]]
+    port = 80
+    handlers = ['http']
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ['tls', 'http']
+
+  [services.concurrency]
+    type = 'connections'
+    hard_limit = 500
+    soft_limit = 200
+
+  [[services.tcp_checks]]
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '1m0s'
+
+  [[services.http_checks]]
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '1m0s'
+    method = 'get'
+    path = '/health'
+    protocol = 'http'
+    tls_skip_verify = false
+
+[[vm]]
+  memory = '2gb'
+  cpu_kind = 'shared'
+  cpus = 2
