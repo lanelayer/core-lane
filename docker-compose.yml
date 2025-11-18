@@ -5,15 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "8332:8332"   # Bitcoin Cache RPC
-    command: >
-      /app/core-lane-node bitcoin-cache
-      --host 0.0.0.0
-      --port 8332
-      --cache-dir /cache
-      --bitcoin-rpc-url https://signet-rpc.publicnode.com
-      --block-archive http://144.76.56.210/blocks-signet
-      --starting-block-count 278860
-      --no-rpc-auth
+    environment:
+      - BITCOIN_UPSTREAM_RPC_URL=https://bitcoin-signet.g.alchemy.com/v2/${ALCHEMY_SIGNET_API_KEY}
+      - STARTING_BLOCK_COUNT=278860
     volumes:
       - bitcoin-cache:/cache
     networks:
