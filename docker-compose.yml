@@ -10,9 +10,9 @@ services:
       --host 0.0.0.0
       --port 8332
       --cache-dir /cache
-      --bitcoin-rpc-url https://bitcoin-rpc.publicnode.com
-      --block-archive http://144.76.56.210/blocks
-      --starting-block-count 916201
+      --bitcoin-rpc-url https://signet-rpc.publicnode.com
+      --block-archive http://144.76.56.210/blocks-signet
+      --starting-block-count 278860
       --no-rpc-auth
     volumes:
       - bitcoin-cache:/cache
@@ -28,8 +28,8 @@ services:
       - "8545:8545"   # Core Lane RPC
     environment:
       - CORE_LANE_MNEMONIC=${CORE_LANE_MNEMONIC}
-      - NETWORK=${NETWORK:-mainnet}
-      - ELECTRUM_URL=${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}
+      - NETWORK=${NETWORK:-signet}
+      - ELECTRUM_URL=${ELECTRUM_URL:-ssl://electrum.blockstream.info:60602}
     command: >
       sh -c "
       /app/core-lane-node start
@@ -40,7 +40,7 @@ services:
       --bitcoin-rpc-write-url http://bitcoin-cache:8332
       --bitcoin-rpc-write-user ${RPC_USER:-bitcoin}
       --bitcoin-rpc-write-password ${RPC_PASSWORD:-bitcoin123}
-      --start-block 916201
+      --start-block 278860
       --mnemonic \"$$CORE_LANE_MNEMONIC\"
       --electrum-url \"$$ELECTRUM_URL\"
       --http-host 0.0.0.0
