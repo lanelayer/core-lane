@@ -135,8 +135,8 @@ impl transaction::ProcessingContext for CoreLaneStateForLib {
         &mut self.account_manager
     }
 
-    fn bitcoin_client_read(&self) -> Arc<Client> {
-        self.bitcoin_client_read.clone()
+    fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
+        Some(self.bitcoin_client_read.clone())
     }
 
     fn bitcoin_network(&self) -> bitcoin::Network {

@@ -10,6 +10,7 @@ use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use anyhow::Result;
+use bitcoin::Network;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
 use reqwest::Url;
@@ -24,7 +25,6 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
     eip1559_fee_manager: eip1559::Eip1559FeeManager,
@@ -37,6 +37,7 @@ use core_lane::{
 };
 
 // RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
+mod derived;
 mod eip1559;
 mod rpc;
 
@@ -398,6 +399,20 @@ enum Commands {
         #[arg(long, default_value = "")]
         rpc_password: String,
     },
+    DerivedStart {
+        #[arg(long, default_value = "http://127.0.0.1:8545")]
+        core_rpc_url: String,
+        #[arg(long, default_value_t = 1281453634)]
+        chain_id: u32,
+        #[arg(long)]
+        start_block: Option<u64>,
+        #[arg(long)]
+        derived_da_address: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        http_host: String,
+        #[arg(long, default_value = "8545")]
+        http_port: u16,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -548,23 +563,23 @@ struct CoreLaneState {
     bitcoin_height_to_core_block: HashMap<u64, u64>, // Bitcoin height -> Core Lane block number
     current_block: Option<CoreLaneBlock>,       // Current block being built
     genesis_block: CoreLaneBlock,
-    bitcoin_client_read: Arc<Client>, // Client for reading blockchain data
+    bitcoin_client_read: Option<Arc<Client>>, // Client for reading blockchain data
     #[allow(dead_code)]
-    bitcoin_client_write: Arc<Client>, // Client for writing/wallet operations
+    bitcoin_client_write: Option<Arc<Client>>, // Client for writing/wallet operations
     eip1559_fee_manager: eip1559::Eip1559FeeManager, // EIP-1559 fee management
-    sequencer_address: Address,       // Address that receives priority fees
-    total_burned_amount: U256,        // Total amount burned from base fees
-    bitcoin_network: bitcoin::Network, // Bitcoin network (mainnet, testnet, regtest, etc.)
+    sequencer_address: Address,               // Address that receives priority fees
+    total_burned_amount: U256,                // Total amount burned from base fees
+    bitcoin_network: bitcoin::Network,        // Bitcoin network (mainnet, testnet, regtest, etc.)
 }
 
 impl CoreLaneState {
     #[allow(dead_code)]
-    pub fn bitcoin_client_read(&self) -> Arc<Client> {
+    pub fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
         self.bitcoin_client_read.clone()
     }
 
     #[allow(dead_code)]
-    pub fn bitcoin_client_write(&self) -> Arc<Client> {
+    pub fn bitcoin_client_write(&self) -> Option<Arc<Client>> {
         self.bitcoin_client_write.clone()
     }
 
@@ -701,7 +716,7 @@ impl transaction::ProcessingContext for CoreLaneState {
         &mut self.account_manager
     }
 
-    fn bitcoin_client_read(&self) -> Arc<Client> {
+    fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
         self.bitcoin_client_read.clone()
     }
 
@@ -720,8 +735,8 @@ impl transaction::ProcessingContext for CoreLaneState {
 }
 
 struct CoreLaneNode {
-    bitcoin_client_read: Arc<Client>,
-    bitcoin_client_write: Arc<Client>,
+    bitcoin_client_read: Option<Arc<Client>>,
+    bitcoin_client_write: Option<Arc<Client>>,
     state: Arc<Mutex<CoreLaneState>>,
     data_dir: String,
 }
@@ -733,6 +748,24 @@ impl CoreLaneNode {
         data_dir: String,
         network: bitcoin::Network,
     ) -> Self {
+        Self::new_with_clients(
+            Some(bitcoin_client_read),
+            Some(bitcoin_client_write),
+            data_dir,
+            network,
+        )
+    }
+
+    fn new_derived(data_dir: String, network: bitcoin::Network) -> Self {
+        Self::new_with_clients(None, None, data_dir, network)
+    }
+
+    fn new_with_clients(
+        bitcoin_client_read: Option<Client>,
+        bitcoin_client_write: Option<Client>,
+        data_dir: String,
+        network: bitcoin::Network,
+    ) -> Self {
         // Create genesis block with EIP-1559 default configuration
         let eip1559_config = eip1559::Eip1559Config::default();
         let genesis_block =
@@ -741,8 +774,8 @@ impl CoreLaneNode {
 
         let mut blocks = HashMap::new();
         let mut block_hashes = HashMap::new();
-        let bitcoin_client_read = Arc::new(bitcoin_client_read);
-        let bitcoin_client_write = Arc::new(bitcoin_client_write);
+        let bitcoin_client_read = bitcoin_client_read.map(Arc::new);
+        let bitcoin_client_write = bitcoin_client_write.map(Arc::new);
 
         // Store genesis block
         blocks.insert(0, genesis_block.clone());
@@ -782,8 +815,8 @@ impl CoreLaneNode {
         }
 
         Self {
-            bitcoin_client_read: bitcoin_client_read.clone(),
-            bitcoin_client_write: bitcoin_client_write.clone(),
+            bitcoin_client_read,
+            bitcoin_client_write,
             state,
             data_dir,
         }
@@ -1129,8 +1162,100 @@ impl CoreLaneNode {
         }
     }
 
+    async fn start_core_lane_scanner(
+        &self,
+        core_rpc_url: String,
+        chain_id: u32,
+        start_block: Option<u64>,
+        derived_da_address: Address,
+    ) -> Result<()> {
+        info!(
+            "Starting derived Core Lane scanner with RPC URL: {}",
+            core_rpc_url
+        );
+        if let Some(block) = start_block {
+            let mut state = self.state.lock().await;
+            state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+        }
+
+        loop {
+            let latest_block = match derived::fetch_core_block_number(&core_rpc_url).await {
+                Ok(height) => height,
+                Err(err) => {
+                    warn!("Failed to fetch derived block number: {err:?}");
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let start_height = {
+                let state = self.state.lock().await;
+                match state.last_processed_bitcoin_height {
+                    None => latest_block.saturating_sub(10),
+                    Some(height) => height + 1,
+                }
+            };
+
+            if start_height > latest_block {
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            info!(
+                "Scanning derived blocks {} to {}...",
+                start_height, latest_block
+            );
+
+            for height in start_height..=latest_block {
+                match derived::process_core_lane_block(
+                    &core_rpc_url,
+                    height,
+                    chain_id,
+                    derived_da_address,
+                )
+                .await
+                {
+                    Ok(parsed_block) => {
+                        let anchor_hash = parsed_block.anchor_block_hash.clone();
+                        match self.process_block(parsed_block).await {
+                            Ok(core_lane_block_number) => {
+                                if core_lane_block_number == 0 {
+                                    info!("Derived backend encountered reorg, restarting scan");
+                                    break;
+                                }
+                                let mut state = self.state.lock().await;
+                                state.last_processed_bitcoin_height = Some(height);
+                                if anchor_hash.len() == 32 {
+                                    let block_hash = B256::from_slice(&anchor_hash);
+                                    state.bitcoin_height_to_hash.insert(height, block_hash);
+                                }
+                                state
+                                    .bitcoin_height_to_core_block
+                                    .insert(height, core_lane_block_number);
+                            }
+                            Err(err) => {
+                                warn!("Failed to process derived block {}: {}", height, err);
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to fetch derived block {}: {}", height, err);
+                        break;
+                    }
+                }
+            }
+
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     async fn scan_new_blocks(&self) -> Result<()> {
-        let tip = self.bitcoin_client_read.get_block_count()?;
+        let bitcoin_client = self
+            .bitcoin_client_read
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC client not configured"))?;
+        let tip = bitcoin_client.get_block_count()?;
 
         // Get the starting block without holding the lock
         let start_block = {
@@ -1157,7 +1282,11 @@ impl CoreLaneNode {
         );
 
         for height in start_block..=tip {
-            let bitcoin_block = process_bitcoin_block(self.bitcoin_client_read.clone(), height)?;
+            let bitcoin_client = self
+                .bitcoin_client_read
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC client not configured"))?;
+            let bitcoin_block = process_bitcoin_block(bitcoin_client, height)?;
 
             match self.process_block(bitcoin_block.clone()).await {
                 Ok(core_lane_block_number) => {
@@ -1666,7 +1795,11 @@ impl CoreLaneNode {
     ) -> Result<()> {
         // Delegate to the TaprootDA implementation which handles all validation and logic
         // Use write client for DA transactions (wallet operations)
-        let taproot_da = TaprootDA::new(self.bitcoin_client_write.clone());
+        let bitcoin_client = self
+            .bitcoin_client_write
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC write client not configured"))?;
+        let taproot_da = TaprootDA::new(bitcoin_client);
         let _bitcoin_txid = taproot_da
             .send_transaction_to_da(
                 raw_tx_hex,
@@ -1683,7 +1816,7 @@ impl CoreLaneNode {
     /// Find the fork point by comparing our stored Bitcoin hashes with current chain
     async fn find_fork_point(
         &self,
-        bitcoin_client: &Arc<Client>,
+        bitcoin_client: Arc<Client>,
         state: &CoreLaneState,
     ) -> Result<Option<u64>> {
         use tokio::task;
@@ -1813,9 +1946,12 @@ impl CoreLaneNode {
 
         // Find the fork point
         info!("🔍 Searching for fork point...");
-        let fork_point = self
-            .find_fork_point(&self.bitcoin_client_read, state)
-            .await?;
+        let fork_point = if let Some(bitcoin_client) = self.bitcoin_client_read.clone() {
+            self.find_fork_point(bitcoin_client, state).await?
+        } else {
+            warn!("⚠️  Bitcoin RPC unavailable, deriving fork point from local Core Lane history");
+            Self::derive_local_fork_point(state)?
+        };
         info!("🔍 Fork point search completed");
 
         match fork_point {
@@ -1900,6 +2036,21 @@ impl CoreLaneNode {
         );
 
         Ok(())
+    }
+
+    fn derive_local_fork_point(state: &CoreLaneState) -> Result<Option<u64>> {
+        let mut search_height = state.last_processed_bitcoin_height.ok_or_else(|| {
+            anyhow::anyhow!("Cannot recover from reorg without processed block history")
+        })?;
+
+        while search_height > 0 {
+            if let Some(&core_block) = state.bitcoin_height_to_core_block.get(&search_height) {
+                return Ok(Some(core_block));
+            }
+            search_height -= 1;
+        }
+
+        Ok(Some(0))
     }
 }
 
@@ -2052,9 +2203,13 @@ async fn main() -> Result<()> {
 
             // Start HTTP server for JSON-RPC - share the same state
             let shared_state = Arc::clone(&node.state);
+            let bitcoin_client_write = node
+                .bitcoin_client_write
+                .clone()
+                .expect("Bitcoin write client must be configured in start mode");
             let rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
-                node.bitcoin_client_write.clone(),
+                bitcoin_client_write,
                 network,
                 String::new(), // wallet parameter no longer used
                 mnemonic_str.clone(),
@@ -3085,6 +3240,55 @@ async fn main() -> Result<()> {
                 println!("✅ Confirmed: {:.8} BTC", confirmed_btc);
                 println!("⏳ Unconfirmed: {:.8} BTC", unconfirmed_btc);
             }
+        }
+
+        Commands::DerivedStart {
+            core_rpc_url,
+            chain_id,
+            start_block,
+            derived_da_address,
+            http_host,
+            http_port,
+        } => {
+            let node = CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest);
+
+            let da_address = Address::from_str(derived_da_address).map_err(|err| {
+                anyhow::anyhow!(
+                    "Invalid --derived-da-address '{}': {}",
+                    derived_da_address,
+                    err
+                )
+            })?;
+
+            let shared_state = Arc::clone(&node.state);
+            let rpc_server = RpcServer::with_derived(
+                shared_state,
+                core_rpc_url.clone(),
+                da_address,
+                cli.data_dir.clone(),
+            );
+
+            let app = rpc_server.router();
+            let addr = format!("{}:{}", http_host, http_port);
+            info!(
+                "🚀 Starting JSON-RPC server on http://{} (derived mode)",
+                addr
+            );
+
+            let server_handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let start_block = *start_block;
+            let chain_id = *chain_id;
+            let core_rpc_url = core_rpc_url.clone();
+            let scanner_handle = tokio::spawn(async move {
+                node.start_core_lane_scanner(core_rpc_url, chain_id, start_block, da_address)
+                    .await
+            });
+
+            let _ = tokio::try_join!(server_handle, scanner_handle)?;
         }
     }
 

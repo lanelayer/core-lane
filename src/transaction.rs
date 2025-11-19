@@ -60,7 +60,7 @@ pub fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
 pub trait ProcessingContext {
     fn state_manager(&self) -> &StateManager;
     fn state_manager_mut(&mut self) -> &mut StateManager;
-    fn bitcoin_client_read(&self) -> Arc<Client>;
+    fn bitcoin_client_read(&self) -> Option<Arc<Client>>;
     fn bitcoin_network(&self) -> bitcoin::Network;
     fn handle_cmio_query(
         &mut self,
@@ -1160,7 +1160,13 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     block_number: u64,
     txid_bytes: [u8; 32],
 ) -> Result<bool> {
-    let client = state.bitcoin_client_read();
+    let Some(client) = state.bitcoin_client_read() else {
+        debug!(
+            "⚠️  Bitcoin verification requested but no Bitcoin RPC configured (intent {:?})",
+            intent_id
+        );
+        return Ok(false);
+    };
 
     let network = state.bitcoin_network();
     let intent = state
