@@ -1,7 +1,9 @@
 use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::TransactionRequest;
 
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
@@ -48,6 +50,8 @@ pub struct RpcServer {
     mnemonic: Option<String>,
     electrum_url: Option<String>,
     data_dir: String,
+    core_rpc_url: Option<String>,
+    da_feed_address: Option<Address>,
 }
 
 impl RpcServer {
@@ -68,6 +72,27 @@ impl RpcServer {
             mnemonic: Some(mnemonic),
             electrum_url,
             data_dir,
+            core_rpc_url: None,
+            da_feed_address: None,
+        }
+    }
+
+    pub fn with_derived(
+        state: Arc<Mutex<CoreLaneState>>,
+        core_rpc_url: String,
+        da_feed_address: Address,
+        data_dir: String,
+    ) -> Self {
+        Self {
+            state,
+            bitcoin_client: None,
+            network: None,
+            wallet: None,
+            mnemonic: None,
+            electrum_url: None,
+            data_dir,
+            core_rpc_url: Some(core_rpc_url),
+            da_feed_address: Some(da_feed_address),
         }
     }
 
@@ -346,6 +371,40 @@ impl RpcServer {
             }));
         }
 
+        if let (Some(core_rpc_url), Some(da_feed_address)) =
+            (&server.core_rpc_url, &server.da_feed_address)
+        {
+            match Self::send_to_core_lane_da(raw_tx_hex, core_rpc_url, *da_feed_address).await {
+                Ok(tx_hash_hex) => {
+                    info!(
+                        core_tx_hash = %tx_hash_hex,
+                        "Transaction forwarded to upstream Core Lane RPC"
+                    );
+
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: Some(json!(tx_hash_hex)),
+                        error: None,
+                        id: request.id,
+                    }));
+                }
+                Err(e) => {
+                    return Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!(
+                                "Failed to forward transaction to upstream Core Lane RPC: {}",
+                                e
+                            ),
+                        }),
+                        id: request.id,
+                    }));
+                }
+            }
+        }
+
         // Check if Bitcoin client is available
         let bitcoin_client = match &server.bitcoin_client {
             Some(client) => client,
@@ -448,6 +507,40 @@ impl RpcServer {
                 data_dir,
             )
             .await
+    }
+
+    async fn send_to_core_lane_da(
+        raw_tx_hex: &str,
+        core_rpc_url: &str,
+        da_feed_address: Address,
+    ) -> Result<String, anyhow::Error> {
+        let tx_bytes =
+            hex::decode(raw_tx_hex).map_err(|e| anyhow::anyhow!("Failed to decode hex: {}", e))?;
+
+        let tx_request = TransactionRequest::default()
+            .to(da_feed_address)
+            .input(Bytes::from(tx_bytes.clone()).into());
+
+        let url = core_rpc_url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid core_rpc_url '{}': {}", core_rpc_url, e))?;
+        let provider = ProviderBuilder::new().connect_http(url);
+
+        let upstream_hash = provider
+            .send_transaction(tx_request)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send to upstream Core Lane RPC: {}", e))?;
+
+        let original_tx_hash = alloy_primitives::keccak256(&tx_bytes);
+        let tx_hash_hex = format!("0x{}", hex::encode(original_tx_hash));
+
+        info!(
+            upstream_tx = ?upstream_hash,
+            original_tx_hash = %tx_hash_hex,
+            "Transaction forwarded to upstream Core Lane RPC"
+        );
+
+        Ok(tx_hash_hex)
     }
 
     async fn handle_get_transaction_by_hash(
