@@ -34,14 +34,6 @@ primary_region = 'cdg'
   internal_port = 8332
   processes = ['app']
 
-  [[services.ports]]
-    port = 80
-    handlers = ['http']
-    force_https = true
-
-  [[services.ports]]
-    port = 443
-    handlers = ['tls', 'http']
 
   [services.concurrency]
     type = 'connections'
