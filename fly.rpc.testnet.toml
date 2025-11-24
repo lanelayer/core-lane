@@ -1,0 +1,37 @@
+# fly.toml app configuration file generated for core-lane-rpc-testnet4 on 2025-11-21T06:24:20+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'core-lane-rpc-testnet4'
+primary_region = 'cdg'
+
+[build]
+  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
+
+[env]
+  BITCOIN_CACHE_HOST = 'core-lane-cache-testnet4.internal'
+  BITCOIN_CACHE_PORT = '8332'
+  DATA_DIR = '/data'
+  ELECTRUM_URL = 'ssl://electrum.blockstream.info:40002'
+  HTTP_PORT = '48332'
+  NETWORK = 'testnet4'
+  ONLY_START = 'core-lane'
+  STARTING_BLOCK_COUNT = '111303'
+
+[[mounts]]
+  source = 'core_lane_storage'
+  destination = '/data'
+
+[http_service]
+  internal_port = 48332
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '2gb'
+  cpu_kind = 'shared'
+  cpus = 2
