@@ -12,7 +12,7 @@ services:
       --cache-dir /cache
       --bitcoin-rpc-url https://bitcoin-testnet-rpc.publicnode.com
       --block-archive http://144.76.56.210/blocks
-      --starting-block-count ${TESTNET4_STARTING_BLOCK:-4782948}
+      --starting-block-count ${TESTNET4_STARTING_BLOCK:-111303}
       --no-rpc-auth
     volumes:
       - bitcoin-cache-testnet4:/cache
