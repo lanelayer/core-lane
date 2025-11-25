@@ -217,7 +217,7 @@ enum Commands {
         /// Path to file containing mnemonic phrase (recommended, more secure)
         #[arg(long)]
         mnemonic_file: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet4)
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
     },
@@ -246,7 +246,7 @@ enum Commands {
         /// Bitcoin RPC password (for regtest)
         #[arg(long)]
         rpc_password: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet4)
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
     },
@@ -271,7 +271,7 @@ enum Commands {
         /// Bitcoin RPC password (for regtest)
         #[arg(long)]
         rpc_password: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet4)
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
     },
@@ -345,7 +345,7 @@ enum Commands {
         /// Path to file containing mnemonic phrase (recommended, more secure)
         #[arg(long)]
         mnemonic_file: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet4)
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet)
         #[arg(long)]
         electrum_url: Option<String>,
         /// Bitcoin RPC URL (for regtest)
