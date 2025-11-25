@@ -109,7 +109,7 @@ fn create_wallet_from_mnemonic(
     // Parse network (include "mainnet" mapping)
     let bdk_network = match network_str {
         "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
-        "testnet" => BdkNetwork::Testnet,
+        "testnet4" => BdkNetwork::Testnet4,
         "signet" => BdkNetwork::Signet,
         "regtest" => BdkNetwork::Regtest,
         _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
@@ -1990,6 +1990,7 @@ async fn main() -> Result<()> {
                 match chain.as_str() {
                     Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
                     Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
+                    Some("testnet4") => bitcoincore_rpc::bitcoin::Network::Testnet4,
                     Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
                     Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
                     Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
@@ -2066,7 +2067,7 @@ async fn main() -> Result<()> {
             // Parse network
             let bdk_network = match network_str.as_str() {
                 "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
-                "testnet" => BdkNetwork::Testnet,
+                "testnet4" => BdkNetwork::Testnet4,
                 "signet" => BdkNetwork::Signet,
                 "regtest" => BdkNetwork::Regtest,
                 _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),

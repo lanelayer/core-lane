@@ -377,9 +377,9 @@ impl RpcServer {
         let network_str = match network {
             bitcoin::Network::Bitcoin => "bitcoin",
             bitcoin::Network::Testnet => "testnet",
+            bitcoin::Network::Testnet4 => "testnet4",
             bitcoin::Network::Signet => "signet",
             bitcoin::Network::Regtest => "regtest",
-            _ => "regtest",
         };
         let electrum_url = server.electrum_url.as_deref();
 
