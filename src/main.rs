@@ -109,6 +109,7 @@ fn create_wallet_from_mnemonic(
     // Parse network (include "mainnet" mapping)
     let bdk_network = match network_str {
         "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
+        "testnet" => BdkNetwork::Testnet,
         "testnet4" => BdkNetwork::Testnet4,
         "signet" => BdkNetwork::Signet,
         "regtest" => BdkNetwork::Regtest,
@@ -216,7 +217,7 @@ enum Commands {
         /// Path to file containing mnemonic phrase (recommended, more secure)
         #[arg(long)]
         mnemonic_file: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet)
+        /// Electrum server URL (for mainnet/signet/testnet4)
         #[arg(long)]
         electrum_url: Option<String>,
     },
@@ -245,13 +246,14 @@ enum Commands {
         /// Bitcoin RPC password (for regtest)
         #[arg(long)]
         rpc_password: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet)
+        /// Electrum server URL (for mainnet/signet/testnet4)
         #[arg(long)]
         electrum_url: Option<String>,
     },
     SendTransaction {
         #[arg(long)]
         raw_tx_hex: String,
+        /// Network for the transaction (bitcoin, testnet, testnet4, signet, regtest)
         #[arg(long, default_value = "regtest")]
         network: String,
         /// Mnemonic phrase for signing (not recommended - visible in process list)
@@ -269,7 +271,7 @@ enum Commands {
         /// Bitcoin RPC password (for regtest)
         #[arg(long)]
         rpc_password: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet)
+        /// Electrum server URL (for mainnet/signet/testnet4)
         #[arg(long)]
         electrum_url: Option<String>,
     },
@@ -312,7 +314,7 @@ enum Commands {
         s3_endpoint: String,
     },
     CreateWallet {
-        /// Network to create wallet for (bitcoin, testnet, signet, regtest)
+        /// Network to create wallet for (bitcoin, testnet, testnet4, signet, regtest)
         #[arg(long, default_value = "regtest")]
         network: String,
         /// Optional mnemonic phrase to restore wallet (12 or 24 words)
@@ -323,7 +325,7 @@ enum Commands {
         mnemonic_only: bool,
     },
     GetAddress {
-        /// Network of the wallet to load (bitcoin, testnet, signet, regtest)
+        /// Network of the wallet to load (bitcoin, testnet, testnet4, signet, regtest)
         #[arg(long, default_value = "regtest")]
         network: String,
         /// Mnemonic phrase for signing (not recommended - visible in process list)
@@ -334,7 +336,7 @@ enum Commands {
         mnemonic_file: Option<String>,
     },
     GetBitcoinBalance {
-        /// Network of the wallet to check (bitcoin, testnet, signet, regtest)
+        /// Network of the wallet to check (bitcoin, testnet, testnet4, signet, regtest)
         #[arg(long, default_value = "regtest")]
         network: String,
         /// Mnemonic phrase for signing (not recommended - visible in process list)
@@ -343,7 +345,7 @@ enum Commands {
         /// Path to file containing mnemonic phrase (recommended, more secure)
         #[arg(long)]
         mnemonic_file: Option<String>,
-        /// Electrum server URL (for mainnet/signet/testnet)
+        /// Electrum server URL (for mainnet/signet/testnet4)
         #[arg(long)]
         electrum_url: Option<String>,
         /// Bitcoin RPC URL (for regtest)
@@ -2067,6 +2069,7 @@ async fn main() -> Result<()> {
             // Parse network
             let bdk_network = match network_str.as_str() {
                 "bitcoin" | "mainnet" => BdkNetwork::Bitcoin,
+                "testnet" => BdkNetwork::Testnet,
                 "testnet4" => BdkNetwork::Testnet4,
                 "signet" => BdkNetwork::Signet,
                 "regtest" => BdkNetwork::Regtest,
@@ -2497,6 +2500,7 @@ async fn main() -> Result<()> {
             let network = match network_str.as_str() {
                 "bitcoin" | "mainnet" => bitcoincore_rpc::bitcoin::Network::Bitcoin,
                 "testnet" => bitcoincore_rpc::bitcoin::Network::Testnet,
+                "testnet4" => bitcoincore_rpc::bitcoin::Network::Testnet4,
                 "signet" => bitcoincore_rpc::bitcoin::Network::Signet,
                 "regtest" => bitcoincore_rpc::bitcoin::Network::Regtest,
                 _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
