@@ -95,11 +95,13 @@ fn resolve_mnemonic(
 
 /// Helper function to create wallet database from mnemonic
 /// Handles network parsing, mnemonic validation, key derivation, descriptor creation, and wallet creation
+/// If electrum_url is provided for non-regtest networks, performs an initial full scan
 fn create_wallet_from_mnemonic(
     data_dir: &str,
     network_str: &str,
     mnemonic_str: String,
     plain_mode: bool,
+    electrum_url: Option<&str>,
 ) -> Result<()> {
     use bdk_wallet::bitcoin::Network as BdkNetwork;
     use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
@@ -140,7 +142,7 @@ fn create_wallet_from_mnemonic(
     let mut conn = Connection::open(&db_path)
         .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
 
-    let _wallet = Wallet::create(external_descriptor, internal_descriptor)
+    let mut wallet = Wallet::create(external_descriptor, internal_descriptor)
         .network(bdk_network)
         .create_wallet(&mut conn)
         .map_err(|e| anyhow::anyhow!("Failed to create wallet: {}", e))?;
@@ -148,6 +150,41 @@ fn create_wallet_from_mnemonic(
     // Log success when not in plain mode
     if !plain_mode {
         info!("✅ Wallet database created successfully");
+    }
+
+    // Perform initial soft sync with Electrum if URL is provided and network is not regtest
+    if let Some(electrum_url_str) = electrum_url {
+        if network_str != "regtest" {
+            if !plain_mode {
+                info!(
+                    "🔄 Performing initial sync with Electrum: {}",
+                    electrum_url_str
+                );
+            }
+
+            use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+            let electrum_client = electrum_client::Client::new(electrum_url_str)
+                .map_err(|e| anyhow::anyhow!("Failed to connect to Electrum server: {}", e))?;
+            let electrum = BdkElectrumClient::new(electrum_client);
+
+            // Use soft sync to sync revealed addresses (for new wallets, this will be empty)
+            let request = wallet.start_sync_with_revealed_spks().build();
+            let response = electrum
+                .sync(request, 5, false)
+                .map_err(|e| anyhow::anyhow!("Failed to perform sync: {}", e))?;
+
+            wallet
+                .apply_update(response)
+                .map_err(|e| anyhow::anyhow!("Failed to apply sync results: {}", e))?;
+            wallet
+                .persist(&mut conn)
+                .map_err(|e| anyhow::anyhow!("Failed to persist wallet: {}", e))?;
+
+            if !plain_mode {
+                info!("✅ Initial sync completed");
+            }
+        }
     }
 
     Ok(())
@@ -323,6 +360,9 @@ enum Commands {
         /// Only generate/output mnemonic, don't create database file
         #[arg(long)]
         mnemonic_only: bool,
+        /// Electrum server URL (for mainnet/testnet/testnet4/signet - performs initial full scan)
+        #[arg(long)]
+        electrum_url: Option<String>,
     },
     GetAddress {
         /// Network of the wallet to load (bitcoin, testnet, testnet4, signet, regtest)
@@ -2178,11 +2218,12 @@ async fn main() -> Result<()> {
                 let electrum = BdkElectrumClient::new(electrum_client);
 
                 if !cli.plain {
-                    info!("🔍 Scanning blockchain for wallet transactions...");
+                    info!("🔄 Performing soft sync (updating revealed addresses)...");
                 }
 
-                let request = wallet.start_full_scan().build();
-                let response = electrum.full_scan(request, 5, 1, false)?;
+                // Use soft sync for updates (only syncs revealed addresses)
+                let request = wallet.start_sync_with_revealed_spks().build();
+                let response = electrum.sync(request, 5, false)?;
 
                 wallet.apply_update(response)?;
                 wallet.persist(&mut conn)?;
@@ -2745,6 +2786,7 @@ async fn main() -> Result<()> {
             network,
             mnemonic: mnemonic_opt,
             mnemonic_only,
+            electrum_url,
         } => {
             use bdk_wallet::keys::{
                 bip39::{Language, Mnemonic, WordCount},
@@ -2804,7 +2846,13 @@ async fn main() -> Result<()> {
             if !cli.plain {
                 info!("💾 Creating wallet database...");
             }
-            create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_words.clone(), cli.plain)?;
+            create_wallet_from_mnemonic(
+                &cli.data_dir,
+                network,
+                mnemonic_words.clone(),
+                cli.plain,
+                electrum_url.as_deref(),
+            )?;
 
             // Output formatting based on plain flag
             let db_path = wallet_db_path(&cli.data_dir, network);
@@ -2856,8 +2904,8 @@ async fn main() -> Result<()> {
                     resolve_mnemonic(None, old_mnemonic_file.to_str())?
                 };
 
-                // Create wallet using helper function
-                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain)?;
+                // Create wallet using helper function (no electrum_url for GetAddress)
+                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain, None)?;
             }
 
             if !cli.plain {
@@ -2922,8 +2970,8 @@ async fn main() -> Result<()> {
                     resolve_mnemonic(None, old_mnemonic_file.to_str())?
                 };
 
-                // Create wallet using helper function
-                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain)?;
+                // Create wallet using helper function (no initial scan here, will sync below)
+                create_wallet_from_mnemonic(&cli.data_dir, network, mnemonic_str, cli.plain, None)?;
             }
 
             if !cli.plain {
@@ -2992,11 +3040,12 @@ async fn main() -> Result<()> {
                 let electrum = BdkElectrumClient::new(electrum_client);
 
                 if !cli.plain {
-                    info!("🔍 Scanning blockchain for wallet transactions...");
+                    info!("🔄 Performing soft sync (updating revealed addresses)...");
                 }
 
-                let request = wallet.start_full_scan().build();
-                let response = electrum.full_scan(request, 5, 1, false)?;
+                // Use soft sync for updates (only syncs revealed addresses)
+                let request = wallet.start_sync_with_revealed_spks().build();
+                let response = electrum.sync(request, 5, false)?;
 
                 wallet.apply_update(response)?;
                 wallet.persist(&mut conn)?;

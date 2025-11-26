@@ -324,10 +324,11 @@ impl TaprootDA {
             let electrum_client = electrum_client::Client::new(electrum_url)?;
             let electrum = BdkElectrumClient::new(electrum_client);
 
-            tracing::info!("🔍 Scanning blockchain for wallet transactions...");
+            tracing::info!("🔄 Performing soft sync (updating revealed addresses)...");
 
-            let request = wallet.start_full_scan().build();
-            let response = electrum.full_scan(request, 5, 1, false)?;
+            // Use soft sync for updates (only syncs revealed addresses)
+            let request = wallet.start_sync_with_revealed_spks().build();
+            let response = electrum.sync(request, 5, false)?;
 
             wallet.apply_update(response)?;
             wallet.persist(&mut conn)?;
