@@ -29,6 +29,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 struct MetaState {
     eip1559_fee_manager: eip1559::Eip1559FeeManager,
     total_burned_amount: U256,
+    sequencer_address: Address,
+}
+
+impl MetaState {
+    /// Get the sequencer address for a given Core Lane block number
+    /// In the future, this could support sequencer rotation based on block height
+    #[allow(dead_code)]
+    pub fn get_sequencer_address_for_block(&self, _block_number: u64) -> Address {
+        // Currently returns a single sequencer address
+        // Future enhancement: could implement rotation logic based on block_number
+        self.sequencer_address
+    }
 }
 
 // Import modules from the library
@@ -39,6 +51,14 @@ use core_lane::{
 // RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
 mod eip1559;
 mod rpc;
+
+// Default sequencer address that gets priority for bundle processing
+// This is the first address from the default Hardhat/Anvil test accounts
+// Used for initialization and testing
+const DEFAULT_SEQUENCER_ADDRESS: Address = Address::new([
+    0xf3, 0x9F, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xF6, 0xF4, 0xce, 0x6a, 0xB8, 0x82, 0x72, 0x79, 0xcf,
+    0xFF, 0xb9, 0x22, 0x66,
+]);
 
 #[cfg(test)]
 mod tests;
@@ -768,10 +788,7 @@ impl CoreLaneNode {
             bitcoin_client_read: bitcoin_client_read.clone(),
             bitcoin_client_write: bitcoin_client_write.clone(),
             eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
-            sequencer_address: Address::from([
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            ]), // Sequencer address
+            sequencer_address: DEFAULT_SEQUENCER_ADDRESS, // Default sequencer address
             total_burned_amount: U256::ZERO,
             bitcoin_network: network,
         }));
@@ -965,6 +982,7 @@ impl CoreLaneNode {
         let genesis_metastate = MetaState {
             eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
             total_burned_amount: U256::ZERO,
+            sequencer_address: DEFAULT_SEQUENCER_ADDRESS,
         };
 
         // Write the genesis metastate using bincode serialization
@@ -1071,10 +1089,11 @@ impl CoreLaneNode {
 
         // Transactions and receipts are already in bundle state and applied via apply_changes.
 
-        // Create metastate with current EIP-1559 fee manager and total burned amount
+        // Create metastate with current EIP-1559 fee manager, total burned amount, and sequencer address
         let metastate = MetaState {
             eip1559_fee_manager: state.eip1559_fee_manager.clone(),
             total_burned_amount: state.total_burned_amount,
+            sequencer_address: state.sequencer_address,
         };
 
         // Persist metastate to disk
@@ -1278,10 +1297,12 @@ impl CoreLaneNode {
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
 
-        // Get EIP-1559 configuration for gas limit enforcement
+        // Get EIP-1559 configuration and sequencer address for this block
         let state = self.state.lock().await;
         let max_gas_limit = state.eip1559_fee_manager.max_gas_limit();
         let target_gas_usage = state.eip1559_fee_manager.target_gas_usage();
+        // Get the expected sequencer address for this block number
+        let expected_sequencer_address = state.sequencer_address;
         drop(state);
 
         // Track cumulative gas used for this block (EIP-1559 maximum enforcement)
@@ -1291,21 +1312,55 @@ impl CoreLaneNode {
         let mut bundle_state = state::BundleStateManager::new();
 
         if let Some(block_origin) = new_block_clone.block_origin {
-            debug!("🔥 Phase 1: Processing burns...");
-            let state = self.state.lock().await;
-            for burn in block_origin.burns.iter() {
-                info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
-                bundle_state.add_balance(&state.account_manager, burn.address, burn.amount)?;
-            }
-            drop(state);
-
             let mut tx_count = 0;
+
+            // Phase 1: Process single HEAD bundle by sequencer only
+            debug!("📦 Phase 1: Processing sequencer HEAD bundle...");
+
+            let mut sequencer_bundle_processed = false;
             for bundle in block_origin.bundles.iter() {
-                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
-                {
-                    // skip this bundle because it's not valid for this block
+                // Only process Head marker bundles
+                if bundle.marker != block::BundleMarker::Head {
                     continue;
                 }
+
+                // Check if valid for this block
+                if bundle.valid_for_block != u64::MAX && bundle.valid_for_block != new_block.number
+                {
+                    continue;
+                }
+
+                // Verify this bundle is signed by the sequencer
+                if let Some(_signature) = bundle.signature {
+                    match bundle.recover_signer_address() {
+                        Ok(signer) => {
+                            if signer != expected_sequencer_address {
+                                warn!(
+                                    "HEAD bundle from non-sequencer address {}, expected {}",
+                                    signer, expected_sequencer_address
+                                );
+                                continue;
+                            }
+                            info!("✅ Processing HEAD bundle from sequencer: {}", signer);
+                        }
+                        Err(e) => {
+                            error!("Failed to recover signer from HEAD bundle: {}", e);
+                            continue;
+                        }
+                    }
+                } else {
+                    warn!("Skipping unsigned HEAD bundle (expected signature from sequencer)");
+                    continue;
+                }
+
+                // Process only the first sequencer HEAD bundle
+                if sequencer_bundle_processed {
+                    warn!(
+                        "⚠️  Multiple sequencer HEAD bundles found, processing only the first one"
+                    );
+                    break;
+                }
+
                 for tx in bundle.transactions.iter() {
                     // EIP-1559: Check if adding this transaction would exceed maximum block gas limit
                     let tx_gas_limit = U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
@@ -1344,6 +1399,7 @@ impl CoreLaneNode {
                             tx_count,
                             max_gas_limit,
                             cumulative_gas_used,
+                            Some(bundle.sequencer_payment_recipient),
                         )
                         .await;
 
@@ -1376,9 +1432,113 @@ impl CoreLaneNode {
                     }
                 }
 
-                // If we've hit the maximum, stop processing remaining bundles
+                // Mark sequencer bundle as processed
+                sequencer_bundle_processed = true;
+
+                // If we've hit the maximum, stop processing
                 if cumulative_gas_used >= max_gas_limit {
                     break;
+                }
+            }
+
+            // Phase 2: Process burns
+            debug!("🔥 Phase 2: Processing burns...");
+            let state = self.state.lock().await;
+            for burn in block_origin.burns.iter() {
+                info!("🪙 Minting {} tokens to {}", burn.amount, burn.address);
+                if let Err(e) =
+                    bundle_state.add_balance(&state.account_manager, burn.address, burn.amount)
+                {
+                    error!("Failed to process burn: {}", e);
+                }
+            }
+            drop(state);
+
+            // Phase 3: Process non-sequencer bundles
+            if cumulative_gas_used < max_gas_limit {
+                debug!("📦 Phase 3: Processing non-sequencer bundles...");
+
+                for bundle in block_origin.bundles.iter() {
+                    // Skip HEAD bundles (already processed in Phase 1)
+                    if bundle.marker == block::BundleMarker::Head {
+                        continue;
+                    }
+
+                    // Check if valid for this block
+                    if bundle.valid_for_block != u64::MAX
+                        && bundle.valid_for_block != new_block.number
+                    {
+                        continue;
+                    }
+
+                    for tx in bundle.transactions.iter() {
+                        let tx_gas_limit =
+                            U256::from(alloy_consensus::Transaction::gas_limit(&tx.0));
+
+                        if cumulative_gas_used + tx_gas_limit > max_gas_limit {
+                            warn!(
+                                    "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
+                                    new_block.number,
+                                    cumulative_gas_used,
+                                    max_gas_limit,
+                                    tx_gas_limit
+                                );
+                            break;
+                        }
+
+                        if cumulative_gas_used >= target_gas_usage
+                            && cumulative_gas_used < target_gas_usage + tx_gas_limit
+                        {
+                            info!(
+                                    "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
+                                    new_block.number,
+                                    target_gas_usage,
+                                    max_gas_limit,
+                                    cumulative_gas_used
+                                );
+                        }
+
+                        let tx_result = self
+                            .process_core_lane_transaction(
+                                &mut bundle_state,
+                                tx,
+                                new_block.number,
+                                tx_count,
+                                max_gas_limit,
+                                cumulative_gas_used,
+                                Some(bundle.sequencer_payment_recipient),
+                            )
+                            .await;
+
+                        if let Some((stored_tx, receipt, tx_hash)) = tx_result {
+                            let gas_used_str = receipt.gas_used.as_str();
+                            let actual_gas_used = if let Some(hex) = gas_used_str.strip_prefix("0x")
+                            {
+                                let bytes = hex::decode(hex).unwrap_or_default();
+                                U256::from_be_slice(&bytes)
+                            } else {
+                                U256::from_str(gas_used_str).unwrap_or(tx_gas_limit)
+                            };
+
+                            cumulative_gas_used += actual_gas_used;
+                            core_lane_transactions.push((stored_tx, receipt, tx_hash));
+                            tx_count += 1;
+
+                            if cumulative_gas_used > max_gas_limit {
+                                warn!(
+                                        "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
+                                        new_block.number,
+                                        cumulative_gas_used,
+                                        max_gas_limit
+                                    );
+                                break;
+                            }
+                        }
+                    }
+
+                    if cumulative_gas_used >= max_gas_limit {
+                        break;
+                    }
                 }
             }
         }
@@ -1422,6 +1582,7 @@ impl CoreLaneNode {
         Ok(core_lane_block_number)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_core_lane_transaction(
         &self,
         bundle_state: &mut state::BundleStateManager,
@@ -1430,6 +1591,7 @@ impl CoreLaneNode {
         tx_number: u64,
         max_block_gas_limit: U256,
         cumulative_gas_used: U256,
+        sequencer_payment_recipient: Option<Address>,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
@@ -1494,18 +1656,23 @@ impl CoreLaneNode {
                 base_fee_portion, state.total_burned_amount
             );
 
-            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer
+            // ACTUAL SEQUENCER PAYMENT: Priority fee goes to sequencer_payment_recipient
+            // EIP-1559 Rule: Priority fee (max_fee_per_gas - base_fee_per_gas) goes to sequencer
+            // This incentivizes sequencers to include transactions and provides economic security
             if priority_fee_portion > U256::ZERO {
+                let sequencer_address = sequencer_payment_recipient
+                    .filter(|addr| *addr != Address::ZERO)
+                    .unwrap_or(state.sequencer_address);
                 if let Err(e) = bundle_state.add_balance(
                     &state.account_manager,
-                    state.sequencer_address,
+                    sequencer_address,
                     priority_fee_portion,
                 ) {
                     warn!("      ⚠️  Failed to pay sequencer priority fee: {}", e);
                 } else {
                     info!(
-                        "      💰 Paid sequencer priority fee: {} wei",
-                        priority_fee_portion
+                        "      💰 Paid sequencer priority fee: {} wei to {}",
+                        priority_fee_portion, sequencer_address
                     );
                 }
             }
@@ -1855,7 +2022,8 @@ impl CoreLaneNode {
                     );
                     state_mut.eip1559_fee_manager = metastate.eip1559_fee_manager;
                     state_mut.total_burned_amount = metastate.total_burned_amount;
-                    info!("✅ Restored EIP-1559 fee manager and total burned amount");
+                    state_mut.sequencer_address = metastate.sequencer_address;
+                    info!("✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address");
                 }
                 Err(e) => {
                     warn!(
