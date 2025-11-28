@@ -5,15 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "8332:8332"   # Bitcoin Cache RPC
-    command: >
-      /app/core-lane-node bitcoin-cache
-      --host 0.0.0.0
-      --port 8332
-      --cache-dir /cache
-      --bitcoin-rpc-url https://bitcoin-rpc.publicnode.com
-      --block-archive http://144.76.56.210/blocks
-      --starting-block-count 916201
-      --no-rpc-auth
+    environment:
+      - BITCOIN_UPSTREAM_RPC_URL=https://bitcoin-signet.g.alchemy.com/v2/${ALCHEMY_SIGNET_API_KEY}
+      - STARTING_BLOCK_COUNT=278860
     volumes:
       - bitcoin-cache:/cache
     networks:
@@ -28,8 +22,8 @@ services:
       - "8545:8545"   # Core Lane RPC
     environment:
       - CORE_LANE_MNEMONIC=${CORE_LANE_MNEMONIC}
-      - NETWORK=${NETWORK:-mainnet}
-      - ELECTRUM_URL=${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}
+      - NETWORK=${NETWORK:-signet}
+      - ELECTRUM_URL=${ELECTRUM_URL:-ssl://electrum.blockstream.info:60602}
     command: >
       sh -c "
       /app/core-lane-node start
@@ -40,7 +34,7 @@ services:
       --bitcoin-rpc-write-url http://bitcoin-cache:8332
       --bitcoin-rpc-write-user ${RPC_USER:-bitcoin}
       --bitcoin-rpc-write-password ${RPC_PASSWORD:-bitcoin123}
-      --start-block 916201
+      --start-block 278860
       --mnemonic \"$$CORE_LANE_MNEMONIC\"
       --electrum-url \"$$ELECTRUM_URL\"
       --http-host 0.0.0.0
