@@ -10,13 +10,12 @@ primary_region = 'cdg'
   image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
 
 [env]
-  BITCOIN_CACHE_HOST = '0.0.0.0'
-  BITCOIN_CACHE_PORT = '8332'
+  BITCOIN_CACHE_PORT = '8545' 
+  CACHE_BIND_HOST = "::"
   BITCOIN_UPSTREAM_RPC_URL = 'https://bitcoin-rpc.publicnode.com'
-  BLOCK_ARCHIVE_URL = 'http://144.76.56.210/blocks'
   CACHE_DIR = '/storage/cache'
   DATA_DIR = '/storage/data'
-  DISABLE_ARCHIVE_FETCH = 'false'
+  DISABLE_ARCHIVE_FETCH = 'true'
   ONLY_START = 'bitcoin-cache'
   RPC_PASSWORD = 'bitcoin123'
   RPC_USER = 'bitcoin'
@@ -26,33 +25,24 @@ primary_region = 'cdg'
   app = '/app/entrypoint-rpc.sh'
 
 [[mounts]]
-  source = 'core_lane_cache_storage'
+  source = 'core_lane_storage'
   destination = '/storage'
 
-[[services]]
-  protocol = 'tcp'
-  internal_port = 8332
+[http_service]
+  internal_port = 8545
+  force_https = true
+  min_machines_running = 0
   processes = ['app']
 
-
-  [services.concurrency]
-    type = 'connections'
-    hard_limit = 500
-    soft_limit = 200
-
-  [[services.tcp_checks]]
-    interval = '15s'
-    timeout = '10s'
-    grace_period = '1m0s'
-
-  [[services.http_checks]]
+  [[http_service.checks]]
     interval = '15s'
     timeout = '10s'
     grace_period = '1m0s'
     method = 'get'
     path = '/health'
     protocol = 'http'
-    tls_skip_verify = false
+
+
 
 [[vm]]
   memory = '2gb'
