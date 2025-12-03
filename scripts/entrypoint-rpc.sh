@@ -20,6 +20,11 @@ CACHE_DIR="${CACHE_DIR:-/cache}"
 ELECTRUM_URL="${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}"
 CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC:-}"
 
+# Derived node configuration
+CHAIN_ID="${CHAIN_ID:-}"
+DERIVED_DA_ADDRESS="${DERIVED_DA_ADDRESS:-}"
+START_BLOCK="${START_BLOCK:-0}"
+
 
 # S3 configuration for uploading cached blocks to S3 storage
 DISABLE_ARCHIVE_FETCH="${DISABLE_ARCHIVE_FETCH:-false}"
@@ -221,6 +226,36 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "core-lane" ]; then
     fi
   fi
 fi
+
+# derive node mode
+if [ "$ONLY_START" = "derive-node" ]; then
+  # Validate required environment variables for derive-node
+  if [ -z "${CHAIN_ID:-}" ] || [ -z "${DERIVED_DA_ADDRESS:-}" ]; then
+    echo "[entrypoint] ERROR: CHAIN_ID and DERIVED_DA_ADDRESS must be set for derive-node mode"
+    exit 1
+  fi
+
+  echo "[entrypoint] starting derive-node on ${HTTP_HOST}:${HTTP_PORT}"
+  CORE_RPC_URL="${CORE_RPC_URL:-https://rpc.lanelayer.com}"
+  "/app/core-lane-node" derived-start \
+    --core-rpc-url "${CORE_RPC_URL}" \
+    --chain-id "${CHAIN_ID}" \
+    --derived-da-address "${DERIVED_DA_ADDRESS}" \
+    --start-block "${START_BLOCK}" \
+    --http-host "${HTTP_HOST}" \
+    --http-port "${HTTP_PORT}" &
+  DERIVE_NODE_PID=$!
+  child_pids+=("$DERIVE_NODE_PID")
+
+  echo "[entrypoint] waiting for derive-node to be ready on ${HTTP_HOST}:${HTTP_PORT}..."
+  if ! wait_for_service "${HTTP_HOST}" "${HTTP_PORT}" 60 "${DERIVE_NODE_PID}"; then
+    echo "[entrypoint] WARNING: derive-node did not become ready, but process is still running"
+  else
+    echo "[entrypoint] derive-node is ready!"
+  fi
+fi
+
+
 
 # Monitor child processes and handle exits gracefully
 set +e

@@ -1,27 +1,27 @@
-# fly.toml app configuration file generated for core-lane-rpc on 2025-11-17T09:30:08+01:00
+# fly.toml app configuration file for core-lane-derived (derived mode)
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'core-lane-rpc'
+
+app = 'core-lane-derived'
 primary_region = 'cdg'
 
 [build]
   image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
 
 [env]
-  BITCOIN_CACHE_HOST = 'bitcoin-cache.internal'
-  BITCOIN_CACHE_PORT = '8545'
-  DATA_DIR = '/data'
-  ELECTRUM_URL = 'ssl://electrum.blockstream.info:50002'
+  # Derived mode specific configuration
+  ONLY_START = 'derive-node'
   HTTP_PORT = '8545'
-  NETWORK = 'mainnet'
-  ONLY_START = 'core-lane'
-
-  
+  HTTP_HOST = '0.0.0.0'
+  CORE_RPC_URL = 'https://rpc.lanelayer.com'
+  CHAIN_ID = '1281453634'
+  DERIVED_DA_ADDRESS = '0x0000000000000000000000000000000000000000'
+  START_BLOCK = '0'
 
 [[mounts]]
-  source = 'core_lane_storage'
+  source = 'core_lane_derived_storage'
   destination = '/data'
 
 [http_service]
@@ -42,3 +42,4 @@ primary_region = 'cdg'
   memory = '2gb'
   cpu_kind = 'shared'
   cpus = 2
+
