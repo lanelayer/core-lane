@@ -3,7 +3,7 @@
 # Quick test script for derived lane
 # This script walks you through testing the derived lane step by step
 
-set -e
+#set -e
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -16,6 +16,7 @@ DERIVED_LANE_RPC="http://127.0.0.1:9545"
 CHAIN_ID=1281453634
 BURN_ADDRESS="0x0000000000000000000000000000000000000666"
 ANVIL_PK="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+TEST_RECIPIENT_PK="0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
 TEST_RECIPIENT="0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
 
 print_step() {
@@ -116,7 +117,7 @@ if [ "$NEW_BALANCE" != "$INITIAL_BALANCE" ] && [ "$NEW_BALANCE" -gt 0 ]; then
     TRANSFER_RESULT=$(cast send "$TRANSFER_RECIPIENT" \
         --rpc-url "$DERIVED_LANE_RPC" \
         --chain-id "$CHAIN_ID" \
-        --private-key "$ANVIL_PK" \
+        --private-key "$TEST_RECIPIENT_PK" \
         --value "$TRANSFER_AMOUNT" 2>&1)
     
     if echo "$TRANSFER_RESULT" | grep -q "transactionHash\|txHash"; then

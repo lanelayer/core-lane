@@ -51,3 +51,4 @@ bdk_wallet = { version = "2.2.0", features = ["keys-bip39", "rusqlite"] }
 bdk_bitcoind_rpc = "0.22.0"
 bdk_electrum = { version = "0.23.0", features = ["use-openssl"] }
 cartesi-machine = { git = "https://github.com/lanelayer/cm-rust-bindings", rev = "80aa8ef3c76ca768c546b035a23524f72e948d47", features = ["download_uarch"] }
+alloy-network = "1.0.27"

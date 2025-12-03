@@ -1,10 +1,11 @@
 use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
+use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
-
+use alloy_signer_local::PrivateKeySigner;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
@@ -524,7 +525,13 @@ impl RpcServer {
         let url = core_rpc_url
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid core_rpc_url '{}': {}", core_rpc_url, e))?;
-        let provider = ProviderBuilder::new().connect_http(url);
+
+        let privkey_hex = std::env::var("CORE_LANE_DA_PRIVATE_KEY")
+            .map_err(|e| anyhow::anyhow!("CORE_LANE_DA_PRIVATE_KEY env var not set: {}", e))?;
+        let signer = PrivateKeySigner::from_str(&privkey_hex)
+            .map_err(|e| anyhow::anyhow!("Invalid CORE_LANE_DA_PRIVATE_KEY: {}", e))?;
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(url);
 
         let upstream_hash = provider
             .send_transaction(tx_request)
