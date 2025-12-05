@@ -5,10 +5,6 @@ use crate::intents::{
 };
 use crate::state::BundleStateManager;
 use crate::state::StateManager;
-use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
-use cartesi_machine::config::runtime::RuntimeConfig;
-use cartesi_machine::types::cmio::CmioResponseReason;
-
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
@@ -16,14 +12,19 @@ use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::Client;
 use bitcoincore_rpc::RpcApi;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
 use cartesi_machine::types::cmio::AutomaticReason;
 use cartesi_machine::types::cmio::CmioRequest;
+use cartesi_machine::types::cmio::CmioResponseReason;
 use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
+use reqwest::Client as RequestClient;
 use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+const INPUT_MEMORY_ADDRESS: u64 = 0x80300000;
 
 alloy_sol_types::sol! {
     #[derive(Debug)]
@@ -88,6 +89,13 @@ impl CoreLaneAddresses {
         Address::from([
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x45,
+        ])
+    }
+
+    pub fn cartesi_http_runner() -> Address {
+        Address::from([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x42,
         ])
     }
 }
@@ -220,6 +228,11 @@ fn execute_transfer<T: ProcessingContext>(
             });
         }
     };
+
+    if to == CoreLaneAddresses::cartesi_http_runner() {
+        let input = Bytes::from(get_transaction_input_bytes(tx));
+        return execute_cartesi_http_runner(input, gas_used, state);
+    }
 
     if to == CoreLaneAddresses::exit_marketplace() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
@@ -1119,6 +1132,222 @@ fn execute_transfer<T: ProcessingContext>(
         )],
         error: None,
     })
+}
+
+fn run_machine_loop(machine: &mut Machine) -> Result<(Vec<u8>, bool)> {
+    let mut machine_output = Vec::new();
+    let mut execution_success = false;
+
+    loop {
+        let reason = machine.run(u64::MAX)?;
+        if reason == 1 {
+            break;
+        }
+
+        match machine.receive_cmio_request() {
+            Ok(req) => {
+                let data = match req {
+                    CmioRequest::Automatic(AutomaticReason::TxOutput { data }) => data,
+                    CmioRequest::Manual(ManualReason::GIO { data, .. }) => data,
+                    _ => {
+                        let _ = machine.send_cmio_response(CmioResponseReason::Advance, &[]);
+                        continue;
+                    }
+                };
+
+                if let Ok(msg) = CmioMessage::from_bytes(&data) {
+                    match msg {
+                        CmioMessage::HttpRequest {
+                            url,
+                            method,
+                            headers,
+                            body,
+                        } => {
+                            info!(
+                                "Machine requested HTTP {} to {} ({} bytes body)",
+                                method,
+                                url,
+                                body.len()
+                            );
+
+                            let target_url = url.clone();
+
+                            let (status, response_body, _error_msg) =
+                                tokio::task::block_in_place(|| {
+                                    make_http_request_for_machine(
+                                        &target_url,
+                                        &method,
+                                        &headers,
+                                        &body,
+                                    )
+                                });
+
+                            info!(
+                                "HTTP response received: status={}, body_len={}",
+                                status,
+                                response_body.len()
+                            );
+
+                            machine_output = response_body.clone();
+                            execution_success = status == 200;
+
+                            let http_response = CmioMessage::HttpResponse {
+                                status,
+                                body: response_body,
+                            };
+
+                            let resp_bytes = http_response.to_bytes().unwrap_or_default();
+                            machine.send_cmio_response(CmioResponseReason::Advance, &resp_bytes)?;
+                        }
+                        CmioMessage::Log { message } => {
+                            info!(target: "cmio", "CM LOG: {}", message);
+                            machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                        }
+                        CmioMessage::Exit { code } => {
+                            info!("Machine exited with code: {}", code);
+                            execution_success = code == 0;
+                            if machine_output.is_empty() {
+                                machine_output = format!("Exit code: {}", code).into_bytes();
+                            }
+                            break;
+                        }
+                        _ => {
+                            machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                        }
+                    }
+                } else {
+                    machine.send_cmio_response(CmioResponseReason::Advance, &[])?;
+                    continue;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Ok((machine_output, execution_success))
+}
+
+fn execute_cartesi_http_runner<T: ProcessingContext>(
+    input: Bytes,
+    gas_used: U256,
+    _state: &mut T,
+) -> Result<ExecutionResult> {
+    let http_service_url = std::env::var("LANELAYER_HTTP_SERVICE_URL").map_err(|_| {
+        anyhow::anyhow!(
+            "LANELAYER_HTTP_SERVICE_URL environment variable not set. \
+            Please set it before starting the node: \
+            export LANELAYER_HTTP_SERVICE_URL=http://localhost:8080/submit"
+        )
+    })?;
+
+    info!(
+        "Calling LaneLayer HTTP service at {} with {} bytes of input",
+        http_service_url,
+        input.len()
+    );
+
+    let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
+
+    info!("Loading Cartesi machine from snapshot: {}", snapshot_path);
+    let mut machine = Machine::load(
+        std::path::Path::new(&snapshot_path),
+        &RuntimeConfig::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load machine snapshot: {}", e))?;
+
+    info!(
+        "Writing {} bytes of transaction input to machine memory at 0x{:x}",
+        input.len(),
+        INPUT_MEMORY_ADDRESS
+    );
+    machine.write_memory(INPUT_MEMORY_ADDRESS, input.as_ref())?;
+
+    let (machine_output, execution_success) = run_machine_loop(&mut machine)?;
+
+    let output_len = machine_output.len();
+
+    Ok(ExecutionResult {
+        success: execution_success,
+        gas_used,
+        gas_refund: U256::ZERO,
+        output: Bytes::from(machine_output),
+        logs: vec![format!(
+            "Cartesi machine executed: success={}, output_len={}",
+            execution_success, output_len
+        )],
+        error: if execution_success {
+            None
+        } else {
+            Some("Machine execution failed or exited with non-zero code".to_string())
+        },
+    })
+}
+
+fn make_http_request_for_machine(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, Vec<u8>, Option<String>) {
+    let base = url.split('/').take(3).collect::<Vec<_>>().join("/");
+    let submit_url = format!("{}/submit", base);
+
+    info!(
+        "Forwarding machine HTTP request ({} {}) as POST to {}",
+        method, url, submit_url
+    );
+
+    let client = match RequestClient::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            warn!("Failed to create HTTP client: {}", e);
+            return (
+                0,
+                Vec::new(),
+                Some(format!("Failed to create HTTP client: {}", e)),
+            );
+        }
+    };
+
+    let handle = tokio::runtime::Handle::current();
+    let mut request = client.post(&submit_url);
+
+    for (key, value) in headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+
+    let request = request.body(body.to_vec());
+
+    match handle.block_on(request.send()) {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            match handle.block_on(response.bytes()) {
+                Ok(body_bytes) => {
+                    info!(
+                        "HTTP request successful: status={}, response_len={}",
+                        status,
+                        body_bytes.len()
+                    );
+                    (status, body_bytes.to_vec(), None)
+                }
+                Err(e) => {
+                    warn!("Failed to read HTTP response body: {}", e);
+                    (
+                        status,
+                        Vec::new(),
+                        Some(format!("Failed to read response body: {}", e)),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            warn!("HTTP request failed: {}", e);
+            (0, Vec::new(), Some(format!("HTTP request error: {}", e)))
+        }
+    }
 }
 
 fn eip712_digest(domain: &Eip712Domain, intent: &[u8], nonce: U256, value: U256) -> B256 {

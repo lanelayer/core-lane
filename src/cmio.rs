@@ -44,6 +44,16 @@ pub enum CmioMessage {
     Exit {
         code: u32,
     },
+    HttpRequest {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    HttpResponse {
+        status: u16,
+        body: Vec<u8>,
+    },
 }
 
 impl CmioMessage {
