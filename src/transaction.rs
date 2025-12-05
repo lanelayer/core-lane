@@ -5,10 +5,6 @@ use crate::intents::{
 };
 use crate::state::BundleStateManager;
 use crate::state::StateManager;
-use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
-use cartesi_machine::config::runtime::RuntimeConfig;
-use cartesi_machine::types::cmio::CmioResponseReason;
-
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
@@ -16,14 +12,48 @@ use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
 use bitcoincore_rpc::Client;
 use bitcoincore_rpc::RpcApi;
+use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+use cartesi_machine::config::runtime::RuntimeConfig;
 use cartesi_machine::types::cmio::AutomaticReason;
 use cartesi_machine::types::cmio::CmioRequest;
+use cartesi_machine::types::cmio::CmioResponseReason;
 use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
+use runner::http_client::start_health_check;
+use runner::http_health_check_client::add_http_health_check_client;
+use runner::http_server::add_http_server;
+use runner::utils::RunnerState;
+use runner::webhook_delivery::{add_webhook_delivery_service, Submission};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+fn build_submission_from_input(input: &Bytes) -> Submission {
+    Submission {
+        tx_hash: None,
+        intent_id: None,
+        user: "core-lane".to_string(),
+        action: "execute".to_string(),
+        params: Some({
+            let mut params = HashMap::new();
+            params.insert(
+                "input".to_string(),
+                serde_json::Value::String(hex::encode(input.as_ref())),
+            );
+            params
+        }),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string(),
+        block_height: None,
+        confirmations: None,
+    }
+}
 
 alloy_sol_types::sol! {
     #[derive(Debug)]
@@ -88,6 +118,13 @@ impl CoreLaneAddresses {
         Address::from([
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x45,
+        ])
+    }
+
+    pub fn cartesi_http_runner() -> Address {
+        Address::from([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x42,
         ])
     }
 }
@@ -220,6 +257,14 @@ fn execute_transfer<T: ProcessingContext>(
             });
         }
     };
+
+    if to == CoreLaneAddresses::cartesi_http_runner() {
+        let input = Bytes::from(get_transaction_input_bytes(tx));
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(execute_cartesi_http_runner(input, gas_used, state))
+        });
+    }
 
     if to == CoreLaneAddresses::exit_marketplace() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
@@ -1118,6 +1163,155 @@ fn execute_transfer<T: ProcessingContext>(
             value, sender, to
         )],
         error: None,
+    })
+}
+
+async fn execute_cartesi_http_runner<T: ProcessingContext>(
+    input: Bytes,
+    gas_used: U256,
+    _state: &mut T,
+) -> Result<ExecutionResult> {
+    let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
+
+    let machine = Mutex::new(Machine::load(
+        std::path::Path::new(&snapshot_path),
+        &RuntimeConfig::default(),
+    )?);
+
+    let state = Arc::new(Mutex::new(RunnerState::new()));
+
+    const GUEST_CID: u32 = 1;
+    const CONTAINER_PORT: u32 = 8080;
+    const HTTP_CLIENT_PORT: u32 = 9002;
+
+    let (mut health_check_receiver, mut submit_done_receiver) = {
+        let mut state_guard = state.lock().await;
+        add_http_server(&mut state_guard);
+        let health_rx: tokio::sync::mpsc::Receiver<bool> =
+            add_http_health_check_client(&mut state_guard, 9000, 10);
+        let submit_done_rx = add_webhook_delivery_service(&mut state_guard, HTTP_CLIENT_PORT, 3);
+        (health_rx, submit_done_rx)
+    };
+
+    {
+        let mut state_guard = state.lock().await;
+        start_health_check(&mut state_guard, 9000, 1, CONTAINER_PORT).unwrap();
+    }
+
+    let state_for_loop = Arc::clone(&state);
+
+    let machine_loop_fut = {
+        let state = state_for_loop.clone();
+        async move {
+            info!("Starting machine loop with shared state...");
+            match runner::utils::run_machine_loop(machine.into(), state).await {
+                Ok(_) => info!("Machine loop completed."),
+                Err(e) => eprintln!("Machine loop failed: {}", e),
+            }
+        }
+    };
+
+    let state_for_webhook = Arc::clone(&state);
+    let submission = build_submission_from_input(&input);
+
+    let health_check_and_webhook_fut = async move {
+        info!("Waiting for health check to succeed...");
+        let health_check_result = health_check_receiver.recv().await;
+        if let Some(true) = health_check_result {
+            info!("Health check succeeded! Proceeding with webhook submission...");
+        } else {
+            info!("Health check failed, skipping webhook submission...");
+            return;
+        }
+
+        let body = match serde_json::to_vec(&submission) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed to serialize submission: {}", e);
+                return;
+            }
+        };
+
+        {
+            let mut state_guard = state_for_webhook.lock().await;
+            info!("Queueing webhook submission...");
+            if let Some(client) = state_guard.get_client(HTTP_CLIENT_PORT) {
+                info!("Client found on port {}", HTTP_CLIENT_PORT);
+                client.queue_post_request(
+                    HTTP_CLIENT_PORT,
+                    "/submit".to_string(),
+                    "localhost:8080".to_string(),
+                    body,
+                    "application/json".to_string(),
+                );
+                if let Err(e) =
+                    state_guard.initiate_connection(HTTP_CLIENT_PORT, GUEST_CID, CONTAINER_PORT)
+                {
+                    info!("Failed to initiate webhook connection: {}", e);
+                    eprintln!("Failed to initiate webhook connection: {}", e);
+                    return;
+                } else {
+                    info!("Initiated webhook connection");
+                }
+            } else {
+                info!(
+                    "Webhook delivery client not found on port {}",
+                    HTTP_CLIENT_PORT
+                );
+                return;
+            }
+        }
+
+        info!("Waiting for webhook submission response...");
+        if let Some(done) = submit_done_receiver.recv().await {
+            info!("Webhook submission completed: {}", done);
+        }
+    };
+
+    tokio::select! {
+        _ = machine_loop_fut => {
+            info!("Machine loop completed (unexpected)");
+        }
+        _ = health_check_and_webhook_fut => {
+            info!("Health check and webhook flow completed, machine loop was running in background");
+        }
+    };
+
+    let state_clone = Arc::clone(&state);
+
+    let (machine_output, execution_success) = {
+        let mut state_guard = state_clone.lock().await;
+        if let Some(http_client) = state_guard.get_client(HTTP_CLIENT_PORT) {
+            if let Some(response_data) = http_client.get_write_data(HTTP_CLIENT_PORT) {
+                info!(
+                    "Retrieved HTTP response from client: {} bytes",
+                    response_data.len()
+                );
+                (response_data, true)
+            } else {
+                (Vec::new(), true)
+            }
+        } else {
+            return Err(anyhow::anyhow!("HTTP client not found in state"));
+        }
+    };
+
+    let output_len = machine_output.len();
+
+    Ok(ExecutionResult {
+        success: execution_success,
+        gas_used,
+        gas_refund: U256::ZERO,
+        output: Bytes::from(machine_output),
+        logs: vec![format!(
+            "Cartesi machine executed: success={}, output_len={}",
+            execution_success, output_len
+        )],
+        error: if execution_success {
+            None
+        } else {
+            Some("Machine execution failed or exited with non-zero code".to_string())
+        },
     })
 }
 

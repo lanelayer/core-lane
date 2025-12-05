@@ -45,10 +45,11 @@ ciborium = "0.2"
 bs58 = "0.5"
 bincode = "1.3"
 borsh = { version = "1.5", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 rust-s3 = { version = "0.33", features = ["tokio"] }
 bdk_wallet = { version = "2.2.0", features = ["keys-bip39", "rusqlite"] }
 bdk_bitcoind_rpc = "0.22.0"
 bdk_electrum = { version = "0.23.0", features = ["use-openssl"] }
 cartesi-machine = { git = "https://github.com/lanelayer/cm-rust-bindings", rev = "80aa8ef3c76ca768c546b035a23524f72e948d47", features = ["download_uarch"] }
 alloy-network = "1.0.27"
+runner = { git = "https://github.com/lanelayer/cli", rev = "2428f24bcc275bd4767f9367ffca0363a8ded11b", package = "runner" }
