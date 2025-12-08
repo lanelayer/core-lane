@@ -3,6 +3,8 @@ set -euo pipefail
 
 
 # Defaults for bitcoin-cache and core-lane RPC
+# Initialize ONLY_START to prevent "unbound variable" errors with set -u
+: "${ONLY_START:=}"
 BITCOIN_CACHE_HOST="${BITCOIN_CACHE_HOST:-127.0.0.1}"
 BITCOIN_CACHE_PORT="${BITCOIN_CACHE_PORT:-8332}"
 BITCOIN_UPSTREAM_RPC_URL="${BITCOIN_UPSTREAM_RPC_URL:-https://bitcoin-rpc.publicnode.com}"
@@ -116,7 +118,7 @@ wait_for_service() {
 }
 
 
-if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
+if [ -z "${ONLY_START:-}" ] || [ "${ONLY_START:-}" = "bitcoin-cache" ]; then
   disable_archive_flag=()
   disable_archive_fetch_normalized="${DISABLE_ARCHIVE_FETCH,,}"
   if [ "$disable_archive_fetch_normalized" = "true" ] || [ "$disable_archive_fetch_normalized" = "1" ]; then
@@ -147,88 +149,86 @@ if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "bitcoin-cache" ]; then
   
   # Wait for bitcoin-cache to be ready before starting core-lane
   # Use 127.0.0.1 when checking locally (same container), BITCOIN_CACHE_HOST is for remote connections
-  if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" != "bitcoin-cache" ]; then
+  if [ -z "${ONLY_START:-}" ] || [ "${ONLY_START:-}" != "bitcoin-cache" ]; then
     if ! wait_for_service "127.0.0.1" "${BITCOIN_CACHE_PORT}" 30 "${BITCOIN_CACHE_PID}"; then
       echo "[entrypoint] Failed to wait for bitcoin-cache, but continuing anyway..."
     fi
   fi
 fi
 
-if [ -z "${ONLY_START:-}" ] || [ "$ONLY_START" = "core-lane" ]; then
-  # Wait for bitcoin-cache service to be available before starting core-lane
-  # This is especially important when running in separate Fly.io apps
-  if [ -n "${BITCOIN_CACHE_HOST:-}" ] && [ "${BITCOIN_CACHE_HOST}" != "127.0.0.1" ] && [ "${BITCOIN_CACHE_HOST}" != "localhost" ]; then
-    echo "[entrypoint] Waiting for bitcoin-cache service at ${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT} to be available..."
-    if ! wait_for_service "${BITCOIN_CACHE_HOST}" "${BITCOIN_CACHE_PORT}" 120; then
-      echo "[entrypoint] WARNING: bitcoin-cache service not available, but continuing to start core-lane..."
+if [ -z "${ONLY_START:-}" ] || [ "${ONLY_START:-}" = "core-lane" ]; then
+  # Check if mnemonic is required
+  if [ -z "${CORE_LANE_MNEMONIC:-}" ]; then
+    if [ "${ONLY_START:-}" = "core-lane" ]; then
+      echo "[entrypoint] ERROR: CORE_LANE_MNEMONIC is required when ONLY_START=core-lane"
+      exit 1
     else
-      echo "[entrypoint] bitcoin-cache service is ready!"
+      echo "[entrypoint] WARNING: CORE_LANE_MNEMONIC not set, skipping core-lane startup"
     fi
-  fi
-  
-  echo "[entrypoint] starting core-lane RPC on ${HTTP_HOST}:${HTTP_PORT}"
-  CORE_LANE_PID=""
-  if [ -n "${CORE_LANE_MNEMONIC}" ]; then
+  else
+    # Wait for bitcoin-cache service to be available before starting core-lane
+    # This is especially important when running in separate Fly.io apps
+    if [ -n "${BITCOIN_CACHE_HOST:-}" ] && [ "${BITCOIN_CACHE_HOST}" != "127.0.0.1" ] && [ "${BITCOIN_CACHE_HOST}" != "localhost" ]; then
+      echo "[entrypoint] Waiting for bitcoin-cache service at ${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT} to be available..."
+      if ! wait_for_service "${BITCOIN_CACHE_HOST}" "${BITCOIN_CACHE_PORT}" 120; then
+        echo "[entrypoint] WARNING: bitcoin-cache service not available, but continuing to start core-lane..."
+      else
+        echo "[entrypoint] bitcoin-cache service is ready!"
+      fi
+    fi
+    
+    echo "[entrypoint] starting core-lane RPC on ${HTTP_HOST}:${HTTP_PORT}"
+    CORE_LANE_PID=""
+    # This prevents the mnemonic from appearing in process listings and shell history
+    CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC}" \
     "/app/core-lane-node" start \
       --data-dir "${DATA_DIR}" \
       --bitcoin-rpc-read-url "http://${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}" \
       --bitcoin-rpc-read-user "${RPC_USER}" \
       --bitcoin-rpc-read-password "${RPC_PASSWORD}" \
       --start-block "${STARTING_BLOCK_COUNT}" \
-      --mnemonic "${CORE_LANE_MNEMONIC}" \
       --electrum-url "${ELECTRUM_URL}" \
       --http-host "${HTTP_HOST}" \
       --http-port "${HTTP_PORT}" &
     CORE_LANE_PID=$!
-  else
-    "/app/core-lane-node" start \
-      --data-dir "${DATA_DIR}" \
-      --bitcoin-rpc-read-url "http://${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}" \
-      --bitcoin-rpc-read-user "${RPC_USER}" \
-      --bitcoin-rpc-read-password "${RPC_PASSWORD}" \
-      --start-block "${STARTING_BLOCK_COUNT}" \
-      --electrum-url "${ELECTRUM_URL}" \
-      --http-host "${HTTP_HOST}" \
-      --http-port "${HTTP_PORT}" &
-    CORE_LANE_PID=$!
-  fi
-  child_pids+=("$CORE_LANE_PID")
-  
-  # Wait a moment and verify core-lane started successfully
-  sleep 2
-  if ! kill -0 "$CORE_LANE_PID" 2>/dev/null; then
-    echo "[entrypoint] ERROR: core-lane process ${CORE_LANE_PID} exited immediately after start!"
-    wait "$CORE_LANE_PID" 2>/dev/null || true
-    exit_status=$?
-    echo "[entrypoint] core-lane exit status: ${exit_status}"
-    # Don't exit here - let bitcoin-cache keep running if ONLY_START is not set
-    if [ -z "${ONLY_START:-}" ]; then
-      echo "[entrypoint] Continuing with bitcoin-cache only..."
-      # Remove from child_pids so we don't wait for it
-      remaining_pids=()
-      for pid in "${child_pids[@]}"; do
-        if [ "$pid" != "$CORE_LANE_PID" ]; then
-          remaining_pids+=("$pid")
-        fi
-      done
-      child_pids=("${remaining_pids[@]}")
+    child_pids+=("$CORE_LANE_PID")
+    
+    # Wait a moment and verify core-lane started successfully
+    sleep 2
+    if ! kill -0 "$CORE_LANE_PID" 2>/dev/null; then
+      echo "[entrypoint] ERROR: core-lane process ${CORE_LANE_PID} exited immediately after start!"
+      wait "$CORE_LANE_PID" 2>/dev/null || true
+      exit_status=$?
+      echo "[entrypoint] core-lane exit status: ${exit_status}"
+      # Don't exit here - let bitcoin-cache keep running if ONLY_START is not set
+      if [ -z "${ONLY_START:-}" ]; then
+        echo "[entrypoint] Continuing with bitcoin-cache only..."
+        # Remove from child_pids so we don't wait for it
+        remaining_pids=()
+        for pid in "${child_pids[@]}"; do
+          if [ "$pid" != "$CORE_LANE_PID" ]; then
+            remaining_pids+=("$pid")
+          fi
+        done
+        child_pids=("${remaining_pids[@]}")
+      else
+        echo "[entrypoint] ONLY_START=core-lane was set, exiting..."
+        exit "$exit_status"
+      fi
     else
-      echo "[entrypoint] ONLY_START=core-lane was set, exiting..."
-      exit "$exit_status"
-    fi
-  else
-    # Wait for core-lane HTTP server to be ready
-    echo "[entrypoint] Waiting for core-lane RPC server to be ready on ${HTTP_HOST}:${HTTP_PORT}..."
-    if ! wait_for_service "${HTTP_HOST}" "${HTTP_PORT}" 60 "${CORE_LANE_PID}"; then
-      echo "[entrypoint] WARNING: core-lane RPC server did not become ready, but process is still running"
-    else
-      echo "[entrypoint] core-lane RPC server is ready!"
+      # Wait for core-lane HTTP server to be ready
+      echo "[entrypoint] Waiting for core-lane RPC server to be ready on ${HTTP_HOST}:${HTTP_PORT}..."
+      if ! wait_for_service "${HTTP_HOST}" "${HTTP_PORT}" 60 "${CORE_LANE_PID}"; then
+        echo "[entrypoint] WARNING: core-lane RPC server did not become ready, but process is still running"
+      else
+        echo "[entrypoint] core-lane RPC server is ready!"
+      fi
     fi
   fi
 fi
 
 # derive node mode
-if [ "$ONLY_START" = "derive-node" ]; then
+if [ "${ONLY_START:-}" = "derive-node" ]; then
   # Validate required environment variables for derive-node
   if [ -z "${CHAIN_ID:-}" ] || [ -z "${DERIVED_DA_ADDRESS:-}" ]; then
     echo "[entrypoint] ERROR: CHAIN_ID and DERIVED_DA_ADDRESS must be set for derive-node mode"
