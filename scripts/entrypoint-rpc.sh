@@ -21,6 +21,7 @@ CACHE_DIR="${CACHE_DIR:-/cache}"
 
 ELECTRUM_URL="${ELECTRUM_URL:-ssl://electrum.blockstream.info:50002}"
 CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC:-}"
+NETWORK="${NETWORK:-mainnet}"
 
 # Derived node configuration
 CHAIN_ID="${CHAIN_ID:-}"
@@ -166,6 +167,17 @@ if [ -z "${ONLY_START:-}" ] || [ "${ONLY_START:-}" = "core-lane" ]; then
       echo "[entrypoint] WARNING: CORE_LANE_MNEMONIC not set, skipping core-lane startup"
     fi
   else
+    # Ensure wallet exists before starting RPC (creates wallet_<network>.sqlite3 in DATA_DIR)
+    echo "[entrypoint] ensuring wallet database exists for network ${NETWORK} in ${DATA_DIR}"
+    if ! CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC}" NETWORK="${NETWORK}" \
+      "/app/core-lane-node" get-address \
+      --network "${NETWORK}" \
+      --data-dir "${DATA_DIR}" >/tmp/core-lane-get-address.log 2>&1; then
+      echo "[entrypoint] WARNING: failed to create wallet during startup; see /tmp/core-lane-get-address.log"
+    else
+      echo "[entrypoint] wallet ready (see /tmp/core-lane-get-address.log for details)"
+    fi
+
     # Wait for bitcoin-cache service to be available before starting core-lane
     # This is especially important when running in separate Fly.io apps
     if [ -n "${BITCOIN_CACHE_HOST:-}" ] && [ "${BITCOIN_CACHE_HOST}" != "127.0.0.1" ] && [ "${BITCOIN_CACHE_HOST}" != "localhost" ]; then
