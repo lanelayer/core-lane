@@ -38,6 +38,10 @@ primary_region = 'cdg'
     path = '/health'
     protocol = 'http'
 
+[[files]] 
+local_path = "vc-cm-snapshot.squashfs"
+guest_path = "/data/vc-cm-snapshot.squashfs"
+
 [[vm]]
   memory = '2gb'
   cpu_kind = 'shared'

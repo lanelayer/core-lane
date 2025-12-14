@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     libudev1 \
     ca-certificates \
+    squashfs-tools \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
