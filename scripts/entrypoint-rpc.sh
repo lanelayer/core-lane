@@ -247,9 +247,34 @@ if [ "${ONLY_START:-}" = "derive-node" ]; then
     exit 1
   fi
 
+  if [ -f "${DATA_DIR}/vc-cm-snapshot.squashfs" ]; then
+    VC_CM_SNAPSHOT_FILE="${DATA_DIR}/vc-cm-snapshot.squashfs"
+  else if [ -f "/vc-cm-snapshot.squashfs" ]; then
+    VC_CM_SNAPSHOT_FILE="/vc-cm-snapshot.squashfs"
+  else
+    echo "[entrypoint] ERROR: vc-cm-snapshot.squashfs not found"
+    exit 1
+  fi
+
+    echo "[entrypoint] mounting vc-cm-snapshot.squashfs from ${DATA_DIR}"
+    mkdir -p "${DATA_DIR}/vc-cm-snapshot"
+    # mount -o loop won't work in docker but it'll work in fly.io
+    
+    if mount -t squashfs -o loop "${VC_CM_SNAPSHOT_FILE}" "${DATA_DIR}/vc-cm-snapshot"; then
+      echo "[entrypoint] Successfully mounted vc-cm-snapshot.squashfs using mount"
+    elif unsquashfs -f -d "${DATA_DIR}/vc-cm-snapshot" "${VC_CM_SNAPSHOT_FILE}"; then
+      echo "[entrypoint] Successfully extracted vc-cm-snapshot.squashfs using unsquashfs"
+    else
+      echo "[entrypoint] WARNING: failed to use vc-cm-snapshot.squashfs"
+      exit 1
+    fi
+  fi
+
   echo "[entrypoint] starting derive-node on ${HTTP_HOST}:${HTTP_PORT}"
+  export LANE_LAYER_SNAPSHOT_DIR="${DATA_DIR}/vc-cm-snapshot"
   CORE_RPC_URL="${CORE_RPC_URL:-https://rpc.lanelayer.com}"
   "/app/core-lane-node" derived-start \
+    --data-dir "${DATA_DIR}" \
     --core-rpc-url "${CORE_RPC_URL}" \
     --chain-id "${CHAIN_ID}" \
     --derived-da-address "${DERIVED_DA_ADDRESS}" \
