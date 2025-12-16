@@ -6,4 +6,4 @@ This is an early implementation. The architecture and APIs may change significan
 
 ## License
 
-All rights reserved for now
+Apache License v2.0
