@@ -87,6 +87,7 @@ pub struct StateManager {
     intents: BTreeMap<B256, Intent>,
     transactions: Vec<StoredTransaction>,
     transaction_receipts: BTreeMap<String, TransactionReceipt>,
+    kv_store: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize, Default)]
@@ -96,6 +97,7 @@ pub struct BundleStateManager {
     pub intents: BTreeMap<B256, Intent>,
     pub transactions: Vec<StoredTransaction>,
     pub transaction_receipts: BTreeMap<String, TransactionReceipt>,
+    pub kv_store: BTreeMap<String, Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -280,6 +282,26 @@ impl BundleStateManager {
         borsh::from_slice(bytes)
             .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize BundleStateManager: {}", e))
     }
+
+    pub fn kv_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.kv_store.get(key).cloned()
+    }
+
+    pub fn kv_put(&mut self, key: String, value: Vec<u8>) {
+        self.kv_store.insert(key, value);
+    }
+
+    pub fn kv_delete(&mut self, key: &str) -> bool {
+        self.kv_store.remove(key).is_some()
+    }
+
+    pub fn kv_contains(&self, key: &str) -> bool {
+        self.kv_store.contains_key(key)
+    }
+
+    pub fn kv_keys(&self) -> Vec<String> {
+        self.kv_store.keys().cloned().collect()
+    }
 }
 
 impl StateManager {
@@ -344,6 +366,27 @@ impl StateManager {
             .map(|acc| acc.nonce)
             .unwrap_or(U256::ZERO)
     }
+
+    pub fn kv_keys(&self) -> Vec<String> {
+        self.kv_store.keys().cloned().collect()
+    }
+
+    pub fn kv_get(&self, key: &str) -> Option<Vec<u8>> {
+        self.kv_store.get(key).cloned()
+    }
+
+    pub fn kv_put(&mut self, key: String, value: Vec<u8>) {
+        self.kv_store.insert(key, value);
+    }
+
+    pub fn kv_delete(&mut self, key: &str) -> bool {
+        self.kv_store.remove(key).is_some()
+    }
+
+    pub fn kv_contains(&self, key: &str) -> bool {
+        self.kv_store.contains_key(key)
+    }
+
     pub fn apply_changes(&mut self, bundle_state_manager: BundleStateManager) {
         for (address, account) in bundle_state_manager.accounts.into_iter() {
             tracing::info!("Applying changes for account {}", address);
@@ -368,6 +411,10 @@ impl StateManager {
         // Apply transaction receipts
         for (tx_hash, receipt) in bundle_state_manager.transaction_receipts.into_iter() {
             self.add_receipt(tx_hash, receipt);
+        }
+
+        for (key, value) in bundle_state_manager.kv_store.into_iter() {
+            self.kv_put(key, value);
         }
     }
     /// Serialize the StateManager to a writer using borsh

@@ -19,10 +19,10 @@ use cartesi_machine::types::cmio::CmioRequest;
 use cartesi_machine::types::cmio::CmioResponseReason;
 use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
+use hex;
 use runner::http_client::start_health_check;
 use runner::http_health_check_client::add_http_health_check_client;
-use runner::http_server::add_http_server;
-use runner::utils::RunnerState;
+use runner::utils::{RunnerState, Service};
 use runner::webhook_delivery::{add_webhook_delivery_service, Submission};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -261,8 +261,12 @@ fn execute_transfer<T: ProcessingContext>(
     if to == CoreLaneAddresses::cartesi_http_runner() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
         return tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(execute_cartesi_http_runner(input, gas_used, state))
+            tokio::runtime::Handle::current().block_on(execute_cartesi_http_runner(
+                input,
+                gas_used,
+                bundle_state,
+                state,
+            ))
         });
     }
 
@@ -1169,6 +1173,7 @@ fn execute_transfer<T: ProcessingContext>(
 async fn execute_cartesi_http_runner<T: ProcessingContext>(
     input: Bytes,
     gas_used: U256,
+    bundle_state: &mut BundleStateManager,
     _state: &mut T,
 ) -> Result<ExecutionResult> {
     let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
@@ -1178,15 +1183,20 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         &RuntimeConfig::default(),
     )?);
 
-    let state = Arc::new(Mutex::new(RunnerState::new()));
+    let runner_state = Arc::new(Mutex::new(RunnerState::new()));
 
     const GUEST_CID: u32 = 1;
     const CONTAINER_PORT: u32 = 8080;
     const HTTP_CLIENT_PORT: u32 = 9002;
+    const KV_STORE_PORT: u32 = 8080;
+
+    let bundle_state_arc = Arc::new(Mutex::new(bundle_state.clone()));
 
     let (mut health_check_receiver, mut submit_done_receiver) = {
-        let mut state_guard = state.lock().await;
-        add_http_server(&mut state_guard);
+        let mut state_guard = runner_state.lock().await;
+
+        add_kv_service(&mut state_guard, KV_STORE_PORT, bundle_state_arc.clone());
+
         let health_rx: tokio::sync::mpsc::Receiver<bool> =
             add_http_health_check_client(&mut state_guard, 9000, 10);
         let submit_done_rx = add_webhook_delivery_service(&mut state_guard, HTTP_CLIENT_PORT, 3);
@@ -1194,11 +1204,11 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     };
 
     {
-        let mut state_guard = state.lock().await;
+        let mut state_guard = runner_state.lock().await;
         start_health_check(&mut state_guard, 9000, 1, CONTAINER_PORT).unwrap();
     }
 
-    let state_for_loop = Arc::clone(&state);
+    let state_for_loop = Arc::clone(&runner_state);
 
     let machine_loop_fut = {
         let state = state_for_loop.clone();
@@ -1211,7 +1221,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         }
     };
 
-    let state_for_webhook = Arc::clone(&state);
+    let state_for_webhook = Arc::clone(&runner_state);
     let submission = build_submission_from_input(&input);
 
     let health_check_and_webhook_fut = async move {
@@ -1277,10 +1287,19 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         }
     };
 
-    let state_clone = Arc::clone(&state);
+    {
+        let bundle_state_guard = bundle_state_arc.lock().await;
+        for key in bundle_state_guard.kv_keys() {
+            if let Some(value) = bundle_state_guard.kv_get(&key) {
+                bundle_state.kv_put(key, value);
+            }
+        }
+    }
+
+    let runner_state_clone = Arc::clone(&runner_state);
 
     let (machine_output, execution_success) = {
-        let mut state_guard = state_clone.lock().await;
+        let mut state_guard = runner_state_clone.lock().await;
         if let Some(http_client) = state_guard.get_client(HTTP_CLIENT_PORT) {
             if let Some(response_data) = http_client.get_write_data(HTTP_CLIENT_PORT) {
                 info!(
@@ -1573,4 +1592,280 @@ fn check_riscv_intent_permission<T: ProcessingContext>(
     }
 
     Ok(permission)
+}
+
+struct KvConnection {
+    port: u32,
+    buffer: Vec<u8>,
+    request_complete: bool,
+}
+
+impl KvConnection {
+    fn new(port: u32) -> Self {
+        Self {
+            port,
+            buffer: Vec::new(),
+            request_complete: false,
+        }
+    }
+}
+
+struct KvService {
+    port: u32,
+    connections: HashMap<u32, KvConnection>,
+    pending_responses: HashMap<u32, Vec<u8>>,
+    bundle_state: Arc<Mutex<BundleStateManager>>,
+}
+
+impl KvService {
+    fn new(port: u32, bundle_state: Arc<Mutex<BundleStateManager>>) -> Self {
+        info!("Creating KV adapter service on port {}", port);
+        Self {
+            port,
+            connections: HashMap::new(),
+            pending_responses: HashMap::new(),
+            bundle_state,
+        }
+    }
+
+    fn handle_http_request(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        let request_str = String::from_utf8_lossy(data);
+        let lines: Vec<&str> = request_str.lines().collect();
+
+        if lines.is_empty() {
+            return None;
+        }
+
+        let first_line = lines[0];
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+        if parts.len() < 2 {
+            return None;
+        }
+
+        let method = parts[0];
+        let path = parts[1];
+
+        info!("KV adapter HTTP {} {}", method, path);
+
+        // TODO: Implement the HTTP request handling logic
+        Some(
+            "{\"status\":\"ok\"}"
+                .as_bytes()
+                .to_vec(),
+        )
+    }
+
+    fn handle_kv_request(&mut self, method: &str, key: &str, request_str: &str) -> Option<Vec<u8>> {
+        match method {
+            "GET" => {
+                let bundle_state = self.bundle_state.blocking_lock();
+
+                if let Some(value) = bundle_state.kv_get(key) {
+                    let value_json = serde_json::json!({ "key": key, "value": hex::encode(&value) });
+                    let _body = serde_json::to_string(&value_json).unwrap();
+                    Some(
+                        "{\"status\":\"ok\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                } else {
+                    Some(
+                     "{\"status\":\"not_found\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+            }
+            "POST" => {
+                if let Some(body_start) = request_str.find("\r\n\r\n") {
+                    let body = &request_str[body_start + 4..];
+                    let value = if body.starts_with('{') {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                            if let Some(hex_val) = json.get("value").and_then(|v| v.as_str()) {
+                                hex::decode(hex_val).ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        hex::decode(body.trim()).ok()
+                    };
+                    if let Some(value_bytes) = value {
+                        let mut bundle_state = self.bundle_state.blocking_lock();
+                        bundle_state.kv_put(key.to_string(), value_bytes);
+                        Some(
+                            "{\"status\":\"ok\"}"
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    } else {
+                        Some(
+                            "{\"status\":\"invalid_body\"}"
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    }
+                } else {
+                    Some(
+                        "{\"status\":\"no_body\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+            }
+            "PUT" => {
+                if let Some(body_start) = request_str.find("\r\n\r\n") {
+                    let body = &request_str[body_start + 4..];
+                    let value = if body.starts_with('{') {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+                            if let Some(hex_val) = json.get("value").and_then(|v| v.as_str()) {
+                                hex::decode(hex_val).ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        hex::decode(body.trim()).ok()
+                    };
+
+                    if let Some(value_bytes) = value {
+                        let mut bundle_state = self.bundle_state.blocking_lock();
+                        bundle_state.kv_put(key.to_string(), value_bytes);
+                        Some(
+                            "{\"status\":\"ok\"}"
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    } else {
+                        Some(
+                            "{\"status\":\"invalid_body\"}"
+                                .as_bytes()
+                                .to_vec(),
+                        )
+                    }
+                } else {
+                    Some(
+                        "{\"status\":\"no_body\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+            }
+            "DELETE" => {
+                let mut bundle_state = self.bundle_state.blocking_lock();
+                let deleted = bundle_state.kv_delete(key);
+                if deleted {
+                    Some(
+                        "{\"status\":\"ok\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                } else {
+                    Some(
+                        "{\"status\":\"not_found\"}"
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+            }
+            _ => Some(
+                "{\"status\":\"method_not_supported\"}"
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        }
+    }
+
+    fn handle_list_keys(&self) -> Option<Vec<u8>> {
+        let bundle_state = self.bundle_state.blocking_lock();
+        let all_keys = bundle_state.kv_keys();
+
+        let keys_json = serde_json::json!({ "keys": all_keys });
+        let _body = serde_json::to_string(&keys_json).unwrap();
+        Some(
+            "{\"status\":\"ok\"}"
+                .as_bytes()
+                .to_vec(),
+        )
+    }
+}
+
+impl Service for KvService {
+    fn on_connection(&mut self, port: u32) {
+        info!("KV adapter: new connection on port {}", port);
+        let conn = KvConnection::new(port);
+        self.connections.insert(port, conn);
+    }
+
+    fn on_data(&mut self, port: u32, data: &[u8]) {
+        info!("KV adapter: {} bytes on port {}", data.len(), port);
+
+        let should_process = {
+            if let Some(conn) = self.connections.get(&port) {
+                let buffer_str = String::from_utf8_lossy(&conn.buffer);
+                buffer_str.contains("\r\n\r\n") && !conn.request_complete
+            } else {
+                false
+            }
+        };
+
+        if should_process {
+            let buffer_data = if let Some(conn) = self.connections.get(&port) {
+                conn.buffer.clone()
+            } else {
+                return;
+            };
+
+            let response = self.handle_http_request(&buffer_data);
+
+            if let Some(conn) = self.connections.get_mut(&port) {
+                conn.request_complete = true;
+                if let Some(resp) = response {
+                    self.pending_responses.insert(port, resp);
+                }
+            }
+        } else if let Some(conn) = self.connections.get_mut(&port) {
+            conn.buffer.extend_from_slice(data);
+        }
+    }
+
+    fn on_reset(&mut self, port: u32) {
+        info!("KV adapter: reset on port {}", port);
+        self.connections.remove(&port);
+        self.pending_responses.remove(&port);
+    }
+
+    fn on_shutdown(&mut self, port: u32) {
+        info!("KV adapter: shutdown on port {}", port);
+        self.connections.remove(&port);
+        self.pending_responses.remove(&port);
+    }
+
+    fn get_write_data(&mut self, port: u32) -> Option<Vec<u8>> {
+        if let Some(resp) = self.pending_responses.remove(&port) {
+            info!("KV adapter: sending {} bytes on port {}", resp.len(), port);
+            Some(resp)
+        } else {
+            None
+        }
+    }
+
+    fn should_shutdown(&mut self, _port: u32) -> bool {
+        false
+    }
+}
+
+fn add_kv_service(
+    state: &mut RunnerState,
+    port: u32,
+    bundle_state: Arc<Mutex<BundleStateManager>>,
+) {
+    let svc = KvService::new(port, bundle_state);
+    state.add_listener(port, Box::new(svc));
+    info!("KV adapter service added on port {}", port);
 }
