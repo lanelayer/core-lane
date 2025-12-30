@@ -16,6 +16,23 @@ use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, Wallet};
 
+/// Configuration for bundle submission to Bitcoin DA
+#[derive(Debug, Clone)]
+pub struct BundleSubmissionConfig {
+    /// Mnemonic phrase for signing Bitcoin transactions
+    pub mnemonic: String,
+    /// Bitcoin network (regtest, testnet, mainnet, signet)
+    pub network: bitcoin::Network,
+    /// Network string identifier
+    pub network_str: String,
+    /// Optional Electrum server URL for wallet sync (required for non-regtest networks)
+    pub electrum_url: Option<String>,
+    /// Data directory for wallet and state
+    pub data_dir: String,
+    /// Ethereum address to receive sequencer fees
+    pub sequencer_payment_recipient: alloy_primitives::Address,
+}
+
 pub struct TaprootDA {
     // Keep bitcoin_client for RPC operations (fee estimation, broadcasting)
     bitcoin_client: Arc<Client>,
@@ -895,6 +912,29 @@ impl TaprootDA {
                 Err(anyhow!("Failed to submit bundle package: {}", e))
             }
         }
+    }
+
+    /// Submit a bundle to Bitcoin DA using a configuration struct
+    ///
+    /// This is a convenience wrapper around `send_bundle_to_da()` that uses
+    /// a `BundleSubmissionConfig` struct instead of individual parameters.
+    pub async fn send_bundle_to_da_with_config(
+        &self,
+        raw_tx_hex_vec: Vec<String>,
+        config: &BundleSubmissionConfig,
+        marker: crate::block::BundleMarker,
+    ) -> Result<String> {
+        self.send_bundle_to_da(
+            raw_tx_hex_vec,
+            &config.mnemonic,
+            config.network,
+            &config.network_str,
+            config.electrum_url.as_deref(),
+            &config.data_dir,
+            config.sequencer_payment_recipient,
+            marker,
+        )
+        .await
     }
 
     fn create_taproot_envelope_script(&self, data: &[u8]) -> Result<ScriptBuf> {
