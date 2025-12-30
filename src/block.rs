@@ -160,6 +160,42 @@ impl CoreLaneBundleCbor {
         }
     }
 
+    /// Create a bundle from transaction envelopes and raw bytes
+    ///
+    /// This is a convenience function for creating bundles from `TxEnvelope` objects
+    /// that sequencers typically work with. The raw bytes are used for the bundle,
+    /// while the envelopes are used for validation.
+    ///
+    /// # Arguments
+    ///
+    /// * `transactions` - Vector of (TxEnvelope, raw_bytes) tuples
+    /// * `sequencer_payment_recipient` - Ethereum address to receive sequencer fees
+    /// * `marker` - Bundle marker (Head or Standard)
+    ///
+    /// # Returns
+    ///
+    /// A `CoreLaneBundleCbor` ready for submission to Bitcoin DA
+    pub fn from_transaction_envelopes(
+        transactions: Vec<(TxEnvelope, Vec<u8>)>,
+        sequencer_payment_recipient: Address,
+        marker: BundleMarker,
+    ) -> Self {
+        let raw_transactions: Vec<Vec<u8>> = transactions
+            .into_iter()
+            .map(|(_, raw_bytes)| raw_bytes)
+            .collect();
+
+        Self {
+            valid_for_block: u64::MAX,
+            flash_loan_amount: U256::ZERO,
+            flash_loaner_address: Address::ZERO,
+            sequencer_payment_recipient,
+            transactions: raw_transactions,
+            signature: None,
+            marker,
+        }
+    }
+
     /// Parse CBOR data into CoreLaneBundleCbor using manual decoding
     /// Schema: [type, decompressed_length, valid_for_block, flash_loan_amount, flash_loaner_address, sequencer_payment_recipient, compressed_transactions, signature, marker]
     /// type: u8 (0 = no compression, 1 = brotli)
