@@ -81,6 +81,7 @@ pub struct RpcServer {
     core_rpc_url: Option<String>,
     da_feed_address: Option<Address>,
     sequencer_rpc_url: Option<String>,
+    block_notifier: Option<tokio::sync::broadcast::Receiver<u64>>,
 }
 
 impl RpcServer {
@@ -112,6 +113,7 @@ impl RpcServer {
             core_rpc_url: None,
             da_feed_address: None,
             sequencer_rpc_url: config.sequencer_rpc_url,
+            block_notifier: None,
         })
     }
 
@@ -133,7 +135,14 @@ impl RpcServer {
             core_rpc_url: Some(core_rpc_url),
             da_feed_address: Some(da_feed_address),
             sequencer_rpc_url,
+            block_notifier: None,
         }
+    }
+
+    /// Set the block notifier receiver
+    pub fn with_block_notifier(mut self, receiver: tokio::sync::broadcast::Receiver<u64>) -> Self {
+        self.block_notifier = Some(receiver);
+        self
     }
 
     pub fn router(self) -> Router {
@@ -154,6 +163,10 @@ impl RpcServer {
                 axum::routing::get(Self::handle_get_latest_block),
             )
             .route("/health", axum::routing::get(Self::handle_health))
+            .route(
+                "/wait_for_next_block",
+                axum::routing::get(Self::handle_wait_for_next_block),
+            )
             .with_state(Arc::new(self))
     }
 
@@ -2695,6 +2708,42 @@ impl RpcServer {
             .header("X-Block-Number", latest_block.to_string())
             .body(axum::body::Body::from(bytes))
             .unwrap())
+    }
+
+    /// GET /wait_for_next_block
+    /// Waits for the next Core Lane block to be processed and returns the block number
+    async fn handle_wait_for_next_block(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+    ) -> Result<JsonResponse<serde_json::Value>, StatusCode> {
+        // Get current latest block
+        let current_block = {
+            let state = rpc_state.state.lock().await;
+            state.blocks.keys().max().copied().unwrap_or(0)
+        };
+
+        // If we have a block notifier, wait for the next block
+        // Clone the receiver since we can't mutably borrow from Arc
+        if let Some(receiver) = rpc_state.block_notifier.as_ref() {
+            let mut receiver = receiver.resubscribe();
+            match receiver.recv().await {
+                Ok(block_number) => Ok(JsonResponse(json!({
+                    "status": "ok",
+                    "block_number": block_number,
+                    "previous_block": current_block,
+                }))),
+                Err(_) => {
+                    // Channel closed or lagged
+                    Err(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        } else {
+            // No block notifier available - return current block
+            Ok(JsonResponse(json!({
+                "status": "ok",
+                "block_number": current_block,
+                "note": "Block notifier not available, returning current block",
+            })))
+        }
     }
 
     /// GET /health

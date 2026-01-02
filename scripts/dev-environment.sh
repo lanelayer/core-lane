@@ -17,6 +17,9 @@ RPC_PASSWORD="bitcoin123"
 RPC_URL="http://127.0.0.1:18443"
 JSON_RPC_PORT=8546
 JSON_RPC_URL="http://127.0.0.1:$JSON_RPC_PORT"
+# Sequencer RPC URL for forwarding transactions (optional)
+# Set via SEQUENCER_RPC_URL environment variable or --sequencer-rpc-url flag
+SEQUENCER_RPC_URL="${SEQUENCER_RPC_URL:-}"
 CORE_LANE_NODE_PID=0
 CORE_LANE_TAIL_PID=0
 MINING_PID=0
@@ -191,21 +194,35 @@ start_core_lane_node() {
         exit 1
     fi
 
-    # Check mnemonic file exists
-    if [ ! -f ".dev-wallets/mnemonic_regtest.txt" ]; then
-        print_error "Mnemonic not found! Setup BDK wallet first."
-        exit 1
-    fi
-
-    RUST_LOG=info,debug ./target/debug/core-lane-node start \
+    # Build command
+    local cmd="RUST_LOG=info,debug ./target/debug/core-lane-node start \
         --start-block 0 \
         --bitcoin-rpc-read-user $RPC_USER \
         --bitcoin-rpc-read-password $RPC_PASSWORD \
-        --mnemonic-file ".dev-wallets/mnemonic_regtest.txt" \
         --http-host 127.0.0.1 \
-        --http-port $JSON_RPC_PORT \
-        > core-lane.log 2>&1 &
+        --http-port $JSON_RPC_PORT"
 
+    # Add sequencer forwarding if configured
+    if [ -n "$SEQUENCER_RPC_URL" ]; then
+        cmd="$cmd --sequencer-rpc-url \"$SEQUENCER_RPC_URL\""
+        print_status "Sequencer forwarding enabled: $SEQUENCER_RPC_URL"
+        # When using sequencer forwarding, mnemonic is optional (core-lane won't post to Bitcoin)
+        if [ -f ".dev-wallets/mnemonic_regtest.txt" ]; then
+            print_warning "Mnemonic file exists but sequencer forwarding is enabled."
+            print_warning "Mnemonic not needed when forwarding to sequencer (core-lane is read-only)."
+        fi
+    else
+        # Check mnemonic file exists only if not using sequencer forwarding
+        if [ ! -f ".dev-wallets/mnemonic_regtest.txt" ]; then
+            print_error "Mnemonic not found! Setup BDK wallet first (or set SEQUENCER_RPC_URL for sequencer forwarding)."
+            exit 1
+        fi
+        cmd="$cmd --mnemonic-file \".dev-wallets/mnemonic_regtest.txt\""
+    fi
+
+    cmd="$cmd > core-lane.log 2>&1 &"
+
+    eval "$cmd"
     CORE_LANE_NODE_PID=$!
 
     print_status "Waiting for Core Lane node to start..."
@@ -218,6 +235,9 @@ start_core_lane_node() {
 
     print_success "Core Lane node started with PID: $CORE_LANE_NODE_PID"
     print_status "JSON-RPC available at: $JSON_RPC_URL"
+    if [ -n "$SEQUENCER_RPC_URL" ]; then
+        print_status "🔄 Sequencer RPC forwarding enabled: $SEQUENCER_RPC_URL"
+    fi
 }
 
 start_core_lane_tail() {
@@ -600,6 +620,11 @@ cleanup() {
 show_usage() {
     echo "Usage: $0 [COMMAND]"
     echo ""
+    echo "Environment Variables:"
+    echo "  SEQUENCER_RPC_URL    Set to enable sequencer forwarding (e.g., http://127.0.0.1:8545)"
+    echo "                       When set, core-lane forwards eth_sendRawTransaction to the sequencer"
+    echo ""
+    echo ""
     echo "Commands:"
     echo "  start     Start the complete development environment (HAZARDOUS MODE)"
     echo "  stop      Stop the development environment"
@@ -612,10 +637,11 @@ show_usage() {
     echo "   when REORG=1 environment variable is set."
     echo ""
     echo "Examples:"
-    echo "  $0 start                    # Start everything"
-    echo "  REORG=1 $0 start           # Start with hazardous reorgs enabled"
-    echo "  $0 stop                     # Stop everything"
-    echo "  $0 balances                # Check balances"
+    echo "  $0 start                                    # Start everything"
+    echo "  REORG=1 $0 start                          # Start with hazardous reorgs enabled"
+    echo "  SEQUENCER_RPC_URL=http://127.0.0.1:8545 $0 start  # Start with sequencer forwarding"
+    echo "  $0 stop                                     # Stop everything"
+    echo "  $0 balances                                # Check balances"
 }
 
 show_status() {

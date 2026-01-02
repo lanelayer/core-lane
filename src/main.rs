@@ -805,6 +805,7 @@ struct CoreLaneNode {
     bitcoin_client_write: Option<Arc<Client>>,
     state: Arc<Mutex<CoreLaneState>>,
     data_dir: String,
+    block_notifier: tokio::sync::broadcast::Sender<u64>, // Notifies when a new Core Lane block is processed
 }
 
 impl CoreLaneNode {
@@ -839,6 +840,9 @@ impl CoreLaneNode {
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
     ) -> Self {
+        // Create block notifier channel
+        let (block_notifier, _) = tokio::sync::broadcast::channel(100);
+
         // Create genesis block with EIP-1559 default configuration
         let eip1559_config = eip1559::Eip1559Config::default();
         let genesis_block =
@@ -891,7 +895,13 @@ impl CoreLaneNode {
             bitcoin_client_write,
             state,
             data_dir,
+            block_notifier,
         }
+    }
+
+    /// Get a receiver for block notifications
+    pub fn block_notifier_receiver(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.block_notifier.subscribe()
     }
 
     async fn create_new_block(
@@ -1388,6 +1398,8 @@ impl CoreLaneNode {
                         "Processed Bitcoin block {} -> Core Lane block {}",
                         height, core_lane_block_number
                     );
+                    // Notify waiting clients about the new block
+                    let _ = self.block_notifier.send(core_lane_block_number);
                 }
                 Err(e) => {
                     error!("Error processing block {}: {}", height, e);
@@ -2063,7 +2075,7 @@ impl CoreLaneNode {
     #[allow(clippy::too_many_arguments)]
     async fn send_bundle_to_da(
         &self,
-        raw_tx_hex_vec: Vec<String>,
+        transactions: Vec<Vec<u8>>,
         mnemonic: &str,
         network: bitcoin::Network,
         network_str: &str,
@@ -2081,7 +2093,7 @@ impl CoreLaneNode {
         let taproot_da = TaprootDA::new(bitcoin_client);
         let _bitcoin_txid = taproot_da
             .send_bundle_to_da(
-                raw_tx_hex_vec,
+                transactions,
                 mnemonic,
                 network,
                 network_str,
@@ -2532,7 +2544,7 @@ async fn main() -> Result<()> {
             let (shared_state, bitcoin_client_write, node_opt) =
                 if sequencer_rpc_url.is_some() && mnemonic_str.is_empty() {
                     // Sequencer-only mode: read-only bitcoin client, no write client needed
-                    // No block scanner needed in sequencer-only mode
+                    // Block scanner still needed to read bundles posted by sequencer
                     let node = CoreLaneNode::new_with_clients(
                         Some(read_client),
                         None,
@@ -2540,7 +2552,7 @@ async fn main() -> Result<()> {
                         network,
                         sequencer_addr,
                     );
-                    (Arc::clone(&node.state), None, None) // node_opt = None to skip block scanner
+                    (Arc::clone(&node.state), None, Some(node)) // node_opt = Some to enable block scanner
                 } else {
                     // Bitcoin DA mode: require write client and mnemonic
                     if mnemonic_str.is_empty() {
@@ -2594,13 +2606,18 @@ async fn main() -> Result<()> {
                 data_dir: cli.data_dir.clone(),
                 sequencer_rpc_url: sequencer_rpc_url.clone(),
             };
-            let rpc_server = RpcServer::with_bitcoin_client(
+            let mut rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
                 bitcoin_client_write,
                 Some(network),
                 rpc_config,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create RPC server: {}", e))?;
+
+            // If we have a node, pass the block notifier receiver to the RPC server
+            if let Some(ref node) = node_opt {
+                rpc_server = rpc_server.with_block_notifier(node.block_notifier_receiver());
+            }
 
             if let Some(ref url) = sequencer_rpc_url {
                 info!("🔄 Sequencer RPC forwarding enabled: {}", url);
@@ -2626,8 +2643,8 @@ async fn main() -> Result<()> {
                     tokio::try_join!(server_handle, scanner_handle)?;
                 scanner_result?;
             } else {
-                // Sequencer-only mode: no block scanner needed
-                info!("⏭️  Skipping block scanner (sequencer-only mode)");
+                // No block scanner available (shouldn't happen in normal operation)
+                warn!("⚠️  Block scanner not available - blocks will not be scanned");
                 server_handle.await?;
             }
         }
@@ -3202,8 +3219,17 @@ async fn main() -> Result<()> {
                 network,
                 None,
             );
+            // Convert hex strings to bytes
+            let transactions: Vec<Vec<u8>> = raw_tx_hex_vec
+                .iter()
+                .map(|tx_hex| {
+                    hex::decode(tx_hex.trim_start_matches("0x"))
+                        .map_err(|e| anyhow::anyhow!("Invalid transaction hex '{}': {}", tx_hex, e))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
             node.send_bundle_to_da(
-                raw_tx_hex_vec.clone(),
+                transactions,
                 &mnemonic_str,
                 network,
                 network_str,

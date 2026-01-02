@@ -38,13 +38,14 @@ pub mod transaction;
 
 // Re-export commonly used types for convenience
 pub use account::CoreLaneAccount;
-pub use block::BundleMarker;
+pub use block::{BundleMarker, CoreLaneBundleCbor};
 pub use intents::{
     create_anchor_bitcoin_fill_intent, decode_intent_calldata, AnchorBitcoinFill, Intent,
     IntentCall, IntentCommandType, IntentData, IntentStatus, IntentSystem, IntentType,
     RiscVProgramIntent,
 };
 pub use state::{BundleStateManager, StateManager, StoredTransaction, TransactionReceipt};
+pub use taproot_da::{BundleSubmissionConfig, TaprootDA};
 pub use transaction::{
     execute_transaction, get_transaction_input_bytes, get_transaction_nonce, CoreLaneAddresses,
     ExecutionResult, ProcessingContext,

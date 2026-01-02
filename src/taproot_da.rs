@@ -16,6 +16,23 @@ use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, Wallet};
 
+/// Configuration for bundle submission to Bitcoin DA
+#[derive(Debug, Clone)]
+pub struct BundleSubmissionConfig {
+    /// Mnemonic phrase for signing Bitcoin transactions
+    pub mnemonic: String,
+    /// Bitcoin network (regtest, testnet, mainnet, signet)
+    pub network: bitcoin::Network,
+    /// Network string identifier
+    pub network_str: String,
+    /// Optional Electrum server URL for wallet sync (required for non-regtest networks)
+    pub electrum_url: Option<String>,
+    /// Data directory for wallet and state
+    pub data_dir: String,
+    /// Ethereum address to receive sequencer fees
+    pub sequencer_payment_recipient: alloy_primitives::Address,
+}
+
 pub struct TaprootDA {
     // Keep bitcoin_client for RPC operations (fee estimation, broadcasting)
     bitcoin_client: Arc<Client>,
@@ -589,7 +606,7 @@ impl TaprootDA {
     #[allow(clippy::too_many_arguments)]
     pub async fn send_bundle_to_da(
         &self,
-        raw_tx_hex_vec: Vec<String>,
+        transactions: Vec<Vec<u8>>,
         mnemonic_str: &str,
         network: bitcoin::Network,
         network_str: &str,
@@ -600,17 +617,9 @@ impl TaprootDA {
     ) -> Result<String> {
         use crate::block::CoreLaneBundleCbor;
 
+        let transaction_count = transactions.len();
         tracing::info!("🚀 Creating Core Lane bundle in Bitcoin DA (commit + reveal in one tx)...");
-        tracing::info!("📦 Bundle contains {} transactions", raw_tx_hex_vec.len());
-
-        // Convert raw transaction hexes to Vec<Vec<u8>>
-        let transactions: Vec<Vec<u8>> = raw_tx_hex_vec
-            .iter()
-            .map(|tx_hex| {
-                hex::decode(tx_hex.trim_start_matches("0x"))
-                    .map_err(|e| anyhow!("Invalid transaction hex: {}", e))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        tracing::info!("📦 Bundle contains {} transactions", transaction_count);
 
         // Create CoreLaneBundleCbor
         let mut bundle =
@@ -621,6 +630,29 @@ impl TaprootDA {
         let bundle_cbor = bundle.to_cbor()?;
         tracing::info!("📦 Bundle CBOR size: {} bytes", bundle_cbor.len());
 
+        // Continue with the rest of the submission using the bundle_cbor
+        self.send_bundle_cbor_to_da_internal(
+            bundle_cbor,
+            mnemonic_str,
+            network,
+            network_str,
+            electrum_url,
+            data_dir,
+        )
+        .await
+    }
+
+    /// Internal method to submit a bundle CBOR to Bitcoin DA
+    /// This allows sequencers to submit pre-signed bundles
+    async fn send_bundle_cbor_to_da_internal(
+        &self,
+        bundle_cbor: Vec<u8>,
+        mnemonic_str: &str,
+        network: bitcoin::Network,
+        network_str: &str,
+        electrum_url: Option<&str>,
+        data_dir: &str,
+    ) -> Result<String> {
         // Create payload with CORE_BNDL prefix
         let mut payload = Vec::new();
         payload.extend_from_slice(b"CORE_BNDL");
@@ -885,8 +917,6 @@ impl TaprootDA {
                 tracing::info!("✅ Core Lane bundle package submitted successfully!");
                 tracing::info!("📍 Commit transaction ID (txid): {}", commit_txid_tx);
                 tracing::info!("📍 Reveal transaction ID (txid): {}", reveal_txid_tx);
-                tracing::info!("📦 Bundle contains {} transactions", raw_tx_hex_vec.len());
-                tracing::info!("🎯 Bundle marker: {:?}", marker);
 
                 Ok(commit_txid_tx.to_string())
             }
@@ -895,6 +925,47 @@ impl TaprootDA {
                 Err(anyhow!("Failed to submit bundle package: {}", e))
             }
         }
+    }
+
+    /// Submit a bundle to Bitcoin DA using a configuration struct
+    ///
+    /// This is a convenience wrapper around `send_bundle_to_da()` that uses
+    /// a `BundleSubmissionConfig` struct instead of individual parameters.
+    pub async fn send_bundle_to_da_with_config(
+        &self,
+        transactions: Vec<Vec<u8>>,
+        config: &BundleSubmissionConfig,
+        marker: crate::block::BundleMarker,
+    ) -> Result<String> {
+        self.send_bundle_to_da(
+            transactions,
+            &config.mnemonic,
+            config.network,
+            &config.network_str,
+            config.electrum_url.as_deref(),
+            &config.data_dir,
+            config.sequencer_payment_recipient,
+            marker,
+        )
+        .await
+    }
+
+    /// Submit a pre-signed bundle CBOR to Bitcoin DA
+    /// This is used by sequencers that sign bundles before submission
+    pub async fn send_signed_bundle_cbor_to_da(
+        &self,
+        bundle_cbor: Vec<u8>,
+        config: &BundleSubmissionConfig,
+    ) -> Result<String> {
+        self.send_bundle_cbor_to_da_internal(
+            bundle_cbor,
+            &config.mnemonic,
+            config.network,
+            &config.network_str,
+            config.electrum_url.as_deref(),
+            &config.data_dir,
+        )
+        .await
     }
 
     fn create_taproot_envelope_script(&self, data: &[u8]) -> Result<ScriptBuf> {
@@ -942,5 +1013,47 @@ impl TaprootDA {
         let control_block_bytes = control_block.serialize();
 
         Ok((address, internal_key_hex, control_block_bytes))
+    }
+
+    /// Get the first receiving address from a mnemonic without loading the full wallet
+    ///
+    /// This is useful for:
+    /// - Pre-generating addresses before starting a sequencer
+    /// - Displaying the address in health endpoints
+    /// - Testing and development
+    ///
+    /// The actual wallet operations (loading, syncing, signing) are handled by
+    /// the `send_bundle_to_da_with_config` and `send_transaction_to_da` methods.
+    pub fn get_address_from_mnemonic(
+        mnemonic_str: &str,
+        network: bitcoin::Network,
+    ) -> Result<bitcoin::Address> {
+        // Parse mnemonic and derive signing keys (same logic as wallet loading)
+        let mnemonic =
+            Mnemonic::parse(mnemonic_str).map_err(|e| anyhow!("Invalid mnemonic: {}", e))?;
+
+        let xkey: ExtendedKey = mnemonic
+            .into_extended_key()
+            .map_err(|_| anyhow!("Failed to derive extended key"))?;
+        let xprv = xkey
+            .into_xprv(network)
+            .ok_or_else(|| anyhow!("Failed to get xprv"))?;
+
+        // Use the same descriptor format as wallet creation
+        let external_descriptor = format!("wpkh({}/0/*)", xprv);
+        let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+        // Create a temporary in-memory wallet to get the first address
+        let mut temp_conn = Connection::open_in_memory()?;
+
+        // Create wallet in memory
+        let mut temp_wallet = Wallet::create(external_descriptor, internal_descriptor)
+            .network(network)
+            .create_wallet(&mut temp_conn)
+            .map_err(|e| anyhow!("Failed to create temp wallet: {}", e))?;
+
+        // Get the first address
+        let address_info = temp_wallet.reveal_next_address(KeychainKind::External);
+        Ok(address_info.address)
     }
 }
