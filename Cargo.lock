@@ -4136,7 +4136,7 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 [[package]]
 name = "runner"
 version = "0.1.0"
-source = "git+https://github.com/lanelayer/cli?rev=2428f24bcc275bd4767f9367ffca0363a8ded11b#2428f24bcc275bd4767f9367ffca0363a8ded11b"
+source = "git+https://github.com/lanelayer/cli?rev=71b67e5c8b45b6fb17925616690c59e487c1fa84#71b67e5c8b45b6fb17925616690c59e487c1fa84"
 dependencies = [
  "bytes",
  "cartesi-machine",
@@ -5436,7 +5436,7 @@ dependencies = [
 [[package]]
 name = "vsock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lanelayer/cli?rev=2428f24bcc275bd4767f9367ffca0363a8ded11b#2428f24bcc275bd4767f9367ffca0363a8ded11b"
+source = "git+https://github.com/lanelayer/cli?rev=71b67e5c8b45b6fb17925616690c59e487c1fa84#71b67e5c8b45b6fb17925616690c59e487c1fa84"
 
 [[package]]
 name = "wait-timeout"

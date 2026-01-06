@@ -84,6 +84,7 @@ impl BorshDeserialize for StoredTransaction {
 pub struct StateManager {
     accounts: BTreeMap<Address, CoreLaneAccount>,
     stored_blobs: BTreeMap<B256, Vec<u8>>,
+    kv_storage: BTreeMap<String, Vec<u8>>,
     intents: BTreeMap<B256, Intent>,
     transactions: Vec<StoredTransaction>,
     transaction_receipts: BTreeMap<String, TransactionReceipt>,
@@ -93,6 +94,8 @@ pub struct StateManager {
 pub struct BundleStateManager {
     pub accounts: BTreeMap<Address, CoreLaneAccount>,
     pub stored_blobs: BTreeMap<B256, Vec<u8>>,
+    pub kv_storage: BTreeMap<String, Vec<u8>>,
+    pub removed_keys: Vec<String>,
     pub intents: BTreeMap<B256, Intent>,
     pub transactions: Vec<StoredTransaction>,
     pub transaction_receipts: BTreeMap<String, TransactionReceipt>,
@@ -111,6 +114,24 @@ impl BundleStateManager {
 
     pub fn insert_blob(&mut self, blob_hash: B256, data: Vec<u8>) {
         self.stored_blobs.insert(blob_hash, data);
+    }
+
+    pub fn get_kv(&self, key: &str) -> Option<&Vec<u8>> {
+        self.kv_storage.get(key)
+    }
+
+    pub fn insert_kv(&mut self, key: String, value: Vec<u8>) {
+        self.kv_storage.insert(key.clone(), value);
+        self.removed_keys.retain(|k| k != &key);
+    }
+
+    pub fn remove_kv(&mut self, key: &str) -> Option<Vec<u8>> {
+        let removed = self.kv_storage.remove(key);
+        let key_string = key.to_string();
+        if !self.removed_keys.iter().any(|k| k == &key_string) {
+            self.removed_keys.push(key_string);
+        }
+        removed
     }
 
     pub fn get_intent<'a>(
@@ -344,6 +365,19 @@ impl StateManager {
             .map(|acc| acc.nonce)
             .unwrap_or(U256::ZERO)
     }
+
+    pub fn get_kv(&self, key: &str) -> Option<&Vec<u8>> {
+        self.kv_storage.get(key)
+    }
+
+    pub fn insert_kv(&mut self, key: String, value: Vec<u8>) {
+        self.kv_storage.insert(key, value);
+    }
+
+    pub fn remove_kv(&mut self, key: &str) -> Option<Vec<u8>> {
+        self.kv_storage.remove(key)
+    }
+
     pub fn apply_changes(&mut self, bundle_state_manager: BundleStateManager) {
         for (address, account) in bundle_state_manager.accounts.into_iter() {
             tracing::info!("Applying changes for account {}", address);
@@ -358,6 +392,14 @@ impl StateManager {
         // Apply intent changes
         for (intent_id, intent) in bundle_state_manager.intents.into_iter() {
             self.insert_intent(intent_id, intent);
+        }
+
+        for key in bundle_state_manager.removed_keys.into_iter() {
+            self.remove_kv(&key);
+        }
+
+        for (key, value) in bundle_state_manager.kv_storage.into_iter() {
+            self.insert_kv(key, value);
         }
 
         // Apply transaction storage

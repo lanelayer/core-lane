@@ -202,6 +202,7 @@ impl RpcServer {
                 "/get_latest_block",
                 axum::routing::get(Self::handle_get_latest_block),
             )
+            .route("/kv/:key", axum::routing::get(Self::handle_kv_get))
             .route("/health", axum::routing::get(Self::handle_health))
             .route(
                 "/bitcoin/wallet/balance",
@@ -267,7 +268,8 @@ impl RpcServer {
 
             // Storage and state methods
             "eth_getStorageAt" => Self::handle_get_storage_at(request, &state).await,
-
+            // KV read via JSON-RPC for applications
+            "corelane_getKV" => Self::handle_get_kv_rpc(request, &state).await,
             // Call and execution methods
             "eth_call" => Self::handle_call(request, &state).await,
 
@@ -383,6 +385,45 @@ impl RpcServer {
         Ok(JsonResponse::from(JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: Some(json!(code_hex)),
+            error: None,
+            id: request.id,
+        }))
+    }
+
+    async fn handle_get_kv_rpc(
+        request: JsonRpcRequest,
+        state: &Arc<Self>,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        if request.params.len() != 1 {
+            return Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: "Invalid params".to_string(),
+                }),
+                id: request.id,
+            }));
+        }
+
+        let key = request.params[0].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+
+        let state_guard = state.state.lock().await;
+
+        // Check applied state
+        if let Some(value) = state_guard.account_manager.get_kv(key) {
+            let hex_str = format!("0x{}", hex::encode(value));
+            return Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: Some(json!(hex_str)),
+                error: None,
+                id: request.id,
+            }));
+        }
+
+        Ok(JsonResponse::from(JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            result: Some(Value::Null),
             error: None,
             id: request.id,
         }))
@@ -2234,7 +2275,7 @@ impl RpcServer {
                                     .to_string(),
                             }),
                             id: request.id,
-                        }))
+                        }));
                     }
                 }
             }
@@ -2250,7 +2291,7 @@ impl RpcServer {
                                 .to_string(),
                         }),
                         id: request.id,
-                    }))
+                    }));
                 }
             },
             _ => {
@@ -2263,7 +2304,7 @@ impl RpcServer {
                             .to_string(),
                     }),
                     id: request.id,
-                }))
+                }));
             }
         };
 
@@ -2751,6 +2792,22 @@ impl RpcServer {
             .header("X-Block-Number", latest_block.to_string())
             .body(axum::body::Body::from(bytes))
             .unwrap())
+    }
+
+    async fn handle_kv_get(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        axum::extract::Path(key): axum::extract::Path<String>,
+    ) -> Result<axum::response::Response, StatusCode> {
+        let state = rpc_state.state.lock().await;
+
+        if let Some(value) = state.account_manager.get_kv(&key) {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .body(axum::body::Body::from(value.clone()))
+                .unwrap());
+        }
+        Err(StatusCode::NOT_FOUND)
     }
 
     /// GET /health
