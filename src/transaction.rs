@@ -21,14 +21,16 @@ use cartesi_machine::types::cmio::ManualReason;
 use cartesi_machine::Machine;
 use runner::http_client::start_health_check;
 use runner::http_health_check_client::add_http_health_check_client;
-use runner::http_server::add_http_server;
+use runner::http_server::{add_http_server_with_kv_store, KvStore};
 use runner::utils::RunnerState;
 use runner::webhook_delivery::{add_webhook_delivery_service, Submission};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time;
 use tracing::{debug, info};
 
 fn build_submission_from_input(input: &Bytes) -> Submission {
@@ -260,10 +262,21 @@ fn execute_transfer<T: ProcessingContext>(
 
     if to == CoreLaneAddresses::cartesi_http_runner() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
-        return tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(execute_cartesi_http_runner(input, gas_used, state))
+        let bundle_state_arc = Arc::new(std::sync::Mutex::new(bundle_state.clone()));
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(execute_cartesi_http_runner(
+                input,
+                gas_used,
+                state,
+                bundle_state_arc.clone(),
+            ))
         });
+        {
+            let locked = bundle_state_arc.lock().unwrap();
+            *bundle_state = locked.clone();
+        }
+
+        return result;
     }
 
     if to == CoreLaneAddresses::exit_marketplace() {
@@ -1166,10 +1179,25 @@ fn execute_transfer<T: ProcessingContext>(
     })
 }
 
+impl KvStore for BundleStateManager {
+    fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
+        BundleStateManager::get_kv(self, key).cloned()
+    }
+
+    fn insert_kv(&mut self, key: String, value: Vec<u8>) {
+        BundleStateManager::insert_kv(self, key, value);
+    }
+
+    fn remove_kv(&mut self, key: &str) -> Option<Vec<u8>> {
+        BundleStateManager::remove_kv(self, key)
+    }
+}
+
 async fn execute_cartesi_http_runner<T: ProcessingContext>(
     input: Bytes,
     gas_used: U256,
     _state: &mut T,
+    bundle_state: Arc<std::sync::Mutex<BundleStateManager>>,
 ) -> Result<ExecutionResult> {
     let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
 
@@ -1178,15 +1206,15 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         &RuntimeConfig::default(),
     )?);
 
-    let state = Arc::new(Mutex::new(RunnerState::new()));
+    let runner_state = Arc::new(Mutex::new(RunnerState::new()));
 
     const GUEST_CID: u32 = 1;
     const CONTAINER_PORT: u32 = 8080;
     const HTTP_CLIENT_PORT: u32 = 9002;
 
-    let (mut health_check_receiver, mut submit_done_receiver) = {
-        let mut state_guard = state.lock().await;
-        add_http_server(&mut state_guard);
+    let (mut health_rx, mut submit_done_rx) = {
+        let mut state_guard = runner_state.lock().await;
+        add_http_server_with_kv_store(&mut state_guard, bundle_state.clone());
         let health_rx: tokio::sync::mpsc::Receiver<bool> =
             add_http_health_check_client(&mut state_guard, 9000, 10);
         let submit_done_rx = add_webhook_delivery_service(&mut state_guard, HTTP_CLIENT_PORT, 3);
@@ -1194,11 +1222,11 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     };
 
     {
-        let mut state_guard = state.lock().await;
+        let mut state_guard = runner_state.lock().await;
         start_health_check(&mut state_guard, 9000, 1, CONTAINER_PORT).unwrap();
     }
 
-    let state_for_loop = Arc::clone(&state);
+    let state_for_loop = Arc::clone(&runner_state);
 
     let machine_loop_fut = {
         let state = state_for_loop.clone();
@@ -1211,16 +1239,60 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         }
     };
 
-    let state_for_webhook = Arc::clone(&state);
+    let state_for_webhook = Arc::clone(&runner_state);
     let submission = build_submission_from_input(&input);
 
     let health_check_and_webhook_fut = async move {
+        const MAX_ATTEMPTS: u32 = 20;
+
         info!("Waiting for health check to succeed...");
-        let health_check_result = health_check_receiver.recv().await;
-        if let Some(true) = health_check_result {
-            info!("Health check succeeded! Proceeding with webhook submission...");
-        } else {
-            info!("Health check failed, skipping webhook submission...");
+        let mut succeeded = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            // Clear any leftover messages from the health channel so a late arrival from a prior attempt can't be mistaken for a new successful health check.
+            while health_rx.try_recv().is_ok() {
+                info!(
+                    "Drained stale health check message before attempt {}",
+                    attempt
+                );
+            }
+
+            {
+                let mut state_guard = state_for_webhook.lock().await;
+                info!(
+                    "Starting health check attempt {}/{}...",
+                    attempt, MAX_ATTEMPTS
+                );
+                if let Err(e) = start_health_check(&mut state_guard, 9000, 1, 8080) {
+                    info!("Failed to start health check attempt {}: {}", attempt, e);
+                }
+            }
+
+            match time::timeout(Duration::from_secs(5), health_rx.recv()).await {
+                Ok(Some(true)) => {
+                    info!("Health check succeeded! Proceeding with webhook submission...");
+                    succeeded = true;
+                    break;
+                }
+                Ok(Some(_)) => {
+                    info!("Received non-success health check message, continuing attempts...");
+                }
+                Ok(None) => {
+                    info!("Health channel closed unexpectedly");
+                    break;
+                }
+                Err(_) => {
+                    info!("Health check attempt {} timed out", attempt);
+                }
+            }
+
+            time::sleep(Duration::from_secs(5)).await;
+        }
+
+        if !succeeded {
+            info!(
+                "Health check failed after {} attempts, skipping webhook submission...",
+                MAX_ATTEMPTS
+            );
             return;
         }
 
@@ -1263,9 +1335,11 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         }
 
         info!("Waiting for webhook submission response...");
-        if let Some(done) = submit_done_receiver.recv().await {
+        if let Some(done) = submit_done_rx.recv().await {
             info!("Webhook submission completed: {}", done);
         }
+
+        info!("All operations completed successfully");
     };
 
     tokio::select! {
@@ -1277,7 +1351,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         }
     };
 
-    let state_clone = Arc::clone(&state);
+    let state_clone = Arc::clone(&runner_state);
 
     let (machine_output, execution_success) = {
         let mut state_guard = state_clone.lock().await;
