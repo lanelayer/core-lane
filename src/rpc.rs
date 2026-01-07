@@ -69,6 +69,55 @@ impl BitcoinClientConfig {
     }
 }
 
+/// Wallet balance data structure
+struct WalletBalanceData {
+    network_str: String,
+    total_sats: u64,
+    confirmed_sats: u64,
+    unconfirmed_sats: u64,
+    total_btc: String,
+    confirmed_btc: String,
+    unconfirmed_btc: String,
+}
+
+/// Wallet balance error types
+enum WalletBalanceError {
+    /// Wallet database file not found
+    WalletNotFound(String),
+    /// Invalid mnemonic or key derivation failure
+    InvalidMnemonic(String),
+    /// Failed to open or load wallet database
+    DatabaseError(String),
+    /// Wallet not found in database
+    WalletNotInDatabase,
+    /// Missing required configuration (e.g., electrum URL or bitcoin RPC client)
+    ConfigError(String),
+}
+
+impl WalletBalanceError {
+    /// Convert error to HTTP status code
+    fn to_status_code(&self) -> StatusCode {
+        match self {
+            WalletBalanceError::WalletNotFound(_) => StatusCode::NOT_FOUND,
+            WalletBalanceError::InvalidMnemonic(_) => StatusCode::BAD_REQUEST,
+            WalletBalanceError::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            WalletBalanceError::WalletNotInDatabase => StatusCode::NOT_FOUND,
+            WalletBalanceError::ConfigError(_) => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    /// Get error message
+    fn message(&self) -> String {
+        match self {
+            WalletBalanceError::WalletNotFound(msg) => msg.clone(),
+            WalletBalanceError::InvalidMnemonic(msg) => msg.clone(),
+            WalletBalanceError::DatabaseError(msg) => msg.clone(),
+            WalletBalanceError::WalletNotInDatabase => "Wallet not found in database".to_string(),
+            WalletBalanceError::ConfigError(msg) => msg.clone(),
+        }
+    }
+}
+
 pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
     bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
@@ -154,6 +203,10 @@ impl RpcServer {
                 axum::routing::get(Self::handle_get_latest_block),
             )
             .route("/health", axum::routing::get(Self::handle_health))
+            .route(
+                "/bitcoin/wallet/balance",
+                axum::routing::get(Self::handle_bitcoin_wallet_balance),
+            )
             .with_state(Arc::new(self))
     }
 
@@ -208,6 +261,9 @@ impl RpcServer {
             "eth_baseFeePerGas" => Self::handle_base_fee_per_gas(&state, request).await,
             "corelane_sequencerBalance" => Self::handle_sequencer_balance(&state, request).await,
             "corelane_totalBurned" => Self::handle_total_burned(&state, request).await,
+            "bitcoin_getWalletBalance" => {
+                Self::handle_bitcoin_wallet_balance_rpc(request, &state).await
+            }
 
             // Storage and state methods
             "eth_getStorageAt" => Self::handle_get_storage_at(request, &state).await,
@@ -2712,6 +2768,335 @@ impl RpcServer {
             "latest_block": latest_block,
             "last_processed_bitcoin_height": state.last_processed_bitcoin_height,
         })))
+    }
+
+    /// Helper function to load, sync (Electrum/RPC), and get wallet balance
+    /// Returns the balance data or an error
+    fn get_wallet_balance(
+        mnemonic: &str,
+        network: bitcoin::Network,
+        data_dir: &str,
+        electrum_url: Option<&str>,
+        bitcoin_client: Option<&bitcoincore_rpc::Client>,
+    ) -> Result<WalletBalanceData, WalletBalanceError> {
+        use bdk_wallet::keys::bip39::Mnemonic;
+        use bdk_wallet::keys::DerivableKey;
+        use bdk_wallet::keys::ExtendedKey;
+        use bdk_wallet::rusqlite::Connection;
+        use bdk_wallet::{KeychainKind, Wallet};
+
+        let network_str = match network {
+            bitcoin::Network::Bitcoin => "bitcoin",
+            bitcoin::Network::Testnet => "testnet",
+            bitcoin::Network::Testnet4 => "testnet4",
+            bitcoin::Network::Signet => "signet",
+            bitcoin::Network::Regtest => "regtest",
+        };
+
+        let wallet_path =
+            std::path::Path::new(data_dir).join(format!("wallet_{}.sqlite3", network_str));
+
+        if !wallet_path.exists() {
+            return Err(WalletBalanceError::WalletNotFound(format!(
+                "Wallet database not found at: {}",
+                wallet_path.display()
+            )));
+        }
+
+        let mut conn = Connection::open(&wallet_path).map_err(|e| {
+            WalletBalanceError::DatabaseError(format!("Failed to open wallet database: {}", e))
+        })?;
+
+        // Parse mnemonic and derive descriptors
+        let mnemonic = Mnemonic::parse(mnemonic)
+            .map_err(|_| WalletBalanceError::InvalidMnemonic("Invalid mnemonic".to_string()))?;
+
+        let xkey: ExtendedKey = mnemonic.into_extended_key().map_err(|_| {
+            WalletBalanceError::InvalidMnemonic(
+                "Failed to derive extended key from mnemonic".to_string(),
+            )
+        })?;
+
+        let xprv = xkey.into_xprv(network).ok_or_else(|| {
+            WalletBalanceError::InvalidMnemonic("Failed to get extended private key".to_string())
+        })?;
+
+        let external_descriptor = format!("wpkh({}/0/*)", xprv);
+        let internal_descriptor = format!("wpkh({}/1/*)", xprv);
+
+        // Load wallet
+        let wallet_opt = Wallet::load()
+            .descriptor(KeychainKind::External, Some(external_descriptor.clone()))
+            .descriptor(KeychainKind::Internal, Some(internal_descriptor.clone()))
+            .extract_keys()
+            .check_network(network)
+            .load_wallet(&mut conn)
+            .map_err(|e| {
+                WalletBalanceError::DatabaseError(format!(
+                    "Failed to load wallet from database: {}",
+                    e
+                ))
+            })?;
+
+        let wallet = wallet_opt.ok_or(WalletBalanceError::WalletNotInDatabase)?;
+
+        // Sync wallet before reading balance
+        match network {
+            bitcoin::Network::Regtest => {
+                // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::Emitter;
+                let rpc = bitcoin_client.ok_or_else(|| {
+                    WalletBalanceError::ConfigError(
+                        "Bitcoin RPC client not configured for regtest sync".to_string(),
+                    )
+                })?;
+
+                let mut emitter = Emitter::new(
+                    rpc,
+                    wallet.latest_checkpoint().clone(),
+                    0,
+                    std::iter::empty::<Arc<bitcoin::Transaction>>(),
+                );
+
+                let mut wallet = wallet;
+                while let Some(block_emission) = emitter.next_block().map_err(|e| {
+                    WalletBalanceError::DatabaseError(format!(
+                        "Failed to fetch blocks from Bitcoin RPC: {}",
+                        e
+                    ))
+                })? {
+                    wallet
+                        .apply_block(&block_emission.block, block_emission.block_height())
+                        .map_err(|e| {
+                            WalletBalanceError::DatabaseError(format!(
+                                "Failed to apply block: {}",
+                                e
+                            ))
+                        })?;
+                }
+
+                wallet
+                    .persist(&mut conn)
+                    .map_err(|e| WalletBalanceError::DatabaseError(format!("{}", e)))?;
+
+                // Proceed with the synced wallet
+                let balance = wallet.balance();
+                Ok(WalletBalanceData {
+                    network_str: network_str.to_string(),
+                    total_sats: balance.total().to_sat(),
+                    confirmed_sats: balance.confirmed.to_sat(),
+                    unconfirmed_sats: balance.untrusted_pending.to_sat(),
+                    total_btc: format!("{:.8}", balance.total().to_sat() as f64 / 100_000_000.0),
+                    confirmed_btc: format!(
+                        "{:.8}",
+                        balance.confirmed.to_sat() as f64 / 100_000_000.0
+                    ),
+                    unconfirmed_btc: format!(
+                        "{:.8}",
+                        balance.untrusted_pending.to_sat() as f64 / 100_000_000.0
+                    ),
+                })
+            }
+            _ => {
+                // Use Electrum for non-regtest networks
+                use bdk_electrum::{electrum_client, BdkElectrumClient};
+
+                let url = electrum_url.ok_or_else(|| {
+                    WalletBalanceError::ConfigError(format!(
+                        "Electrum URL required for network: {}",
+                        network_str
+                    ))
+                })?;
+
+                let electrum_client = electrum_client::Client::new(url).map_err(|e| {
+                    WalletBalanceError::DatabaseError(format!(
+                        "Failed to connect to Electrum: {}",
+                        e
+                    ))
+                })?;
+                let electrum = BdkElectrumClient::new(electrum_client);
+
+                let request = wallet.start_sync_with_revealed_spks().build();
+                let response = electrum.sync(request, 5, false).map_err(|e| {
+                    WalletBalanceError::DatabaseError(format!(
+                        "Failed to sync with Electrum: {}",
+                        e
+                    ))
+                })?;
+
+                let mut wallet = wallet;
+                wallet.apply_update(response).map_err(|e| {
+                    WalletBalanceError::DatabaseError(format!("Sync apply failed: {}", e))
+                })?;
+                wallet
+                    .persist(&mut conn)
+                    .map_err(|e| WalletBalanceError::DatabaseError(format!("{}", e)))?;
+
+                let balance = wallet.balance();
+                Ok(WalletBalanceData {
+                    network_str: network_str.to_string(),
+                    total_sats: balance.total().to_sat(),
+                    confirmed_sats: balance.confirmed.to_sat(),
+                    unconfirmed_sats: balance.untrusted_pending.to_sat(),
+                    total_btc: format!("{:.8}", balance.total().to_sat() as f64 / 100_000_000.0),
+                    confirmed_btc: format!(
+                        "{:.8}",
+                        balance.confirmed.to_sat() as f64 / 100_000_000.0
+                    ),
+                    unconfirmed_btc: format!(
+                        "{:.8}",
+                        balance.untrusted_pending.to_sat() as f64 / 100_000_000.0
+                    ),
+                })
+            }
+        }
+    }
+
+    /// GET /bitcoin/wallet/balance
+    /// Returns the Bitcoin wallet balance from BDK wallet
+    async fn handle_bitcoin_wallet_balance(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+    ) -> Result<JsonResponse<serde_json::Value>, StatusCode> {
+        // Check if wallet is configured
+        let mnemonic_str = match &rpc_state.mnemonic {
+            Some(m) => m,
+            None => {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+
+        let network = match rpc_state.network {
+            Some(n) => n,
+            None => {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        };
+
+        // Get wallet balance using shared helper (wrapped in spawn_blocking for blocking I/O)
+        let mnemonic_str = mnemonic_str.to_string();
+        let data_dir = rpc_state.data_dir.clone();
+        let electrum_url = rpc_state.electrum_url.clone();
+        let bitcoin_client = rpc_state.bitcoin_client.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            Self::get_wallet_balance(
+                &mnemonic_str,
+                network,
+                &data_dir,
+                electrum_url.as_deref(),
+                bitcoin_client.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(balance_data)) => Ok(JsonResponse(json!({
+                "network": balance_data.network_str,
+                "total_sats": balance_data.total_sats,
+                "confirmed_sats": balance_data.confirmed_sats,
+                "unconfirmed_sats": balance_data.unconfirmed_sats,
+                "total_btc": balance_data.total_btc,
+                "confirmed_btc": balance_data.confirmed_btc,
+                "unconfirmed_btc": balance_data.unconfirmed_btc,
+            }))),
+            Ok(Err(err)) => Err(err.to_status_code()),
+            Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    /// JSON-RPC method: bitcoin_getWalletBalance
+    /// Returns the Bitcoin wallet balance from BDK wallet
+    async fn handle_bitcoin_wallet_balance_rpc(
+        request: JsonRpcRequest,
+        state: &Arc<Self>,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        // Check if wallet is configured
+        let mnemonic_str = match &state.mnemonic {
+            Some(m) => m,
+            None => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32000,
+                        message:
+                            "Wallet not configured: Mnemonic is required for wallet operations"
+                                .to_string(),
+                    }),
+                    id: request.id,
+                }));
+            }
+        };
+
+        let network = match state.network {
+            Some(n) => n,
+            None => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32000,
+                        message: "Network not configured: Bitcoin network is required for wallet operations".to_string(),
+                    }),
+                    id: request.id,
+                }));
+            }
+        };
+
+        // Get wallet balance using shared helper (wrapped in spawn_blocking for blocking I/O)
+        let mnemonic_str = mnemonic_str.to_string();
+        let data_dir = state.data_dir.clone();
+        let electrum_url = state.electrum_url.clone();
+        let bitcoin_client = state.bitcoin_client.clone();
+        let request_id = request.id.clone();
+
+        match tokio::task::spawn_blocking(move || {
+            Self::get_wallet_balance(
+                &mnemonic_str,
+                network,
+                &data_dir,
+                electrum_url.as_deref(),
+                bitcoin_client.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(balance_data)) => {
+                let result = json!({
+                    "network": balance_data.network_str,
+                    "total_sats": balance_data.total_sats,
+                    "confirmed_sats": balance_data.confirmed_sats,
+                    "unconfirmed_sats": balance_data.unconfirmed_sats,
+                    "total_btc": balance_data.total_btc,
+                    "confirmed_btc": balance_data.confirmed_btc,
+                    "unconfirmed_btc": balance_data.unconfirmed_btc,
+                });
+
+                Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: Some(result),
+                    error: None,
+                    id: request_id,
+                }))
+            }
+            Ok(Err(err)) => Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32000,
+                    message: err.message(),
+                }),
+                id: request_id,
+            })),
+            Err(_) => Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: "Internal error: task execution failed".to_string(),
+                }),
+                id: request_id,
+            })),
+        }
     }
 }
 
