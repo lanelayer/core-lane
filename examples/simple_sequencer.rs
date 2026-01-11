@@ -122,8 +122,15 @@ async fn main() -> Result<()> {
             let mut tx_bundle = BundleStateManager::new();
 
             // Call execute_transaction directly, just like the main node does
-            let result =
-                execute_transaction(&envelope, sender, &mut tx_bundle, &mut state_context)?;
+            // Use a test timestamp (Unix timestamp for a test date)
+            let block_timestamp = 1704067200; // 2024-01-01 00:00:00 UTC
+            let result = execute_transaction(
+                &envelope,
+                sender,
+                &mut tx_bundle,
+                &mut state_context,
+                block_timestamp,
+            )?;
 
             if result.success {
                 println!("   ✅ Transaction executed successfully!");
