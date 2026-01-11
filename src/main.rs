@@ -1600,6 +1600,7 @@ impl CoreLaneNode {
                             max_gas_limit,
                             cumulative_gas_used,
                             Some(bundle.sequencer_payment_recipient),
+                            new_block.timestamp,
                         )
                         .await;
 
@@ -1716,6 +1717,7 @@ impl CoreLaneNode {
                                 max_gas_limit,
                                 cumulative_gas_used,
                                 Some(bundle.sequencer_payment_recipient),
+                                new_block.timestamp,
                             )
                             .await;
 
@@ -1801,6 +1803,7 @@ impl CoreLaneNode {
         max_block_gas_limit: U256,
         cumulative_gas_used: U256,
         sequencer_payment_recipient: Option<Address>,
+        block_timestamp: u64,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
@@ -1919,14 +1922,15 @@ impl CoreLaneNode {
         }
 
         // Execute transaction with bundle state
-        let execution_result = match execute_transaction(&tx.0, tx.1, bundle_state, &mut *state) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("      ⚠️  Transaction execution failed with error: {}", e);
-                // Return None to skip this transaction
-                return None;
-            }
-        };
+        let execution_result =
+            match execute_transaction(&tx.0, tx.1, bundle_state, &mut *state, block_timestamp) {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("      ⚠️  Transaction execution failed with error: {}", e);
+                    // Return None to skip this transaction
+                    return None;
+                }
+            };
 
         // Log execution outcome
         if execution_result.success {
