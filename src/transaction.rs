@@ -1332,8 +1332,35 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         );
     }
 
-    // Prepare webhook submission data
-    let submission = build_submission_from_input(&input, block_timestamp);
+    // Parse input format: <path>\0<payload> (null byte separator is required)
+    // Note: path in transaction data does NOT include the leading /, we add it here
+    let (webhook_path, payload) = if let Some(null_pos) = input.iter().position(|&b| b == 0) {
+        // Format: <path>\0<payload> where path is without leading /
+        let path_bytes = &input[..null_pos];
+        let payload_bytes = &input[null_pos + 1..];
+
+        if path_bytes.is_empty() {
+            return Err(anyhow::anyhow!("Webhook path cannot be empty"));
+        }
+
+        let path = String::from_utf8(path_bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in webhook path: {}", e))?;
+
+        // Add leading / to construct the webhook path
+        let full_path = format!("/{}", path);
+
+        info!("Using webhook path: {}", full_path);
+        (full_path, Bytes::from(payload_bytes.to_vec()))
+    } else {
+        // Null byte separator is required - fail if not present
+        return Err(anyhow::anyhow!(
+            "Input must contain null byte separator (format: <path>\\0<payload>), got {} bytes without separator",
+            input.len()
+        ));
+    };
+
+    // Prepare webhook submission data from payload
+    let submission = build_submission_from_input(&payload, block_timestamp);
     let body = match serde_json::to_vec(&submission) {
         Ok(b) => b,
         Err(e) => {
@@ -1345,7 +1372,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     let mut execution_state = ExecutionState::WaitingForHealthCheck;
     let mut webhook_data = Some((
         HTTP_CLIENT_PORT,
-        "/submit".to_string(),
+        webhook_path,
         "localhost:8080".to_string(),
         body,
         "application/json".to_string(),
