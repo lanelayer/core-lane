@@ -636,6 +636,10 @@ struct CoreLaneState {
     sequencer_address: Address,               // Address that receives priority fees
     total_burned_amount: U256,                // Total amount burned from base fees
     bitcoin_network: bitcoin::Network,        // Bitcoin network (mainnet, testnet, regtest, etc.)
+    // Metrics tracking
+    reorgs_detected: u64, // Counter for blockchain reorganizations detected
+    total_sequencer_payments: U256, // Cumulative priority fees paid to sequencers (in wei)
+    last_block_processing_time_ms: Option<u64>, // Last block processing time in milliseconds
 }
 
 impl CoreLaneState {
@@ -879,6 +883,10 @@ impl CoreLaneNode {
             sequencer_address: sequencer_addr,
             total_burned_amount: U256::ZERO,
             bitcoin_network: network,
+            // Initialize metrics tracking
+            reorgs_detected: 0,
+            total_sequencer_payments: U256::ZERO,
+            last_block_processing_time_ms: None,
         }));
 
         // Write genesis state to disk
@@ -1408,7 +1416,7 @@ impl CoreLaneNode {
 
         // 🔍 REORG DETECTION: Check for blockchain reorganizations
         {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let height = bitcoin_block.anchor_block_height;
 
             // anchor_block_hash is now raw 32-byte hash
@@ -1421,6 +1429,9 @@ impl CoreLaneNode {
                         "🚨 REORG DETECTED! Height {} has different hash (same-height mismatch). Expected: {}, Got: {}",
                         height, existing_hash, current_hash
                     );
+
+                    // Increment reorg counter
+                    state.reorgs_detected += 1;
 
                     // Attempt to recover from reorg
                     match self.handle_reorg(&state).await {
@@ -1456,6 +1467,9 @@ impl CoreLaneNode {
                             "🚨 REORG DETECTED! Height {} parent hash mismatch. Expected: {}, Got: {}",
                             height, prev_hash, expected_parent_hash
                         );
+
+                        // Increment reorg counter
+                        state.reorgs_detected += 1;
 
                         // Attempt to recover from reorg
                         match self.handle_reorg(&state).await {
@@ -1790,6 +1804,12 @@ impl CoreLaneNode {
             block_execution_time, bitcoin_height, core_lane_block_number
         );
 
+        // Track block processing time
+        {
+            let mut state = self.state.lock().await;
+            state.last_block_processing_time_ms = Some(block_execution_time.as_millis() as u64);
+        }
+
         Ok(core_lane_block_number)
     }
 
@@ -1886,6 +1906,9 @@ impl CoreLaneNode {
                         "      💰 Paid sequencer priority fee: {} wei to {}",
                         priority_fee_portion, sequencer_address
                     );
+
+                    // Track total sequencer payments
+                    state.total_sequencer_payments += priority_fee_portion;
                 }
             }
 
