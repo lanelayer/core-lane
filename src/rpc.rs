@@ -2819,11 +2819,42 @@ impl RpcServer {
         let block_count = state.blocks.len();
         let latest_block = state.blocks.keys().max().copied().unwrap_or(0);
 
+        // Calculate the 4 metrics
+        let total_accounts = state.account_manager.accounts_count();
+        let total_transactions = state.account_manager.get_transactions().len();
+        let current_base_fee = state.eip1559_fee_manager.current_base_fee();
+        let total_burned_amount = state.total_burned_amount;
+
+        // Get the 3 tracked metrics
+        let reorgs_detected = state.reorgs_detected;
+        let total_sequencer_payments = state.total_sequencer_payments;
+        let last_block_processing_time_ms = state.last_block_processing_time_ms;
+
+        // Convert U256 to u128/u64 for JSON serialization
+        let current_base_fee_u128 = current_base_fee.to::<u128>();
+        let current_base_fee_gwei = (current_base_fee / U256::from(1_000_000_000u64)).to::<u64>();
+        let total_burned_u128 = total_burned_amount.to::<u128>();
+        let total_sequencer_payments_u128 = total_sequencer_payments.to::<u128>();
+
         Ok(JsonResponse(json!({
             "status": "ok",
             "block_count": block_count,
             "latest_block": latest_block,
             "last_processed_bitcoin_height": state.last_processed_bitcoin_height,
+            // State metrics
+            "total_accounts": total_accounts,
+            "total_transactions": total_transactions,
+            // Base fee (provide both wei and gwei for flexibility)
+            "current_base_fee_wei": current_base_fee_u128,
+            "current_base_fee_gwei": current_base_fee_gwei,
+            // Total burned (provide both wei and ETH for flexibility)
+            "total_burned_wei": total_burned_u128,
+            "total_burned_eth": format!("{:.9}", total_burned_u128 as f64 / 1e18),
+            // Performance and stability metrics
+            "reorgs_detected": reorgs_detected,
+            "total_sequencer_payments_wei": total_sequencer_payments_u128,
+            "total_sequencer_payments_eth": format!("{:.9}", total_sequencer_payments_u128 as f64 / 1e18),
+            "last_block_processing_time_ms": last_block_processing_time_ms,
         })))
     }
 

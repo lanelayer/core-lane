@@ -344,6 +344,10 @@ impl StateManager {
         &self.transactions
     }
 
+    pub fn accounts_count(&self) -> usize {
+        self.accounts.len()
+    }
+
     pub fn get_receipt(&self, tx_hash: &str) -> Option<&TransactionReceipt> {
         self.transaction_receipts.get(tx_hash)
     }
