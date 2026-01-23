@@ -2,7 +2,7 @@ use crate::intents::IntentSystem;
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::TxKind;
-use alloy_primitives::{hex, Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::Provider;
 use alloy_provider::ProviderBuilder;
 use alloy_rpc_types::TransactionRequest;
@@ -14,6 +14,8 @@ use bitcoin::Network;
 use clap::{Parser, Subcommand};
 use core_lane::bitcoin_rpc_client::BitcoinRpcReadClient;
 use core_lane::{create_bitcoin_rpc_client, BitcoinRpcClient};
+use client::SequencerClient;
+use futures::stream::StreamExt;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
@@ -23,7 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,7 @@ use core_lane::{bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, tran
 // RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
 mod derived;
 mod eip1559;
+mod espresso;
 mod rpc;
 
 // Default sequencer address that gets priority for bundle processing
@@ -145,10 +148,10 @@ fn create_wallet_from_mnemonic(
     plain_mode: bool,
     electrum_url: Option<&str>,
 ) -> Result<()> {
-    use bdk_wallet::bitcoin::Network as BdkNetwork;
-    use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
-    use bdk_wallet::rusqlite::Connection;
     use bdk_wallet::Wallet;
+    use bdk_wallet::bitcoin::Network as BdkNetwork;
+    use bdk_wallet::keys::{DerivableKey, ExtendedKey, bip39::Mnemonic};
+    use bdk_wallet::rusqlite::Connection;
 
     // Parse network (include "mainnet" mapping)
     let bdk_network = match network_str {
@@ -204,7 +207,7 @@ fn create_wallet_from_mnemonic(
                 );
             }
 
-            use bdk_electrum::{electrum_client, BdkElectrumClient};
+            use bdk_electrum::{BdkElectrumClient, electrum_client};
 
             let electrum_client = electrum_client::Client::new(electrum_url_str)
                 .map_err(|e| anyhow::anyhow!("Failed to connect to Electrum server: {}", e))?;
@@ -488,6 +491,36 @@ enum Commands {
         start_block: Option<u64>,
         #[arg(long)]
         derived_da_address: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        http_host: String,
+        #[arg(long, default_value = "8545")]
+        http_port: u16,
+        /// Sequencer RPC URL - if set, eth_sendRawTransaction will forward transactions to this endpoint
+        #[arg(long)]
+        sequencer_rpc_url: Option<String>,
+        /// Sequencer address that receives priority fees (hex format, e.g., 0x...)
+        /// If not provided, defaults to a well-known test address (insecure for production)
+        #[arg(long)]
+        sequencer_address: Option<String>,
+    },
+    EspressoStart {
+        /// Core Lane RPC URL for reading burns (funding)
+        #[arg(long, default_value = "http://127.0.0.1:8546")]
+        core_rpc_url: String,
+        /// Chain ID for the derived lane (must match Core Lane burn encoding)
+        #[arg(long, default_value_t = 1281453634)]
+        chain_id: u32,
+        /// Espresso sequencer URL
+        #[arg(long)]
+        espresso_url: String,
+        /// Namespace ID for filtering bundles from Espresso (default: 0)
+        #[arg(long, default_value_t = 0)]
+        espresso_namespace: u64,
+        #[arg(long)]
+        start_block: Option<u64>,
+        /// Start block for Core Lane burn scanning (defaults to latest - 10)
+        #[arg(long)]
+        core_start_block: Option<u64>,
         #[arg(long, default_value = "127.0.0.1")]
         http_host: String,
         #[arg(long, default_value = "8545")]
@@ -895,7 +928,7 @@ impl CoreLaneNode {
         )
     }
 
-    fn new_derived(
+    fn new_without_bitcoin(
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
@@ -1744,6 +1777,183 @@ impl CoreLaneNode {
         }
     }
 
+    async fn start_espresso_scanner(
+        &self,
+        espresso_url: String,
+        namespace: u64,
+        start_block: Option<u64>,
+        core_rpc_url: String,
+        chain_id: u32,
+        core_start_block: Option<u64>,
+    ) -> Result<()> {
+        info!(
+            "Starting Espresso scanner with URL: {}, namespace: {}",
+            espresso_url, namespace
+        );
+        info!(
+            "Core Lane burn scanner enabled: {}, chain_id: {}",
+            core_rpc_url, chain_id
+        );
+
+        let mut reorg_tracker = espresso::CoreLaneReorgTracker::new(core_rpc_url.clone());
+
+        let sequencer_url = Url::parse(&espresso_url)
+            .map_err(|e| anyhow::anyhow!("Invalid espresso URL '{}': {}", espresso_url, e))?;
+        let client = SequencerClient::new(sequencer_url);
+
+        if let Some(block) = start_block {
+            let mut state = self.state.lock().await;
+            state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+        }
+
+        // Track Core Lane height locally for burn scanning
+        let mut last_core_lane_height: Option<u64> = core_start_block.map(|b| b.saturating_sub(1));
+
+        loop {
+            let latest_block = client.get_height().await?;
+
+            let start_height = {
+                let state = self.state.lock().await;
+                match state.last_processed_bitcoin_height {
+                    None => latest_block.saturating_sub(1),
+                    Some(height) => height + 1,
+                }
+            };
+
+            if start_height > latest_block {
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            info!(
+                "Scanning Espresso blocks {} to {} (namespace: {})...",
+                start_height, latest_block, namespace
+            );
+
+            let mut subscriber = client.subscribe_blocks(start_height).await?;
+
+            while let Some(evt) = subscriber.next().await {
+                let header = evt?;
+                let height = header.height();
+
+                match espresso::process_espresso_block(height, namespace).await {
+                    Ok(mut parsed_block) => {
+                        let (burns, core_lane_block_infos) = self
+                            .fetch_core_lane_burns(
+                                &core_rpc_url,
+                                chain_id,
+                                &mut last_core_lane_height,
+                            )
+                            .await;
+                        for burn in burns {
+                            info!(
+                                "🔥 Adding burn from Core Lane: {} → {}",
+                                burn.amount, burn.address
+                            );
+                            parsed_block.add_burn(burn);
+                        }
+
+                        match self.process_block(parsed_block).await {
+                            Ok(core_lane_block_number) => {
+                                if core_lane_block_number == 0 {
+                                    info!("Espresso backend encountered reorg, restarting scan");
+                                }
+
+                                for (core_height, core_hash) in core_lane_block_infos {
+                                    reorg_tracker.record(height, core_height, core_hash);
+                                }
+
+                                if let Ok(Some(core_lane_height)) =
+                                    reorg_tracker.check_reorg().await
+                                {
+                                    warn!(
+                                        "🚨 Core Lane reorg detected at Core Lane block {} — pruning anchors",
+                                        core_lane_height
+                                    );
+                                    reorg_tracker
+                                        .remove_anchors_after_core_height(core_lane_height);
+                                }
+                            }
+                            Err(err) => {
+                                warn!("Failed to process Espresso block {}: {}", height, err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to fetch Espresso block {}: {}", height, err);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fetch_core_lane_burns(
+        &self,
+        core_rpc_url: &str,
+        chain_id: u32,
+        last_height: &mut Option<u64>,
+    ) -> (Vec<block::CoreLaneBurn>, Vec<(u64, B256)>) {
+        let mut all_burns = Vec::new();
+        let mut block_infos: Vec<(u64, B256)> = Vec::new();
+
+        // Get latest Core Lane block height
+        let latest_height = match derived::fetch_core_block_number(core_rpc_url).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Failed to fetch Core Lane block number: {}", e);
+                return (all_burns, block_infos);
+            }
+        };
+
+        let start_height = match *last_height {
+            Some(h) => h + 1,
+            None => latest_height.saturating_sub(10),
+        };
+
+        if start_height > latest_height {
+            return (all_burns, block_infos);
+        }
+
+        // Fetch burns from new Core Lane blocks
+        for height in start_height..=latest_height {
+            match derived::fetch_burns_from_core_lane_block(core_rpc_url, height, chain_id).await {
+                Ok(burns) => {
+                    // Also fetch the block hash while we know the block exists
+                    match derived::fetch_core_block_hash(core_rpc_url, height).await {
+                        Ok(hash) => {
+                            block_infos.push((height, hash));
+                            info!(
+                                "✅ Core Lane chain has block {} with hash {} (visible to Espresso)",
+                                height, hash
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to fetch Core Lane block hash for {}: {}", height, e);
+                        }
+                    }
+                    if !burns.is_empty() {
+                        info!(
+                            "🔥 Found {} burn(s) in Core Lane block {}",
+                            burns.len(),
+                            height
+                        );
+                    }
+                    all_burns.extend(burns);
+                    *last_height = Some(height);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch burns from Core Lane block {}: {}",
+                        height, e
+                    );
+                    break;
+                }
+            }
+        }
+
+        (all_burns, block_infos)
+    }
+
     async fn scan_new_blocks(&self) -> Result<()> {
         let bitcoin_client = self
             .bitcoin_client_read
@@ -1988,10 +2198,7 @@ impl CoreLaneNode {
                     if cumulative_gas_used + tx_gas_limit > max_gas_limit {
                         warn!(
                             "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping transaction with gas_limit: {}",
-                            new_block.number,
-                            cumulative_gas_used,
-                            max_gas_limit,
-                            tx_gas_limit
+                            new_block.number, cumulative_gas_used, max_gas_limit, tx_gas_limit
                         );
                         // Skip remaining transactions as we've hit the maximum
                         break;
@@ -2003,10 +2210,7 @@ impl CoreLaneNode {
                     {
                         info!(
                             "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
-                            new_block.number,
-                            target_gas_usage,
-                            max_gas_limit,
-                            cumulative_gas_used
+                            new_block.number, target_gas_usage, max_gas_limit, cumulative_gas_used
                         );
                     }
 
@@ -2043,9 +2247,7 @@ impl CoreLaneNode {
                         if cumulative_gas_used > max_gas_limit {
                             warn!(
                                 "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
-                                new_block.number,
-                                cumulative_gas_used,
-                                max_gas_limit
+                                new_block.number, cumulative_gas_used, max_gas_limit
                             );
                             break;
                         }
@@ -2106,12 +2308,9 @@ impl CoreLaneNode {
 
                         if cumulative_gas_used + tx_gas_limit > max_gas_limit {
                             warn!(
-                                    "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
-                                    new_block.number,
-                                    cumulative_gas_used,
-                                    max_gas_limit,
-                                    tx_gas_limit
-                                );
+                                "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
+                                new_block.number, cumulative_gas_used, max_gas_limit, tx_gas_limit
+                            );
                             break;
                         }
 
@@ -2119,12 +2318,12 @@ impl CoreLaneNode {
                             && cumulative_gas_used < target_gas_usage + tx_gas_limit
                         {
                             info!(
-                                    "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
-                                    new_block.number,
-                                    target_gas_usage,
-                                    max_gas_limit,
-                                    cumulative_gas_used
-                                );
+                                "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
+                                new_block.number,
+                                target_gas_usage,
+                                max_gas_limit,
+                                cumulative_gas_used
+                            );
                         }
 
                         let tx_result = self
@@ -2156,11 +2355,9 @@ impl CoreLaneNode {
 
                             if cumulative_gas_used > max_gas_limit {
                                 warn!(
-                                        "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
-                                        new_block.number,
-                                        cumulative_gas_used,
-                                        max_gas_limit
-                                    );
+                                    "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
+                                    new_block.number, cumulative_gas_used, max_gas_limit
+                                );
                                 break;
                             }
                         }
@@ -2351,7 +2548,10 @@ impl CoreLaneNode {
             let legacy_tx = tx.0.as_legacy().unwrap();
 
             if gas_price > legacy_tx.tx().gas_price {
-                warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
+                warn!(
+                    "      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}",
+                    tx.0
+                );
                 return None;
             }
 
@@ -2606,7 +2806,10 @@ impl CoreLaneNode {
 
                             if stored_hash.as_slice() == current_hash_bytes {
                                 // This height matches - this is the last common ancestor (fork point)
-                                info!("✅ Bitcoin height {} matches stored hash - this is the fork point (last common ancestor)", current_bitcoin_height);
+                                info!(
+                                    "✅ Bitcoin height {} matches stored hash - this is the fork point (last common ancestor)",
+                                    current_bitcoin_height
+                                );
                                 info!(
                                     "🔍 Fork point found at Bitcoin height {} (Core Lane block {})",
                                     current_bitcoin_height, core_block
@@ -2729,7 +2932,9 @@ impl CoreLaneNode {
                     state_mut.eip1559_fee_manager = metastate.eip1559_fee_manager;
                     state_mut.total_burned_amount = metastate.total_burned_amount;
                     state_mut.sequencer_address = metastate.sequencer_address;
-                    info!("✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address");
+                    info!(
+                        "✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address"
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -2898,7 +3103,9 @@ async fn main() -> Result<()> {
                 .transpose()?;
 
             if sequencer_addr.is_none() {
-                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
             } else {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
             }
@@ -3124,7 +3331,7 @@ async fn main() -> Result<()> {
             electrum_url,
         } => {
             use bdk_wallet::bitcoin::Network as BdkNetwork;
-            use bdk_wallet::keys::{bip39::Mnemonic, DerivableKey, ExtendedKey};
+            use bdk_wallet::keys::{DerivableKey, ExtendedKey, bip39::Mnemonic};
             use bdk_wallet::rusqlite::Connection;
             use bdk_wallet::{KeychainKind, Wallet};
 
@@ -3201,9 +3408,9 @@ async fn main() -> Result<()> {
             // Sync wallet based on network
             if network_str == "regtest" {
                 // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::Emitter;
                 use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
                 use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
-                use bdk_bitcoind_rpc::Emitter;
                 use std::sync::Arc;
 
                 if !cli.plain {
@@ -3233,7 +3440,7 @@ async fn main() -> Result<()> {
                 wallet.persist(&mut conn)?;
             } else {
                 // Use Electrum for other networks
-                use bdk_electrum::{electrum_client, BdkElectrumClient};
+                use bdk_electrum::{BdkElectrumClient, electrum_client};
 
                 let electrum_url = electrum_url.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("--electrum-url required for network: {}", network_str)
@@ -3298,7 +3505,7 @@ async fn main() -> Result<()> {
             }
 
             // Create burn transaction with BDK
-            use bitcoin::{blockdata::opcodes::all::OP_RETURN, Amount, ScriptBuf};
+            use bitcoin::{Amount, ScriptBuf, blockdata::opcodes::all::OP_RETURN};
 
             if !cli.plain {
                 info!("🔥 Building burn transaction...");
@@ -3441,7 +3648,9 @@ async fn main() -> Result<()> {
 
             if !finalized {
                 if !cli.plain {
-                    warn!("⚠️  Transaction not fully finalized by BDK, attempting manual finalization...");
+                    warn!(
+                        "⚠️  Transaction not fully finalized by BDK, attempting manual finalization..."
+                    );
                 }
 
                 // Try manual finalization with miniscript
@@ -3542,7 +3751,10 @@ async fn main() -> Result<()> {
                 println!("{}", txid);
             } else {
                 info!("✅ Wallet updated - inputs marked as spent");
-                info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_addr);
+                info!(
+                    "🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!",
+                    burn_amount, eth_addr
+                );
             }
         }
 
@@ -3655,7 +3867,7 @@ async fn main() -> Result<()> {
                     return Err(anyhow::anyhow!(
                         "Invalid bundle marker: {}. Must be 'head' or 'standard'",
                         marker
-                    ))
+                    ));
                 }
             };
 
@@ -3796,7 +4008,10 @@ async fn main() -> Result<()> {
                                 Ok(json) => {
                                     if let Some(result) = json.get("result") {
                                         if let Some(count) = result.as_u64() {
-                                            info!("✅ Bitcoin RPC connection successful! Current block height: {}", count);
+                                            info!(
+                                                "✅ Bitcoin RPC connection successful! Current block height: {}",
+                                                count
+                                            );
                                         }
                                     } else if let Some(error) = json.get("error") {
                                         if !error.is_null() {
@@ -3902,7 +4117,9 @@ async fn main() -> Result<()> {
 
             let addr = format!("{}:{}", host, port);
             info!("📡 Bitcoin Cache RPC listening on http://{}", addr);
-            info!("📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only), getblockchaininfo");
+            info!(
+                "📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only), getblockchaininfo"
+            );
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;
@@ -3915,8 +4132,8 @@ async fn main() -> Result<()> {
             electrum_url,
         } => {
             use bdk_wallet::keys::{
-                bip39::{Language, Mnemonic, WordCount},
                 GeneratableKey, GeneratedKey,
+                bip39::{Language, Mnemonic, WordCount},
             };
 
             // Either use provided mnemonic or generate a new one
@@ -4074,8 +4291,8 @@ async fn main() -> Result<()> {
             rpc_user,
             rpc_password,
         } => {
-            use bdk_wallet::rusqlite::Connection;
             use bdk_wallet::Wallet;
+            use bdk_wallet::rusqlite::Connection;
 
             let db_path = wallet_db_path(&cli.data_dir, network);
 
@@ -4121,9 +4338,9 @@ async fn main() -> Result<()> {
 
             if network == "regtest" {
                 // Use bitcoind RPC for regtest
+                use bdk_bitcoind_rpc::Emitter;
                 use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
                 use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
-                use bdk_bitcoind_rpc::Emitter;
                 use std::sync::Arc;
 
                 if !cli.plain {
@@ -4152,7 +4369,7 @@ async fn main() -> Result<()> {
                 wallet.persist(&mut conn)?;
             } else {
                 // Use Electrum for other networks
-                use bdk_electrum::{electrum_client, BdkElectrumClient};
+                use bdk_electrum::{BdkElectrumClient, electrum_client};
 
                 let electrum_url = electrum_url.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("--electrum-url required for network: {}", network)
@@ -4234,13 +4451,18 @@ async fn main() -> Result<()> {
                 .transpose()?;
 
             if sequencer_addr.is_none() {
-                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
             } else {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
             }
 
-            let node =
-                CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
+            let node = CoreLaneNode::new_without_bitcoin(
+                cli.data_dir.clone(),
+                Network::Regtest,
+                sequencer_addr,
+            );
 
             let da_address = Address::from_str(derived_da_address).map_err(|err| {
                 anyhow::anyhow!(
@@ -4281,6 +4503,86 @@ async fn main() -> Result<()> {
             let scanner_handle = tokio::spawn(async move {
                 node.start_core_lane_scanner(core_rpc_url, chain_id, start_block, da_address)
                     .await
+            });
+
+            let _ = tokio::try_join!(server_handle, scanner_handle)?;
+        }
+        Commands::EspressoStart {
+            core_rpc_url,
+            chain_id,
+            espresso_url,
+            espresso_namespace,
+            start_block,
+            core_start_block,
+            http_host,
+            http_port,
+            sequencer_rpc_url,
+            sequencer_address,
+        } => {
+            let sequencer_addr = sequencer_address
+                .as_ref()
+                .map(|addr_str| {
+                    Address::from_str(addr_str).map_err(|e| {
+                        anyhow::anyhow!("Invalid sequencer address '{}': {}", addr_str, e)
+                    })
+                })
+                .transpose()?;
+
+            if sequencer_addr.is_none() {
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
+            } else {
+                info!("✅ Using sequencer address: {:?}", sequencer_addr);
+            }
+
+            let node = CoreLaneNode::new_without_bitcoin(
+                cli.data_dir.clone(),
+                Network::Regtest,
+                sequencer_addr,
+            );
+
+            let shared_state = Arc::clone(&node.state);
+
+            let rpc_server = RpcServer::with_espresso(
+                shared_state,
+                cli.data_dir.clone(),
+                sequencer_rpc_url.clone(),
+                Some(espresso_url.clone()),
+            );
+
+            if let Some(ref url) = sequencer_rpc_url {
+                info!("🔄 Sequencer RPC forwarding enabled: {}", url);
+            }
+
+            let app = rpc_server.router();
+            let addr = format!("{}:{}", http_host, http_port);
+            info!(
+                "🚀 Starting JSON-RPC server on http://{} (Espresso mode, namespace: {})",
+                addr, espresso_namespace
+            );
+
+            let server_handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let start_block = *start_block;
+            let core_start_block = *core_start_block;
+            let espresso_namespace = *espresso_namespace;
+            let chain_id = *chain_id;
+            let espresso_url = espresso_url.clone();
+            let core_rpc_url_clone = core_rpc_url.clone();
+            let scanner_handle = tokio::spawn(async move {
+                node.start_espresso_scanner(
+                    espresso_url,
+                    espresso_namespace,
+                    start_block,
+                    core_rpc_url_clone,
+                    chain_id,
+                    core_start_block,
+                )
+                .await
             });
 
             let _ = tokio::try_join!(server_handle, scanner_handle)?;

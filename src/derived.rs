@@ -180,3 +180,51 @@ fn extract_burn(
 
     Ok(Some(CoreLaneBurn::new(amount, recipient)))
 }
+
+/// Fetch only burns from a Core Lane block (for Espresso mode)
+pub async fn fetch_burns_from_core_lane_block(
+    rpc_url: &str,
+    height: u64,
+    chain_id: u32,
+) -> Result<Vec<CoreLaneBurn>> {
+    let url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let block = provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+        .await?
+        .ok_or_else(|| anyhow!("Core Lane block {} not found", height))?;
+
+    let txs: Vec<alloy_rpc_types::Transaction> = match &block.transactions {
+        alloy_rpc_types::BlockTransactions::Full(txs) => txs.to_vec(),
+        alloy_rpc_types::BlockTransactions::Hashes(hashes) => {
+            let mut full_txs = Vec::new();
+            for hash in hashes {
+                if let Ok(Some(tx)) = provider.get_transaction_by_hash(*hash).await {
+                    full_txs.push(tx);
+                }
+            }
+            full_txs
+        }
+        alloy_rpc_types::BlockTransactions::Uncle => Vec::new(),
+    };
+
+    let mut burns = Vec::new();
+    for tx in &txs {
+        if let Some(burn) = extract_burn(tx, chain_id)? {
+            burns.push(burn);
+        }
+    }
+
+    Ok(burns)
+}
+
+/// Fetch Core Lane block hash at a specific height
+pub async fn fetch_core_block_hash(rpc_url: &str, height: u64) -> Result<alloy_primitives::B256> {
+    let url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let block = provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+        .await?
+        .ok_or_else(|| anyhow!("Core Lane block {} not found", height))?;
+    Ok(block.header.hash)
+}
