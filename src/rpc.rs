@@ -9,6 +9,7 @@ use alloy_signer_local::PrivateKeySigner;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -142,6 +143,7 @@ pub struct RpcServer {
     core_rpc_url: Option<String>,
     da_feed_address: Option<Address>,
     sequencer_rpc_url: Option<String>,
+    espresso_submit_url: Option<String>,
 }
 
 impl RpcServer {
@@ -175,6 +177,7 @@ impl RpcServer {
             core_rpc_url: None,
             da_feed_address: None,
             sequencer_rpc_url: config.sequencer_rpc_url,
+            espresso_submit_url: None,
         })
     }
 
@@ -197,6 +200,29 @@ impl RpcServer {
             core_rpc_url: Some(core_rpc_url),
             da_feed_address: Some(da_feed_address),
             sequencer_rpc_url,
+            espresso_submit_url: None,
+        }
+    }
+
+    pub fn with_espresso(
+        state: Arc<Mutex<CoreLaneState>>,
+        data_dir: String,
+        sequencer_rpc_url: Option<String>,
+        espresso_submit_url: Option<String>,
+    ) -> Self {
+        Self {
+            state,
+            bitcoin_client: None,
+            bdk_bitcoind_client: None,
+            network: None,
+            wallet: None,
+            mnemonic: None,
+            electrum_url: None,
+            data_dir,
+            core_rpc_url: None,
+            da_feed_address: None,
+            sequencer_rpc_url,
+            espresso_submit_url,
         }
     }
 
@@ -223,6 +249,7 @@ impl RpcServer {
                 "/bitcoin/wallet/balance",
                 axum::routing::get(Self::handle_bitcoin_wallet_balance),
             )
+            .route("/submit", post(Self::handle_submit))
             .with_state(Arc::new(self))
     }
 
@@ -2888,6 +2915,97 @@ impl RpcServer {
         })))
     }
 
+    /// POST /submit
+    /// Submit a bundle/transaction to Espresso sequencer
+    async fn handle_submit(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        body: axum::body::Bytes,
+    ) -> Result<JsonResponse<serde_json::Value>, StatusCode> {
+        let espresso_url = match &rpc_state.espresso_submit_url {
+            Some(url) => url.clone(),
+            None => {
+                return Ok(JsonResponse(json!({
+                    "error": "Espresso submit URL not configured"
+                })));
+            }
+        };
+
+        let (tx_data, namespace): (Vec<u8>, u64) = {
+            match serde_json::from_slice::<SubmitRequest>(&body) {
+                Ok(req) => {
+                    let hex_str = req.payload.strip_prefix("0x").unwrap_or(&req.payload);
+                    match hex::decode(hex_str) {
+                        Ok(data) => (data, req.namespace),
+                        Err(e) => {
+                            return Ok(JsonResponse(json!({
+                                "error": format!("Invalid hex encoding: {}", e)
+                            })));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Ok(JsonResponse(json!({
+                        "error": format!("Invalid request body: {}", e)
+                    })));
+                }
+            }
+        };
+
+        if tx_data.is_empty() {
+            return Ok(JsonResponse(json!({
+                "error": "Empty transaction data"
+            })));
+        }
+
+        let submit_url = format!("{}/submit/submit", espresso_url.trim_end_matches('/'));
+        info!(
+            "Submitting transaction to Espresso: {} (namespace: {}, {} bytes)",
+            submit_url,
+            namespace,
+            tx_data.len()
+        );
+
+        let payload_base64 = STANDARD.encode(&tx_data);
+        let json_body = json!({
+            "namespace": namespace,
+            "payload": payload_base64
+        });
+
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        match client.post(&submit_url).json(&json_body).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.text().await {
+                        Ok(tx_hash) => {
+                            info!("Transaction submitted to Espresso: {}", tx_hash);
+                            Ok(JsonResponse(json!({
+                                "status": "submitted",
+                                "hash": tx_hash
+                            })))
+                        }
+                        Err(e) => Ok(JsonResponse(json!({
+                            "status": "submitted",
+                            "warning": format!("Could not read response: {}", e)
+                        }))),
+                    }
+                } else {
+                    let status = response.status();
+                    let error_text = response.text().await.unwrap_or_default();
+                    Ok(JsonResponse(json!({
+                        "error": format!("Espresso returned {}: {}", status, error_text)
+                    })))
+                }
+            }
+            Err(e) => Ok(JsonResponse(json!({
+                "error": format!("Failed to submit to Espresso: {}", e)
+            }))),
+        }
+    }
+
     /// Helper function to load, sync (Electrum/RPC), and get wallet balance
     /// Returns the balance data or an error
     fn get_wallet_balance(
@@ -3216,6 +3334,12 @@ impl RpcServer {
             })),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct SubmitRequest {
+    payload: String,
+    namespace: u64,
 }
 
 // Helper function to parse Address from string
