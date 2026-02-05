@@ -43,6 +43,26 @@ impl MetaState {
     }
 }
 
+/// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
+const TIP_FORMAT_VERSION: u8 = 1;
+
+/// Persisted chain tip for restore-from-disk on startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChainTip {
+    core_lane_block_number: u64,
+    last_processed_bitcoin_height: u64,
+    bitcoin_block_hash: B256,
+    core_lane_block: CoreLaneBlock,
+}
+
+/// Per-block chain index entry for full restore (blocks 1..n; genesis is built from code).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChainIndexEntry {
+    core_lane_block: CoreLaneBlock,
+    bitcoin_height: u64,
+    bitcoin_block_hash: B256,
+}
+
 // Import modules from the library
 use core_lane::{
     bitcoin_block, bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, transaction,
@@ -481,7 +501,7 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CoreLaneBlock {
     number: u64,
     hash: B256,
@@ -502,6 +522,7 @@ struct CoreLaneBlock {
     receipts_root: B256,
     transactions_root: B256,
     logs_bloom: Vec<u8>,
+    #[serde(skip)]
     block_origin: Option<CoreLaneBlockParsed>,
 }
 
@@ -843,55 +864,136 @@ impl CoreLaneNode {
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
     ) -> Self {
-        // Create genesis block with EIP-1559 default configuration
+        // Create genesis block with EIP-1559 default configuration (always needed)
         let eip1559_config = eip1559::Eip1559Config::default();
         let genesis_block =
             CoreLaneBlock::genesis(eip1559_config.gas_limit, eip1559_config.initial_base_fee);
         let genesis_hash = genesis_block.hash;
 
-        let mut blocks = HashMap::new();
-        let mut block_hashes = HashMap::new();
         let bitcoin_client_read = bitcoin_client_read.map(Arc::new);
         let bitcoin_client_write = bitcoin_client_write.map(Arc::new);
-
-        // Store genesis block
-        blocks.insert(0, genesis_block.clone());
-        block_hashes.insert(genesis_hash, 0);
-
-        // Initialize bitcoin_height_to_hash mapping for reorg detection
-        // This maps Bitcoin heights to Bitcoin block hashes (not Core Lane hashes)
-        // It will be populated as we process actual Bitcoin blocks
-        let bitcoin_height_to_hash = HashMap::new();
-
-        // Initialize bitcoin_height_to_core_block mapping
-        let bitcoin_height_to_core_block = HashMap::new();
-
         let sequencer_addr = sequencer_address.unwrap_or(DEFAULT_SEQUENCER_ADDRESS);
 
-        let state = Arc::new(Mutex::new(CoreLaneState {
-            account_manager: StateManager::new(),
-            last_processed_bitcoin_height: None,
-            blocks,
-            block_hashes,
-            bitcoin_height_to_hash,
-            bitcoin_height_to_core_block,
-            current_block: None,
-            genesis_block: genesis_block.clone(),
-            bitcoin_client_read: bitcoin_client_read.clone(),
-            bitcoin_client_write: bitcoin_client_write.clone(),
-            eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
-            sequencer_address: sequencer_addr,
-            total_burned_amount: U256::ZERO,
-            bitcoin_network: network,
-            // Initialize metrics tracking
-            reorgs_detected: 0,
-            total_sequencer_payments: U256::ZERO,
-            last_block_processing_time_ms: None,
-        }));
+        // Restore from disk using tip as commit marker (tip is source of truth; do not use max block number).
+        let mut state = None;
+        let mut restored = false;
+        if let Ok(Some(tip)) = Self::read_tip_from_disk_static(&data_dir) {
+            let n = tip.core_lane_block_number;
+            match (
+                Self::load_state_from_disk(&data_dir, n),
+                Self::load_metastate_from_disk_static(&data_dir, n),
+            ) {
+                (Ok(account_manager), Ok(metastate)) => {
+                    let mut blocks = HashMap::new();
+                    let mut block_hashes = HashMap::new();
+                    let mut bitcoin_height_to_hash = HashMap::new();
+                    let mut bitcoin_height_to_core_block = HashMap::new();
 
-        // Write genesis state to disk
-        if let Err(e) = Self::write_genesis_state(&data_dir, sequencer_addr) {
-            error!("Failed to write genesis state to disk: {}", e);
+                    blocks.insert(0, genesis_block.clone());
+                    block_hashes.insert(genesis_hash, 0);
+
+                    let full_chain = (1..=n)
+                        .map(|i| Self::load_chain_index_entry_static(&data_dir, i))
+                        .collect::<Result<Vec<_>>>();
+
+                    match full_chain {
+                        Ok(entries) => {
+                            for (i, entry) in entries.into_iter().enumerate() {
+                                let block_num = (i + 1) as u64;
+                                blocks.insert(block_num, entry.core_lane_block.clone());
+                                block_hashes.insert(entry.core_lane_block.hash, block_num);
+                                bitcoin_height_to_core_block
+                                    .insert(entry.bitcoin_height, block_num);
+                                bitcoin_height_to_hash
+                                    .insert(entry.bitcoin_height, entry.bitcoin_block_hash);
+                            }
+                            info!(
+                                "✅ Restored full chain from disk: Core Lane blocks 0..{} (Bitcoin height {})",
+                                n, tip.last_processed_bitcoin_height
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Could not load full chain index ({}), falling back to tip-only restore: {}",
+                                n, e
+                            );
+                            blocks.insert(n, tip.core_lane_block.clone());
+                            block_hashes.insert(tip.core_lane_block.hash, n);
+                            bitcoin_height_to_core_block
+                                .insert(tip.last_processed_bitcoin_height, n);
+                            bitcoin_height_to_hash
+                                .insert(tip.last_processed_bitcoin_height, tip.bitcoin_block_hash);
+                            info!(
+                                "✅ Restored state from disk (tip only): Core Lane block {} (Bitcoin height {})",
+                                n, tip.last_processed_bitcoin_height
+                            );
+                        }
+                    }
+                    state = Some(CoreLaneState {
+                        account_manager,
+                        last_processed_bitcoin_height: Some(tip.last_processed_bitcoin_height),
+                        blocks,
+                        block_hashes,
+                        bitcoin_height_to_hash,
+                        bitcoin_height_to_core_block,
+                        current_block: None,
+                        genesis_block: genesis_block.clone(),
+                        bitcoin_client_read: bitcoin_client_read.clone(),
+                        bitcoin_client_write: bitcoin_client_write.clone(),
+                        eip1559_fee_manager: metastate.eip1559_fee_manager,
+                        sequencer_address: metastate.sequencer_address,
+                        total_burned_amount: metastate.total_burned_amount,
+                        bitcoin_network: network,
+                        reorgs_detected: 0,
+                        total_sequencer_payments: U256::ZERO,
+                        last_block_processing_time_ms: None,
+                    });
+                    restored = true;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!(
+                        "Could not restore from disk (state/metastate missing or invalid for block {}); starting from genesis: {}",
+                        n, e
+                    );
+                }
+            }
+        } else {
+            warn!("Could not restore from disk (tip missing or invalid); starting from genesis");
+        }
+
+        let state = state.unwrap_or_else(|| {
+            let mut blocks = HashMap::new();
+            let mut block_hashes = HashMap::new();
+            blocks.insert(0, genesis_block.clone());
+            block_hashes.insert(genesis_hash, 0);
+            CoreLaneState {
+                account_manager: StateManager::new(),
+                last_processed_bitcoin_height: None,
+                blocks,
+                block_hashes,
+                bitcoin_height_to_hash: HashMap::new(),
+                bitcoin_height_to_core_block: HashMap::new(),
+                current_block: None,
+                genesis_block: genesis_block.clone(),
+                bitcoin_client_read: bitcoin_client_read.clone(),
+                bitcoin_client_write: bitcoin_client_write.clone(),
+                eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+                sequencer_address: sequencer_addr,
+                total_burned_amount: U256::ZERO,
+                bitcoin_network: network,
+                reorgs_detected: 0,
+                total_sequencer_payments: U256::ZERO,
+                last_block_processing_time_ms: None,
+            }
+        });
+
+        let state = Arc::new(Mutex::new(state));
+
+        // Write genesis state to disk only when we did not restore (so we don't overwrite existing state)
+        if !restored {
+            if let Err(e) = Self::write_genesis_state(&data_dir, sequencer_addr) {
+                error!("Failed to write genesis state to disk: {}", e);
+            }
         }
 
         Self {
@@ -1055,6 +1157,193 @@ impl CoreLaneNode {
         Ok(metastate)
     }
 
+    /// Write the chain tip to disk for restore on startup.
+    /// Writes to a temp file then atomically renames to avoid corrupted/truncated tip on crash.
+    /// Format: [TIP_FORMAT_VERSION][bincode(ChainTip)] for schema evolution.
+    fn write_tip_to_disk(&self, tip: &ChainTip) -> Result<()> {
+        use std::io::Write;
+        use std::path::Path;
+
+        let tip_file = Path::new(&self.data_dir).join("tip");
+        let temp_file = tip_file.with_extension("tmp");
+        let payload = bincode::serialize(tip)?;
+        let mut serialized = vec![TIP_FORMAT_VERSION];
+        serialized.extend_from_slice(&payload);
+        let mut f = fs::File::create(&temp_file)?;
+        f.write_all(&serialized)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&temp_file, &tip_file)?;
+        if let Some(parent) = tip_file.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        debug!(
+            "💾 Wrote tip for Core Lane block {} to {}",
+            tip.core_lane_block_number,
+            tip_file.display()
+        );
+        Ok(())
+    }
+
+    /// Write a chain index entry for block_number (atomic write). Used for full restore of blocks 1..n.
+    fn write_chain_index_entry(&self, block_number: u64, entry: &ChainIndexEntry) -> Result<()> {
+        use std::io::Write;
+        use std::path::Path;
+
+        let index_dir = Path::new(&self.data_dir).join("chain_index");
+        fs::create_dir_all(&index_dir)?;
+        let entry_file = index_dir.join(format!("{}", block_number));
+        let temp_file = entry_file.with_extension("tmp");
+        let serialized = bincode::serialize(entry)?;
+        let mut f = fs::File::create(&temp_file)?;
+        f.write_all(&serialized)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&temp_file, &entry_file)?;
+        if let Some(parent) = entry_file.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        debug!("💾 Wrote chain index entry for block {}", block_number);
+        Ok(())
+    }
+
+    /// Read the chain tip from disk (shared impl). Format: [version byte][bincode(ChainTip)].
+    fn read_tip_from_disk_impl(data_dir: &str) -> Result<Option<ChainTip>> {
+        use std::path::Path;
+
+        let tip_file = Path::new(data_dir).join("tip");
+        if !tip_file.exists() {
+            return Ok(None);
+        }
+        let serialized = fs::read(&tip_file)?;
+        let tip = if serialized.is_empty() || serialized[0] != TIP_FORMAT_VERSION {
+            if !serialized.is_empty() {
+                warn!(
+                    "Tip file {} has wrong version or is corrupt",
+                    tip_file.display()
+                );
+            }
+            None
+        } else {
+            match bincode::deserialize::<ChainTip>(&serialized[1..]) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!(
+                        "Tip file {} version byte matched but payload failed to deserialize (corrupt tip): {}",
+                        tip_file.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        };
+        if let Some(ref t) = tip {
+            info!(
+                "💾 Read tip from {} (Core Lane block {})",
+                tip_file.display(),
+                t.core_lane_block_number
+            );
+        }
+        Ok(tip)
+    }
+
+    /// Read the chain tip from disk, if present.
+    #[allow(dead_code)]
+    fn read_tip_from_disk(&self) -> Result<Option<ChainTip>> {
+        Self::read_tip_from_disk_impl(&self.data_dir)
+    }
+
+    /// Return the latest block number that has state on disk (max of blocks/ and metastate/), or None if empty/only genesis.
+    #[allow(dead_code)]
+    fn find_latest_block_number(data_dir: &str) -> Option<u64> {
+        use std::path::Path;
+
+        let mut max_block: Option<u64> = None;
+        for dir_name in ["blocks", "metastate"] {
+            let dir = Path::new(data_dir).join(dir_name);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if let Ok(n) = name.to_string_lossy().parse::<u64>() {
+                        max_block = Some(max_block.map_or(n, |m| m.max(n)));
+                    }
+                }
+            }
+        }
+        max_block
+    }
+
+    /// Read the chain tip from disk (static, for use at startup before node exists).
+    fn read_tip_from_disk_static(data_dir: &str) -> Result<Option<ChainTip>> {
+        Self::read_tip_from_disk_impl(data_dir)
+    }
+
+    /// Load chain index entry for a block (static, for use at startup). Returns error if missing.
+    fn load_chain_index_entry_static(data_dir: &str, block_number: u64) -> Result<ChainIndexEntry> {
+        use std::path::Path;
+
+        let entry_file = Path::new(data_dir)
+            .join("chain_index")
+            .join(format!("{}", block_number));
+        if !entry_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Chain index entry not found for block {}",
+                block_number
+            ));
+        }
+        let serialized = fs::read(&entry_file)?;
+        bincode::deserialize(&serialized).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to deserialize chain index for block {}: {}",
+                block_number,
+                e
+            )
+        })
+    }
+
+    /// Load StateManager for a block from disk (static, for use at startup).
+    fn load_state_from_disk(data_dir: &str, block_number: u64) -> Result<StateManager> {
+        use std::path::Path;
+
+        let blocks_dir = Path::new(data_dir).join("blocks");
+        let block_file = blocks_dir.join(format!("{}", block_number));
+        if !block_file.exists() {
+            return Err(anyhow::anyhow!(
+                "State file not found for block {}",
+                block_number
+            ));
+        }
+        let serialized_state = fs::read(&block_file)?;
+        StateManager::borsh_deserialize(&serialized_state).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to deserialize state for block {}: {}",
+                block_number,
+                e
+            )
+        })
+    }
+
+    /// Load MetaState for a block from disk (static, for use at startup).
+    fn load_metastate_from_disk_static(data_dir: &str, block_number: u64) -> Result<MetaState> {
+        use std::path::Path;
+
+        let metastate_dir = Path::new(data_dir).join("metastate");
+        let metastate_file = metastate_dir.join(format!("{}", block_number));
+        if !metastate_file.exists() {
+            return Err(anyhow::anyhow!(
+                "Metastate file not found for block {}",
+                block_number
+            ));
+        }
+        let serialized_metastate = fs::read(&metastate_file)?;
+        bincode::deserialize(&serialized_metastate)
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize metastate: {}", e))
+    }
+
     /// Write the genesis state (block 0) to disk
     pub fn write_genesis_state(data_dir: &str, sequencer_address: Address) -> Result<()> {
         use std::fs;
@@ -1104,7 +1393,7 @@ impl CoreLaneNode {
         &self,
         transactions: Vec<(StoredTransaction, TransactionReceipt, String)>,
         mut new_block: CoreLaneBlock,
-    ) -> Result<()> {
+    ) -> Result<CoreLaneBlock> {
         let mut state = self.state.lock().await;
 
         // Calculate total gas used from transactions
@@ -1216,11 +1505,12 @@ impl CoreLaneNode {
             next_base_fee / U256::from(1_000_000_000u64)
         );
 
+        let finalized_block = new_block.clone();
         {
             let mut state = self.state.lock().await;
             state.current_block = Some(new_block);
         }
-        Ok(())
+        Ok(finalized_block)
     }
 
     async fn start_block_scanner(&self, start_block: Option<u64>) -> Result<()> {
@@ -1314,13 +1604,17 @@ impl CoreLaneNode {
                                 }
                                 let mut state = self.state.lock().await;
                                 state.last_processed_bitcoin_height = Some(height);
-                                if anchor_hash.len() == 32 {
-                                    let block_hash = B256::from_slice(&anchor_hash);
-                                    state.bitcoin_height_to_hash.insert(height, block_hash);
-                                }
+                                let _block_hash = if anchor_hash.len() == 32 {
+                                    let h = B256::from_slice(&anchor_hash);
+                                    state.bitcoin_height_to_hash.insert(height, h);
+                                    h
+                                } else {
+                                    B256::ZERO
+                                };
                                 state
                                     .bitcoin_height_to_core_block
                                     .insert(height, core_lane_block_number);
+                                // Tip already written in process_block (state + tip committed together)
                             }
                             Err(err) => {
                                 warn!("Failed to process derived block {}: {}", height, err);
@@ -1383,7 +1677,7 @@ impl CoreLaneNode {
                         info!("Scanning again, we encountered a reorg");
                         break;
                     }
-                    // Update the last processed block and bitcoin_height_to_hash mapping
+                    // Update the last processed block and bitcoin_height_to_hash mapping (tip already written in process_block)
                     let mut state = self.state.lock().await;
                     state.last_processed_bitcoin_height = Some(height);
                     // anchor_block_hash is now raw 32-byte hash
@@ -1497,7 +1791,7 @@ impl CoreLaneNode {
             }
         }
 
-        let new_block = self.create_new_block(Some(bitcoin_block)).await?;
+        let new_block = self.create_new_block(Some(bitcoin_block.clone())).await?;
 
         let new_block_clone = new_block.clone();
         let mut core_lane_transactions = Vec::new();
@@ -1793,10 +2087,34 @@ impl CoreLaneNode {
             }
         }
 
-        // Finalize the Core Lane block
+        // Finalize first (updates EIP-1559, inserts block, writes metastate). Tip is written last
+        // so it acts as commit marker: if tip exists, state and metastate for that block are on disk.
         let core_lane_block_number = new_block.number;
-        self.finalize_current_block(core_lane_transactions, new_block)
+        let finalized_block = self
+            .finalize_current_block(core_lane_transactions, new_block)
             .await?;
+
+        let bitcoin_block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
+        let tip = ChainTip {
+            core_lane_block_number: block_number,
+            last_processed_bitcoin_height: bitcoin_height,
+            bitcoin_block_hash,
+            core_lane_block: finalized_block.clone(),
+        };
+        if let Err(e) = self.write_tip_to_disk(&tip) {
+            error!("Failed to write tip to disk: {}", e);
+        }
+        let chain_entry = ChainIndexEntry {
+            core_lane_block: finalized_block,
+            bitcoin_height,
+            bitcoin_block_hash,
+        };
+        if let Err(e) = self.write_chain_index_entry(block_number, &chain_entry) {
+            warn!(
+                "Failed to write chain index entry for block {}: {}",
+                block_number, e
+            );
+        }
 
         let block_execution_time = block_start_time.elapsed();
         info!(
