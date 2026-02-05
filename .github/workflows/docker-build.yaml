@@ -64,6 +64,20 @@ jobs:
         env:
           RUST_LOG: info
 
+      - name: Run restore-from-state test
+        run: |
+          ./tests/test_restore_state.sh
+        env:
+          RUST_LOG: warn
+
+      - name: Show restore test node log on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/restore_test_node.log ]; then
+            echo "--- restore_test_node.log ---"
+            cat /tmp/restore_test_node.log
+          fi
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -73,6 +87,7 @@ jobs:
             /tmp/core_lane_node_output
             /tmp/core_lane_node_rpc_output
             /tmp/core_lane_test_output
+            /tmp/restore_test_node.log
           retention-days: 7
 
   # Build and push Docker image job
