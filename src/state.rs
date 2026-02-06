@@ -436,9 +436,21 @@ impl StateManager {
             .map_err(|e| anyhow::anyhow!("Failed to borsh serialize StateManager: {}", e))
     }
 
-    /// Deserialize a StateManager from a byte slice using borsh
+    /// Deserialize a StateManager from a byte slice using borsh.
+    /// On "not all bytes read" style errors, the error message includes file length and bytes consumed.
     pub fn borsh_deserialize(bytes: &[u8]) -> Result<Self> {
-        borsh::from_slice(bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))
+        let mut cursor = std::io::Cursor::new(bytes);
+        let value = borsh::BorshDeserialize::deserialize_reader(&mut cursor)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))?;
+        let consumed = cursor.position() as usize;
+        if consumed != bytes.len() {
+            return Err(anyhow::anyhow!(
+                "Not all bytes read: state file length {} bytes, consumed {} bytes ({} trailing)",
+                bytes.len(),
+                consumed,
+                bytes.len().saturating_sub(consumed)
+            ));
+        }
+        Ok(value)
     }
 }
