@@ -44,7 +44,8 @@ impl MetaState {
 }
 
 /// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
-const TIP_FORMAT_VERSION: u8 = 1;
+/// When this is bumped, any existing tip file will be treated as invalid and all block data (blocks/, metastate/, deltas/, chain_index/, tip) will be wiped so the node starts from genesis.
+const TIP_FORMAT_VERSION: u8 = 2;
 
 /// Persisted chain tip for restore-from-disk on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -680,43 +681,44 @@ impl CoreLaneState {
         info!("🔄 Rolling back state to Core Lane block {}", target_block);
 
         // Load the state from disk for the target block
-        let loaded_state = {
-            use std::fs;
-            use std::path::Path;
+        let loaded_state =
+            {
+                use std::fs;
+                use std::path::Path;
 
-            let blocks_dir = Path::new(data_dir).join("blocks");
-            let block_file = blocks_dir.join(format!("{}", target_block));
+                let blocks_dir = Path::new(data_dir).join("blocks");
+                let block_file = blocks_dir.join(format!("{}", target_block));
 
-            info!("💾 Looking for state file: {}", block_file.display());
-            if !block_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "State file not found for block {}",
-                    target_block
-                ));
-            }
-
-            info!("💾 Reading state file for block {}", target_block);
-            let serialized_state = fs::read(&block_file)?;
-            info!(
-                "💾 Deserializing state for block {} ({} bytes)",
-                target_block,
-                serialized_state.len()
-            );
-
-            match StateManager::borsh_deserialize(&serialized_state) {
-                Ok(state) => {
-                    info!("✅ Successfully loaded state for block {}", target_block);
-                    state
+                info!("💾 Looking for state file: {}", block_file.display());
+                if !block_file.exists() {
+                    return Err(anyhow::anyhow!(
+                        "State file not found for block {}",
+                        target_block
+                    ));
                 }
-                Err(e) => {
-                    error!(
-                        "❌ Failed to deserialize state for block {}: {}",
-                        target_block, e
+
+                info!("💾 Reading state file for block {}", target_block);
+                let serialized_state = fs::read(&block_file)?;
+                info!(
+                    "💾 Deserializing state for block {} ({} bytes)",
+                    target_block,
+                    serialized_state.len()
+                );
+
+                match StateManager::borsh_deserialize(&serialized_state) {
+                    Ok(state) => {
+                        info!("✅ Successfully loaded state for block {}", target_block);
+                        state
+                    }
+                    Err(e) => {
+                        error!(
+                        "❌ Failed to deserialize state for block {} (file length {} bytes): {}",
+                        target_block, serialized_state.len(), e
                     );
-                    return Err(e);
+                        return Err(e);
+                    }
                 }
-            }
-        };
+            };
 
         // Replace the current state with the loaded state
         info!("🔄 Replacing current state with loaded state");
@@ -955,10 +957,16 @@ impl CoreLaneNode {
                         "Could not restore from disk (state/metastate missing or invalid for block {}); starting from genesis: {}",
                         n, e
                     );
+                    if let Err(we) = Self::wipe_block_data_for_fresh_start(&data_dir) {
+                        warn!("Failed to wipe block data: {}", we);
+                    }
                 }
             }
         } else {
             warn!("Could not restore from disk (tip missing or invalid); starting from genesis");
+            if let Err(we) = Self::wipe_block_data_for_fresh_start(&data_dir) {
+                warn!("Failed to wipe block data: {}", we);
+            }
         }
 
         let state = state.unwrap_or_else(|| {
@@ -1062,23 +1070,31 @@ impl CoreLaneNode {
     }
 
     /// Write the delta (BundleStateManager) to disk
+    /// Write the delta (BundleStateManager) to disk. Uses temp file + rename + sync for crash safety.
     fn write_delta_to_disk(
         &self,
         block_number: u64,
         bundle_state: &state::BundleStateManager,
     ) -> Result<()> {
-        use std::fs;
+        use std::io::Write;
         use std::path::Path;
 
-        // Create deltas directory if it doesn't exist
         let deltas_dir = Path::new(&self.data_dir).join("deltas");
         fs::create_dir_all(&deltas_dir)?;
 
-        // Write the bundle state (delta) using borsh serialization
         let delta_file = deltas_dir.join(format!("{}", block_number));
+        let temp_file = delta_file.with_extension("tmp");
         let serialized_delta = bundle_state.borsh_serialize()?;
-        fs::write(&delta_file, serialized_delta)?;
-
+        let mut f = fs::File::create(&temp_file)?;
+        f.write_all(&serialized_delta)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&temp_file, &delta_file)?;
+        if let Some(parent) = delta_file.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         info!(
             "💾 Wrote delta for block {} to {}",
             block_number,
@@ -1087,20 +1103,28 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    /// Write the state (StateManager) to disk
+    /// Write the state (StateManager) to disk. Uses temp file + rename + sync so a kill
+    /// during write does not leave a truncated block file.
     fn write_state_to_disk(&self, block_number: u64, state_manager: &StateManager) -> Result<()> {
-        use std::fs;
+        use std::io::Write;
         use std::path::Path;
 
-        // Create blocks directory if it doesn't exist
         let blocks_dir = Path::new(&self.data_dir).join("blocks");
         fs::create_dir_all(&blocks_dir)?;
 
-        // Write the full state manager using borsh serialization
         let block_file = blocks_dir.join(format!("{}", block_number));
+        let temp_file = block_file.with_extension("tmp");
         let serialized_state = state_manager.borsh_serialize()?;
-        fs::write(&block_file, serialized_state)?;
-
+        let mut f = fs::File::create(&temp_file)?;
+        f.write_all(&serialized_state)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&temp_file, &block_file)?;
+        if let Some(parent) = block_file.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         info!(
             "💾 Wrote state for block {} to {}",
             block_number,
@@ -1109,20 +1133,27 @@ impl CoreLaneNode {
         Ok(())
     }
 
-    /// Write the metadata state (MetaState) to disk
+    /// Write the metadata state (MetaState) to disk. Uses temp file + rename + sync for crash safety.
     fn write_metastate_to_disk(&self, block_number: u64, metastate: &MetaState) -> Result<()> {
-        use std::fs;
+        use std::io::Write;
         use std::path::Path;
 
-        // Create metastate directory if it doesn't exist
         let metastate_dir = Path::new(&self.data_dir).join("metastate");
         fs::create_dir_all(&metastate_dir)?;
 
-        // Write the metadata state using bincode serialization
         let metastate_file = metastate_dir.join(format!("{}", block_number));
+        let temp_file = metastate_file.with_extension("tmp");
         let serialized_metastate = bincode::serialize(metastate)?;
-        fs::write(&metastate_file, serialized_metastate)?;
-
+        let mut f = fs::File::create(&temp_file)?;
+        f.write_all(&serialized_metastate)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&temp_file, &metastate_file)?;
+        if let Some(parent) = metastate_file.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         info!(
             "💾 Wrote metastate for block {} to {}",
             block_number,
@@ -1208,6 +1239,30 @@ impl CoreLaneNode {
             }
         }
         debug!("💾 Wrote chain index entry for block {}", block_number);
+        Ok(())
+    }
+
+    /// Wipe all persisted block data and tip so the node can start from genesis. Used when tip is
+    /// missing/invalid (e.g. tip version changed) or when state/metastate for the tip block cannot be loaded.
+    fn wipe_block_data_for_fresh_start(data_dir: &str) -> Result<()> {
+        use std::path::Path;
+
+        let p = Path::new(data_dir);
+        for name in ["blocks", "metastate", "deltas", "chain_index"] {
+            let dir = p.join(name);
+            if dir.exists() {
+                fs::remove_dir_all(&dir)
+                    .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", dir.display(), e))?;
+            }
+        }
+        for name in ["tip", "tip.tmp"] {
+            let f = p.join(name);
+            if f.exists() {
+                fs::remove_file(&f)
+                    .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", f.display(), e))?;
+            }
+        }
+        info!("Wiped block data and tip in {} (tip version change or unrecoverable state); will start from genesis", data_dir);
         Ok(())
     }
 
@@ -1320,8 +1375,9 @@ impl CoreLaneNode {
         let serialized_state = fs::read(&block_file)?;
         StateManager::borsh_deserialize(&serialized_state).map_err(|e| {
             anyhow::anyhow!(
-                "Failed to deserialize state for block {}: {}",
+                "Failed to deserialize state for block {} (file length {} bytes): {}",
                 block_number,
+                serialized_state.len(),
                 e
             )
         })
