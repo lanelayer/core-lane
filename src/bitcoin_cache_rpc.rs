@@ -1,3 +1,4 @@
+use crate::bitcoin_rpc_client::BitcoinRpcReadClient;
 use anyhow::{anyhow, Result};
 use axum::{
     extract::State,
@@ -7,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use bitcoin::Block;
-use bitcoincore_rpc::{Client, RpcApi};
+use corepc_client::client_sync::v28;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use serde_json::{json, Value};
@@ -159,10 +160,10 @@ impl HttpRpcClient {
     }
 }
 
-/// Bitcoin RPC client that can use either bitcoincore-rpc or HTTP
+/// Bitcoin RPC client: corepc (sync) or HTTP (async)
 #[derive(Clone)]
 enum BitcoinRpcClient {
-    BitcoinCore(Arc<Client>),
+    Corepc(Arc<v28::Client>),
     Http(HttpRpcClient),
 }
 
@@ -235,7 +236,7 @@ struct BitcoinCacheState {
 impl BitcoinCacheRpcServer {
     pub fn new(
         cache_dir: &str,
-        bitcoin_client: Client,
+        bitcoin_client: Arc<v28::Client>,
         block_archive_url: String,
         _starting_block_count: Option<u64>,
         disable_archive_fetch: bool,
@@ -269,7 +270,7 @@ impl BitcoinCacheRpcServer {
         Ok(Self {
             state: Arc::new(BitcoinCacheState {
                 cache_dir: cache_path,
-                bitcoin_client: BitcoinRpcClient::BitcoinCore(Arc::new(bitcoin_client)),
+                bitcoin_client: BitcoinRpcClient::Corepc(bitcoin_client),
                 block_archive_url,
                 archive_http_client,
                 disable_archive_fetch,
@@ -484,9 +485,15 @@ impl BitcoinCacheRpcServer {
 
         // Forward to Bitcoin RPC (no lock needed - state is immutable)
         let count = match &self.state.bitcoin_client {
-            BitcoinRpcClient::BitcoinCore(client) => client
-                .get_block_count()
-                .map_err(|e| anyhow!("Failed to get block count from Bitcoin RPC: {}", e))?,
+            BitcoinRpcClient::Corepc(client) => {
+                let client = client.clone();
+                tokio::task::spawn_blocking(move || {
+                    BitcoinRpcReadClient::get_block_count(client.as_ref())
+                })
+                .await
+                .map_err(|e| anyhow!("Blocking task failed: {}", e))?
+                .map_err(|e| anyhow!("Failed to get block count from Bitcoin RPC: {}", e))?
+            }
             BitcoinRpcClient::Http(client) => client.get_block_count().await?,
         };
 
@@ -502,10 +509,16 @@ impl BitcoinCacheRpcServer {
 
         // Forward to Bitcoin RPC (no lock needed - state is immutable)
         let hash = match &self.state.bitcoin_client {
-            BitcoinRpcClient::BitcoinCore(client) => client
-                .get_block_hash(block_height)
+            BitcoinRpcClient::Corepc(client) => {
+                let client = client.clone();
+                tokio::task::spawn_blocking(move || {
+                    BitcoinRpcReadClient::get_block_hash(client.as_ref(), block_height)
+                })
+                .await
+                .map_err(|e| anyhow!("Blocking task failed: {}", e))?
                 .map_err(|e| anyhow!("Failed to get block hash from Bitcoin RPC: {}", e))?
-                .to_string(),
+                .to_string()
+            }
             BitcoinRpcClient::Http(client) => client.get_block_hash(block_height).await?,
         };
 
@@ -518,25 +531,14 @@ impl BitcoinCacheRpcServer {
 
         // Forward to Bitcoin RPC (no lock needed - state is immutable)
         let info = match &self.state.bitcoin_client {
-            BitcoinRpcClient::BitcoinCore(client) => {
-                let blockchain_info = client.get_blockchain_info().map_err(|e| {
-                    anyhow!("Failed to get blockchain info from Bitcoin RPC: {}", e)
-                })?;
-
-                // Convert to JSON value
-                json!({
-                    "chain": blockchain_info.chain.to_string(),
-                    "blocks": blockchain_info.blocks,
-                    "headers": blockchain_info.headers,
-                    "bestblockhash": blockchain_info.best_block_hash.to_string(),
-                    "difficulty": blockchain_info.difficulty,
-                    "mediantime": blockchain_info.median_time,
-                    "verificationprogress": blockchain_info.verification_progress,
-                    "initialblockdownload": blockchain_info.initial_block_download,
-                    "chainwork": hex::encode(&blockchain_info.chain_work),
-                    "size_on_disk": blockchain_info.size_on_disk,
-                    "pruned": blockchain_info.pruned,
+            BitcoinRpcClient::Corepc(client) => {
+                let client = client.clone();
+                tokio::task::spawn_blocking(move || {
+                    BitcoinRpcReadClient::getblockchaininfo(client.as_ref())
                 })
+                .await
+                .map_err(|e| anyhow!("Blocking task failed: {}", e))?
+                .map_err(|e| anyhow!("Failed to get blockchain info from Bitcoin RPC: {}", e))?
             }
             BitcoinRpcClient::Http(client) => client.get_blockchain_info().await?,
         };
@@ -872,15 +874,16 @@ impl BitcoinCacheRpcServer {
 
             // Fetch raw block hex from Bitcoin RPC
             let fetch_result = match &bitcoin_client {
-                BitcoinRpcClient::BitcoinCore(client) => {
-                    // Parse block hash
-                    let hash = match bitcoin::BlockHash::from_str(block_hash) {
-                        Ok(h) => h,
-                        Err(e) => return Err(anyhow!("Invalid block hash: {}", e)),
-                    };
-
+                BitcoinRpcClient::Corepc(client) => {
                     let client = client.clone();
-                    match tokio::task::spawn_blocking(move || client.get_block_hex(&hash)).await {
+                    let hash = block_hash.to_string();
+                    match tokio::task::spawn_blocking(move || -> Result<String, anyhow::Error> {
+                        let block =
+                            BitcoinRpcReadClient::get_block_by_hash_hex(client.as_ref(), &hash)?;
+                        Ok(hex::encode(bitcoin::consensus::serialize(&block)))
+                    })
+                    .await
+                    {
                         Ok(Ok(hex)) => Some(hex),
                         Ok(Err(e)) => {
                             warn!("⚠️  Attempt {} failed: {}", attempt + 1, e);
@@ -1121,7 +1124,7 @@ impl BitcoinCacheRpcServer {
     /// Forward RPC call to upstream Bitcoin RPC server
     async fn forward_rpc_call(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         match &self.state.bitcoin_client {
-            BitcoinRpcClient::BitcoinCore(client) => {
+            BitcoinRpcClient::Corepc(client) => {
                 // Use the existing call method for Bitcoin Core client
                 let result = client
                     .call(method, &params)

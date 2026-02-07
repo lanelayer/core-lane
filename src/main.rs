@@ -11,8 +11,9 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
 use anyhow::Result;
 use bitcoin::Network;
-use bitcoincore_rpc::{Auth, Client, RpcApi};
 use clap::{Parser, Subcommand};
+use core_lane::bitcoin_rpc_client::BitcoinRpcReadClient;
+use core_lane::{create_bitcoin_rpc_client, BitcoinRpcClient};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
@@ -45,7 +46,7 @@ impl MetaState {
 
 /// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
 /// When this is bumped, any existing tip file will be treated as invalid and all block data (blocks/, metastate/, deltas/, chain_index/, tip) will be wiped so the node starts from genesis.
-const TIP_FORMAT_VERSION: u8 = 2;
+const TIP_FORMAT_VERSION: u8 = 3;
 
 /// Persisted chain tip for restore-from-disk on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,9 +66,7 @@ struct ChainIndexEntry {
 }
 
 // Import modules from the library
-use core_lane::{
-    bitcoin_block, bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, transaction,
-};
+use core_lane::{bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, transaction};
 
 // RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
 mod derived;
@@ -94,7 +93,8 @@ use state::{StateManager, StoredTransaction, TransactionReceipt};
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
 
-use crate::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
+use core_lane::bitcoin_rpc_client::create_bitcoin_read_client;
+use core_lane::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 
 /// Helper function to construct wallet database path
 fn wallet_db_path(data_dir: &str, network: &str) -> String {
@@ -641,7 +641,7 @@ impl CoreLaneBlock {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CoreLaneState {
     account_manager: StateManager,
     last_processed_bitcoin_height: Option<u64>,
@@ -651,27 +651,66 @@ struct CoreLaneState {
     bitcoin_height_to_core_block: HashMap<u64, u64>, // Bitcoin height -> Core Lane block number
     current_block: Option<CoreLaneBlock>,       // Current block being built
     genesis_block: CoreLaneBlock,
-    bitcoin_client_read: Option<Arc<Client>>, // Client for reading blockchain data
+    bitcoin_client_read: Option<Arc<dyn BitcoinRpcReadClient>>, // Client for reading blockchain data
     #[allow(dead_code)]
-    bitcoin_client_write: Option<Arc<Client>>, // Client for writing/wallet operations
-    eip1559_fee_manager: eip1559::Eip1559FeeManager, // EIP-1559 fee management
-    sequencer_address: Address,               // Address that receives priority fees
-    total_burned_amount: U256,                // Total amount burned from base fees
-    bitcoin_network: bitcoin::Network,        // Bitcoin network (mainnet, testnet, regtest, etc.)
+    bitcoin_client_write: Option<Arc<BitcoinRpcClient>>, // Client for writing/wallet operations
+    eip1559_fee_manager: eip1559::Eip1559FeeManager,            // EIP-1559 fee management
+    sequencer_address: Address, // Address that receives priority fees
+    total_burned_amount: U256,  // Total amount burned from base fees
+    bitcoin_network: bitcoin::Network, // Bitcoin network (mainnet, testnet, regtest, etc.)
     // Metrics tracking
     reorgs_detected: u64, // Counter for blockchain reorganizations detected
     total_sequencer_payments: U256, // Cumulative priority fees paid to sequencers (in wei)
     last_block_processing_time_ms: Option<u64>, // Last block processing time in milliseconds
 }
 
+impl std::fmt::Debug for CoreLaneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreLaneState")
+            .field("account_manager", &self.account_manager)
+            .field(
+                "last_processed_bitcoin_height",
+                &self.last_processed_bitcoin_height,
+            )
+            .field("blocks", &self.blocks)
+            .field("block_hashes", &self.block_hashes)
+            .field("bitcoin_height_to_hash", &self.bitcoin_height_to_hash)
+            .field(
+                "bitcoin_height_to_core_block",
+                &self.bitcoin_height_to_core_block,
+            )
+            .field("current_block", &self.current_block)
+            .field("genesis_block", &self.genesis_block)
+            .field(
+                "bitcoin_client_read",
+                &self
+                    .bitcoin_client_read
+                    .as_ref()
+                    .map(|_| "<BitcoinRpcReadClient>"),
+            )
+            .field("bitcoin_client_write", &self.bitcoin_client_write)
+            .field("eip1559_fee_manager", &self.eip1559_fee_manager)
+            .field("sequencer_address", &self.sequencer_address)
+            .field("total_burned_amount", &self.total_burned_amount)
+            .field("bitcoin_network", &self.bitcoin_network)
+            .field("reorgs_detected", &self.reorgs_detected)
+            .field("total_sequencer_payments", &self.total_sequencer_payments)
+            .field(
+                "last_block_processing_time_ms",
+                &self.last_block_processing_time_ms,
+            )
+            .finish()
+    }
+}
+
 impl CoreLaneState {
     #[allow(dead_code)]
-    pub fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
+    pub fn bitcoin_client_read(&self) -> Option<Arc<dyn BitcoinRpcReadClient>> {
         self.bitcoin_client_read.clone()
     }
 
     #[allow(dead_code)]
-    pub fn bitcoin_client_write(&self) -> Option<Arc<Client>> {
+    pub fn bitcoin_client_write(&self) -> Option<Arc<BitcoinRpcClient>> {
         self.bitcoin_client_write.clone()
     }
 
@@ -681,44 +720,45 @@ impl CoreLaneState {
         info!("🔄 Rolling back state to Core Lane block {}", target_block);
 
         // Load the state from disk for the target block
-        let loaded_state =
-            {
-                use std::fs;
-                use std::path::Path;
+        let loaded_state = {
+            use std::fs;
+            use std::path::Path;
 
-                let blocks_dir = Path::new(data_dir).join("blocks");
-                let block_file = blocks_dir.join(format!("{}", target_block));
+            let blocks_dir = Path::new(data_dir).join("blocks");
+            let block_file = blocks_dir.join(format!("{}", target_block));
 
-                info!("💾 Looking for state file: {}", block_file.display());
-                if !block_file.exists() {
-                    return Err(anyhow::anyhow!(
-                        "State file not found for block {}",
-                        target_block
-                    ));
+            info!("💾 Looking for state file: {}", block_file.display());
+            if !block_file.exists() {
+                return Err(anyhow::anyhow!(
+                    "State file not found for block {}",
+                    target_block
+                ));
+            }
+
+            info!("💾 Reading state file for block {}", target_block);
+            let serialized_state = fs::read(&block_file)?;
+            info!(
+                "💾 Deserializing state for block {} ({} bytes)",
+                target_block,
+                serialized_state.len()
+            );
+
+            match StateManager::borsh_deserialize(&serialized_state) {
+                Ok(state) => {
+                    info!("✅ Successfully loaded state for block {}", target_block);
+                    state
                 }
-
-                info!("💾 Reading state file for block {}", target_block);
-                let serialized_state = fs::read(&block_file)?;
-                info!(
-                    "💾 Deserializing state for block {} ({} bytes)",
-                    target_block,
-                    serialized_state.len()
-                );
-
-                match StateManager::borsh_deserialize(&serialized_state) {
-                    Ok(state) => {
-                        info!("✅ Successfully loaded state for block {}", target_block);
-                        state
-                    }
-                    Err(e) => {
-                        error!(
+                Err(e) => {
+                    error!(
                         "❌ Failed to deserialize state for block {} (file length {} bytes): {}",
-                        target_block, serialized_state.len(), e
+                        target_block,
+                        serialized_state.len(),
+                        e
                     );
-                        return Err(e);
-                    }
+                    return Err(e);
                 }
-            };
+            }
+        };
 
         // Replace the current state with the loaded state
         info!("🔄 Replacing current state with loaded state");
@@ -809,7 +849,7 @@ impl transaction::ProcessingContext for CoreLaneState {
         &mut self.account_manager
     }
 
-    fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
+    fn bitcoin_client_read(&self) -> Option<Arc<dyn BitcoinRpcReadClient>> {
         self.bitcoin_client_read.clone()
     }
 
@@ -828,16 +868,19 @@ impl transaction::ProcessingContext for CoreLaneState {
 }
 
 struct CoreLaneNode {
-    bitcoin_client_read: Option<Arc<Client>>,
-    bitcoin_client_write: Option<Arc<Client>>,
+    bitcoin_client_read: Option<Arc<dyn BitcoinRpcReadClient>>,
+    bitcoin_client_write: Option<Arc<BitcoinRpcClient>>,
+    /// For regtest wallet sync - BDK Emitter requires bitcoincore_rpc::Client
+    bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     state: Arc<Mutex<CoreLaneState>>,
     data_dir: String,
 }
 
 impl CoreLaneNode {
     fn new(
-        bitcoin_client_read: Client,
-        bitcoin_client_write: Client,
+        bitcoin_client_read: Arc<dyn BitcoinRpcReadClient>,
+        bitcoin_client_write: Arc<BitcoinRpcClient>,
+        bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
@@ -845,6 +888,7 @@ impl CoreLaneNode {
         Self::new_with_clients(
             Some(bitcoin_client_read),
             Some(bitcoin_client_write),
+            bdk_bitcoind_client,
             data_dir,
             network,
             sequencer_address,
@@ -856,12 +900,13 @@ impl CoreLaneNode {
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
     ) -> Self {
-        Self::new_with_clients(None, None, data_dir, network, sequencer_address)
+        Self::new_with_clients(None, None, None, data_dir, network, sequencer_address)
     }
 
     fn new_with_clients(
-        bitcoin_client_read: Option<Client>,
-        bitcoin_client_write: Option<Client>,
+        bitcoin_client_read: Option<Arc<dyn BitcoinRpcReadClient>>,
+        bitcoin_client_write: Option<Arc<BitcoinRpcClient>>,
+        bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
@@ -872,8 +917,7 @@ impl CoreLaneNode {
             CoreLaneBlock::genesis(eip1559_config.gas_limit, eip1559_config.initial_base_fee);
         let genesis_hash = genesis_block.hash;
 
-        let bitcoin_client_read = bitcoin_client_read.map(Arc::new);
-        let bitcoin_client_write = bitcoin_client_write.map(Arc::new);
+        let bitcoin_client_write = bitcoin_client_write;
         let sequencer_addr = sequencer_address.unwrap_or(DEFAULT_SEQUENCER_ADDRESS);
 
         // Restore from disk using tip as commit marker (tip is source of truth; do not use max block number).
@@ -1007,6 +1051,7 @@ impl CoreLaneNode {
         Self {
             bitcoin_client_read,
             bitcoin_client_write,
+            bdk_bitcoind_client,
             state,
             data_dir,
         }
@@ -1361,6 +1406,7 @@ impl CoreLaneNode {
     }
 
     /// Load StateManager for a block from disk (static, for use at startup).
+    /// Fails if the file cannot be deserialized exactly (e.g. truncated or trailing bytes).
     fn load_state_from_disk(data_dir: &str, block_number: u64) -> Result<StateManager> {
         use std::path::Path;
 
@@ -2447,7 +2493,7 @@ impl CoreLaneNode {
             .bitcoin_client_write
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC write client not configured"))?;
-        let taproot_da = TaprootDA::new(bitcoin_client);
+        let taproot_da = TaprootDA::new(bitcoin_client, self.bdk_bitcoind_client.clone());
         let _bitcoin_txid = taproot_da
             .send_transaction_to_da(
                 raw_tx_hex,
@@ -2479,7 +2525,7 @@ impl CoreLaneNode {
             .bitcoin_client_write
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Bitcoin RPC write client not configured"))?;
-        let taproot_da = TaprootDA::new(bitcoin_client);
+        let taproot_da = TaprootDA::new(bitcoin_client, self.bdk_bitcoind_client.clone());
         let _bitcoin_txid = taproot_da
             .send_bundle_to_da(
                 raw_tx_hex_vec,
@@ -2498,7 +2544,7 @@ impl CoreLaneNode {
     /// Find the fork point by comparing our stored Bitcoin hashes with current chain
     async fn find_fork_point(
         &self,
-        bitcoin_client: Arc<Client>,
+        bitcoin_client: Arc<dyn BitcoinRpcReadClient>,
         state: &CoreLaneState,
     ) -> Result<Option<u64>> {
         use tokio::task;
@@ -2542,7 +2588,7 @@ impl CoreLaneNode {
                     match task::spawn_blocking({
                         let client = bitcoin_client.clone();
                         let height = current_bitcoin_height;
-                        move || client.get_block_hash(height)
+                        move || BitcoinRpcReadClient::get_block_hash(client.as_ref(), height)
                     })
                     .await
                     {
@@ -2898,25 +2944,23 @@ async fn main() -> Result<()> {
 
             let mnemonic_str = mnemonic_str_opt.unwrap_or_default();
 
-            // Always create read client (needed for reading blockchain data)
-            let read_client = bitcoincore_rpc::Client::new(
+            // Always create read client (HTTPS-capable when URL is https, e.g. https://bitcoin-cache.fly.dev)
+            let read_client = create_bitcoin_read_client(
                 bitcoin_rpc_read_url,
-                Auth::UserPass(
-                    bitcoin_rpc_read_user.to_string(),
-                    bitcoin_rpc_read_password.to_string(),
-                ),
+                bitcoin_rpc_read_user,
+                bitcoin_rpc_read_password,
             )?;
 
             // Get blockchain info from read client to determine network
-            let blockchain_info: serde_json::Value = read_client.call("getblockchaininfo", &[])?;
+            let blockchain_info: serde_json::Value = read_client.getblockchaininfo()?;
 
             let network = if let Some(chain) = blockchain_info.get("chain") {
                 match chain.as_str() {
-                    Some("main") => bitcoincore_rpc::bitcoin::Network::Bitcoin,
-                    Some("test") => bitcoincore_rpc::bitcoin::Network::Testnet,
-                    Some("testnet4") => bitcoincore_rpc::bitcoin::Network::Testnet4,
-                    Some("signet") => bitcoincore_rpc::bitcoin::Network::Signet,
-                    Some("regtest") => bitcoincore_rpc::bitcoin::Network::Regtest,
+                    Some("main") => bitcoin::Network::Bitcoin,
+                    Some("test") => bitcoin::Network::Testnet,
+                    Some("testnet4") => bitcoin::Network::Testnet4,
+                    Some("signet") => bitcoin::Network::Signet,
+                    Some("regtest") => bitcoin::Network::Regtest,
                     Some(chain) => return Err(anyhow::anyhow!("Unknown chain type: {}", chain)),
                     None => return Err(anyhow::anyhow!("Chain field is not a string")),
                 }
@@ -2930,18 +2974,19 @@ async fn main() -> Result<()> {
             info!("   📖 Read:  {}", bitcoin_rpc_read_url);
 
             // If sequencer is configured and mnemonic is not, we can skip write client setup
-            let (shared_state, bitcoin_client_write, node_opt) =
+            let (shared_state, bitcoin_client_write, bdk_bitcoind_client, node_opt) =
                 if sequencer_rpc_url.is_some() && mnemonic_str.is_empty() {
                     // Sequencer-only mode: read-only bitcoin client, no write client needed
                     // No block scanner needed in sequencer-only mode
                     let node = CoreLaneNode::new_with_clients(
-                        Some(read_client),
+                        Some(read_client.clone()),
+                        None,
                         None,
                         cli.data_dir.clone(),
                         network,
                         sequencer_addr,
                     );
-                    (Arc::clone(&node.state), None, None) // node_opt = None to skip block scanner
+                    (Arc::clone(&node.state), None, None, None) // node_opt = None to skip block scanner
                 } else {
                     // Bitcoin DA mode: require write client and mnemonic
                     if mnemonic_str.is_empty() {
@@ -2961,17 +3006,35 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .unwrap_or(bitcoin_rpc_read_password);
 
-                    // Write client - user can customize the URL themselves
-                    let write_client = bitcoincore_rpc::Client::new(
-                        write_url,
-                        Auth::UserPass(write_user.to_string(), write_password.to_string()),
-                    )?;
+                    let rpc_client =
+                        create_bitcoin_rpc_client(write_url, write_user, write_password)?;
+                    // Preserve read_client from --bitcoin-rpc-read-* when separate write URL is configured
+                    let read_client_for_node = if bitcoin_rpc_write_url.is_none() {
+                        rpc_client.clone() as Arc<dyn BitcoinRpcReadClient>
+                    } else {
+                        read_client.clone()
+                    };
 
                     info!("   ✍️  Write: {}", write_url);
 
+                    // BDK Emitter (regtest sync) needs bitcoincore_rpc::Client
+                    let bdk_bitcoind_client =
+                        if network == bitcoin::Network::Regtest && !mnemonic_str.is_empty() {
+                            Some(Arc::new(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+                                write_url,
+                                bdk_bitcoind_rpc::bitcoincore_rpc::Auth::UserPass(
+                                    write_user.to_string(),
+                                    write_password.to_string(),
+                                ),
+                            )?))
+                        } else {
+                            None
+                        };
+
                     let node = CoreLaneNode::new(
-                        read_client,
-                        write_client,
+                        read_client_for_node,
+                        rpc_client,
+                        bdk_bitcoind_client.clone(),
                         cli.data_dir.clone(),
                         network,
                         sequencer_addr,
@@ -2981,7 +3044,12 @@ async fn main() -> Result<()> {
                         .bitcoin_client_write
                         .clone()
                         .expect("Bitcoin write client must be configured in start mode");
-                    (shared_state, Some(bitcoin_client_write), Some(node))
+                    (
+                        shared_state,
+                        Some(bitcoin_client_write),
+                        bdk_bitcoind_client,
+                        Some(node),
+                    )
                 };
 
             let rpc_config = crate::rpc::BitcoinClientConfig {
@@ -2998,6 +3066,7 @@ async fn main() -> Result<()> {
             let rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
                 bitcoin_client_write,
+                bdk_bitcoind_client,
                 Some(network),
                 rpc_config,
             )
@@ -3407,18 +3476,11 @@ async fn main() -> Result<()> {
 
             // Broadcast transaction based on network
             if network_str == "regtest" {
-                // Use bitcoind RPC for regtest
-                use bdk_bitcoind_rpc::bitcoincore_rpc::Auth as RpcAuth;
-                use bdk_bitcoind_rpc::bitcoincore_rpc::Client;
-
                 let rpc_pass = rpc_password
                     .as_ref()
                     .map(|s| s.as_str())
                     .unwrap_or("bitcoin123");
-                let rpc_client = Client::new(
-                    rpc_url,
-                    RpcAuth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
-                )?;
+                let rpc_client = create_bitcoin_rpc_client(rpc_url, rpc_user.as_str(), rpc_pass)?;
 
                 let broadcast_txid: bitcoin::Txid =
                     rpc_client.call("sendrawtransaction", &[serde_json::json!(tx_hex)])?;
@@ -3490,31 +3552,37 @@ async fn main() -> Result<()> {
 
             // Parse network
             let network = match network_str.as_str() {
-                "bitcoin" | "mainnet" => bitcoincore_rpc::bitcoin::Network::Bitcoin,
-                "testnet" => bitcoincore_rpc::bitcoin::Network::Testnet,
-                "testnet4" => bitcoincore_rpc::bitcoin::Network::Testnet4,
-                "signet" => bitcoincore_rpc::bitcoin::Network::Signet,
-                "regtest" => bitcoincore_rpc::bitcoin::Network::Regtest,
+                "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
+                "testnet" => bitcoin::Network::Testnet,
+                "testnet4" => bitcoin::Network::Testnet4,
+                "signet" => bitcoin::Network::Signet,
+                "regtest" => bitcoin::Network::Regtest,
                 _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
             };
 
-            // Create Bitcoin RPC clients (only used for regtest)
+            // Create Bitcoin RPC client
             let rpc_pass = rpc_password
                 .as_ref()
                 .map(|s| s.as_str())
                 .unwrap_or("bitcoin123");
-            let read_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
-            )?;
-            let write_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
-            )?;
+            let rpc_client = create_bitcoin_rpc_client(rpc_url, rpc_user.as_str(), rpc_pass)?;
+            let read_client = rpc_client.clone() as Arc<dyn BitcoinRpcReadClient>;
+            let bdk_client = if network_str == "regtest" {
+                Some(Arc::new(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+                    rpc_url,
+                    bdk_bitcoind_rpc::bitcoincore_rpc::Auth::UserPass(
+                        rpc_user.clone(),
+                        rpc_pass.to_string(),
+                    ),
+                )?))
+            } else {
+                None
+            };
 
             let node = CoreLaneNode::new(
                 read_client,
-                write_client,
+                rpc_client,
+                bdk_client,
                 cli.data_dir.clone(),
                 network,
                 None,
@@ -3553,11 +3621,11 @@ async fn main() -> Result<()> {
 
             // Parse network
             let network = match network_str.as_str() {
-                "bitcoin" | "mainnet" => bitcoincore_rpc::bitcoin::Network::Bitcoin,
-                "testnet" => bitcoincore_rpc::bitcoin::Network::Testnet,
-                "testnet4" => bitcoincore_rpc::bitcoin::Network::Testnet4,
-                "signet" => bitcoincore_rpc::bitcoin::Network::Signet,
-                "regtest" => bitcoincore_rpc::bitcoin::Network::Regtest,
+                "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
+                "testnet" => bitcoin::Network::Testnet,
+                "testnet4" => bitcoin::Network::Testnet4,
+                "signet" => bitcoin::Network::Signet,
+                "regtest" => bitcoin::Network::Regtest,
                 _ => return Err(anyhow::anyhow!("Invalid network: {}", network_str)),
             };
 
@@ -3582,23 +3650,29 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Create Bitcoin RPC clients (only used for regtest)
+            // Create Bitcoin RPC client
             let rpc_pass = rpc_password
                 .as_ref()
                 .map(|s| s.as_str())
                 .unwrap_or("bitcoin123");
-            let read_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
-            )?;
-            let write_client = bitcoincore_rpc::Client::new(
-                rpc_url,
-                Auth::UserPass(rpc_user.clone(), rpc_pass.to_string()),
-            )?;
+            let rpc_client = create_bitcoin_rpc_client(rpc_url, rpc_user.as_str(), rpc_pass)?;
+            let read_client = rpc_client.clone() as Arc<dyn BitcoinRpcReadClient>;
+            let bdk_client = if network_str == "regtest" {
+                Some(Arc::new(bdk_bitcoind_rpc::bitcoincore_rpc::Client::new(
+                    rpc_url,
+                    bdk_bitcoind_rpc::bitcoincore_rpc::Auth::UserPass(
+                        rpc_user.clone(),
+                        rpc_pass.to_string(),
+                    ),
+                )?))
+            } else {
+                None
+            };
 
             let node = CoreLaneNode::new(
                 read_client,
-                write_client,
+                rpc_client,
+                bdk_client,
                 cli.data_dir.clone(),
                 network,
                 None,
@@ -3767,21 +3841,21 @@ async fn main() -> Result<()> {
                 )?
             } else {
                 info!(
-                    "🔐 Using bitcoincore-rpc client (user: {})",
+                    "🔐 Using corepc Bitcoin RPC client (user: {})",
                     bitcoin_rpc_user
                 );
 
-                let bitcoin_client = bitcoincore_rpc::Client::new(
+                let bitcoin_client = create_bitcoin_rpc_client(
                     bitcoin_rpc_url,
-                    Auth::UserPass(
-                        bitcoin_rpc_user.to_string(),
-                        bitcoin_rpc_password.to_string(),
-                    ),
+                    bitcoin_rpc_user,
+                    bitcoin_rpc_password,
                 )?;
 
-                // Health check with bitcoincore-rpc
+                // Health check with corepc
                 info!("🏥 Testing Bitcoin RPC connection...");
-                match bitcoin_client.get_block_count() {
+                match core_lane::bitcoin_rpc_client::BitcoinRpcReadClient::get_block_count(
+                    bitcoin_client.as_ref(),
+                ) {
                     Ok(count) => {
                         info!(
                             "✅ Bitcoin RPC connection successful! Current block height: {}",

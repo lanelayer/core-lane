@@ -64,8 +64,11 @@ impl BorshSerialize for StoredTransaction {
 
 impl BorshDeserialize for StoredTransaction {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let raw_data: Vec<u8> = borsh::from_reader(reader)?;
-        let block_number: u64 = borsh::from_reader(reader)?;
+        // Use deserialize_reader, NOT from_reader: from_reader uses try_from_reader which
+        // requires no bytes remain after deserializing. We're in the middle of deserializing
+        // StateManager (transactions Vec); block_number and more data follow.
+        let raw_data: Vec<u8> = borsh::BorshDeserialize::deserialize_reader(reader)?;
+        let block_number: u64 = borsh::BorshDeserialize::deserialize_reader(reader)?;
 
         // Reconstruct envelope from raw_data
         let envelope = TxEnvelope::decode(&mut raw_data.as_slice())
@@ -440,17 +443,26 @@ impl StateManager {
     /// On "not all bytes read" style errors, the error message includes file length and bytes consumed.
     pub fn borsh_deserialize(bytes: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(bytes);
-        let value = borsh::BorshDeserialize::deserialize_reader(&mut cursor)
-            .map_err(|e| anyhow::anyhow!("Failed to borsh deserialize StateManager: {}", e))?;
+        let result = borsh::BorshDeserialize::deserialize_reader(&mut cursor);
         let consumed = cursor.position() as usize;
-        if consumed != bytes.len() {
-            return Err(anyhow::anyhow!(
-                "Not all bytes read: state file length {} bytes, consumed {} bytes ({} trailing)",
+        match result {
+            Ok(value) => {
+                if consumed != bytes.len() {
+                    return Err(anyhow::anyhow!(
+                        "Not all bytes read: state file length {} bytes, consumed {} bytes ({} trailing)",
+                        bytes.len(),
+                        consumed,
+                        bytes.len().saturating_sub(consumed)
+                    ));
+                }
+                Ok(value)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Failed to borsh deserialize StateManager (file length {} bytes, consumed {} bytes before error): {}",
                 bytes.len(),
                 consumed,
-                bytes.len().saturating_sub(consumed)
-            ));
+                e
+            )),
         }
-        Ok(value)
     }
 }

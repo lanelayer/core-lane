@@ -118,9 +118,21 @@ impl WalletBalanceError {
     }
 }
 
+/// Parameters for sending a transaction to Bitcoin DA
+struct SendToBitcoinDaParams<'a> {
+    bitcoin_client: &'a Arc<core_lane::BitcoinRpcClient>,
+    bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+    network: bitcoin::Network,
+    network_str: &'a str,
+    electrum_url: Option<&'a str>,
+    data_dir: &'a str,
+}
+
 pub struct RpcServer {
     state: Arc<Mutex<CoreLaneState>>,
-    bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
+    bitcoin_client: Option<Arc<core_lane::BitcoinRpcClient>>,
+    /// For regtest wallet sync only - BDK Emitter requires bitcoincore_rpc::Client
+    bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     network: Option<bitcoin::Network>,
     #[allow(dead_code)]
     wallet: Option<String>,
@@ -135,7 +147,8 @@ pub struct RpcServer {
 impl RpcServer {
     pub fn with_bitcoin_client(
         state: Arc<Mutex<CoreLaneState>>,
-        bitcoin_client: Option<Arc<bitcoincore_rpc::Client>>,
+        bitcoin_client: Option<Arc<core_lane::BitcoinRpcClient>>,
+        bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
         network: Option<bitcoin::Network>,
         config: BitcoinClientConfig,
     ) -> Result<Self, String> {
@@ -153,6 +166,7 @@ impl RpcServer {
         Ok(Self {
             state,
             bitcoin_client,
+            bdk_bitcoind_client,
             network,
             wallet: config.wallet,
             mnemonic: config.mnemonic,
@@ -174,6 +188,7 @@ impl RpcServer {
         Self {
             state,
             bitcoin_client: None,
+            bdk_bitcoind_client: None,
             network: None,
             wallet: None,
             mnemonic: None,
@@ -614,17 +629,15 @@ impl RpcServer {
         };
         let electrum_url = server.electrum_url.as_deref();
 
-        match Self::send_to_bitcoin_da(
-            raw_tx_hex,
+        let da_params = SendToBitcoinDaParams {
             bitcoin_client,
+            bdk_bitcoind_client: server.bdk_bitcoind_client.clone(),
             network,
-            &mnemonic,
             network_str,
             electrum_url,
-            &server.data_dir,
-        )
-        .await
-        {
+            data_dir: &server.data_dir,
+        };
+        match Self::send_to_bitcoin_da(raw_tx_hex, &da_params, &mnemonic).await {
             Ok(bitcoin_txid) => {
                 // Calculate the Core Lane transaction hash for the response
                 use alloy_primitives::keccak256;
@@ -659,24 +672,22 @@ impl RpcServer {
 
     async fn send_to_bitcoin_da(
         raw_tx_hex: &str,
-        bitcoin_client: &Arc<bitcoincore_rpc::Client>,
-        network: bitcoin::Network,
+        params: &SendToBitcoinDaParams<'_>,
         mnemonic: &str,
-        network_str: &str,
-        electrum_url: Option<&str>,
-        data_dir: &str,
     ) -> Result<String, anyhow::Error> {
-        // Use the shared TaprootDA module with proper Taproot envelope method
-        let taproot_da = crate::taproot_da::TaprootDA::new(bitcoin_client.clone());
+        let taproot_da = crate::taproot_da::TaprootDA::new(
+            params.bitcoin_client.clone(),
+            params.bdk_bitcoind_client.clone(),
+        );
 
         taproot_da
             .send_transaction_to_da(
                 raw_tx_hex,
                 mnemonic,
-                network,
-                network_str,
-                electrum_url,
-                data_dir,
+                params.network,
+                params.network_str,
+                params.electrum_url,
+                params.data_dir,
             )
             .await
     }
@@ -2039,8 +2050,6 @@ impl RpcServer {
         request: JsonRpcRequest,
         server: &Arc<RpcServer>,
     ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
-        use bitcoincore_rpc::RpcApi;
-
         // Get bitcoin client from server
         let bitcoin_client = match &server.bitcoin_client {
             Some(client) => client.clone(),
@@ -2055,16 +2064,37 @@ impl RpcServer {
             }
         };
 
-        // Get current Bitcoin tip
-        let bitcoin_tip = match bitcoin_client.get_block_count() {
-            Ok(tip) => tip,
-            Err(e) => {
+        // Get current Bitcoin tip (use trait to get u64, not corepc's GetBlockCount)
+        // Run blocking RPC off the async runtime
+        let bitcoin_tip = match tokio::task::spawn_blocking({
+            let client = bitcoin_client.clone();
+            move || {
+                core_lane::bitcoin_rpc_client::BitcoinRpcReadClient::get_block_count(
+                    client.as_ref(),
+                )
+            }
+        })
+        .await
+        {
+            Ok(Ok(tip)) => tip,
+            Ok(Err(e)) => {
                 return Ok(JsonResponse::from(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     result: None,
                     error: Some(JsonRpcError {
                         code: -32603,
                         message: format!("Failed to get Bitcoin block count: {}", e),
+                    }),
+                    id: request.id,
+                }));
+            }
+            Err(e) => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: format!("Blocking task failed: {}", e),
                     }),
                     id: request.id,
                 }));
@@ -2865,7 +2895,7 @@ impl RpcServer {
         network: bitcoin::Network,
         data_dir: &str,
         electrum_url: Option<&str>,
-        bitcoin_client: Option<&bitcoincore_rpc::Client>,
+        bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     ) -> Result<WalletBalanceData, WalletBalanceError> {
         use bdk_wallet::keys::bip39::Mnemonic;
         use bdk_wallet::keys::DerivableKey;
@@ -2933,14 +2963,14 @@ impl RpcServer {
             bitcoin::Network::Regtest => {
                 // Use bitcoind RPC for regtest
                 use bdk_bitcoind_rpc::Emitter;
-                let rpc = bitcoin_client.ok_or_else(|| {
+                let rpc = bdk_bitcoind_client.as_ref().ok_or_else(|| {
                     WalletBalanceError::ConfigError(
                         "Bitcoin RPC client not configured for regtest sync".to_string(),
                     )
                 })?;
 
                 let mut emitter = Emitter::new(
-                    rpc,
+                    rpc.as_ref(),
                     wallet.latest_checkpoint().clone(),
                     0,
                     std::iter::empty::<Arc<bitcoin::Transaction>>(),
@@ -3064,7 +3094,7 @@ impl RpcServer {
         let mnemonic_str = mnemonic_str.to_string();
         let data_dir = rpc_state.data_dir.clone();
         let electrum_url = rpc_state.electrum_url.clone();
-        let bitcoin_client = rpc_state.bitcoin_client.clone();
+        let bdk_bitcoind_client = rpc_state.bdk_bitcoind_client.clone();
 
         match tokio::task::spawn_blocking(move || {
             Self::get_wallet_balance(
@@ -3072,7 +3102,7 @@ impl RpcServer {
                 network,
                 &data_dir,
                 electrum_url.as_deref(),
-                bitcoin_client.as_deref(),
+                bdk_bitcoind_client,
             )
         })
         .await
@@ -3134,7 +3164,7 @@ impl RpcServer {
         let mnemonic_str = mnemonic_str.to_string();
         let data_dir = state.data_dir.clone();
         let electrum_url = state.electrum_url.clone();
-        let bitcoin_client = state.bitcoin_client.clone();
+        let bdk_bitcoind_client = state.bdk_bitcoind_client.clone();
         let request_id = request.id.clone();
 
         match tokio::task::spawn_blocking(move || {
@@ -3143,7 +3173,7 @@ impl RpcServer {
                 network,
                 &data_dir,
                 electrum_url.as_deref(),
-                bitcoin_client.as_deref(),
+                bdk_bitcoind_client,
             )
         })
         .await

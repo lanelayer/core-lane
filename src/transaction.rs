@@ -1,3 +1,4 @@
+use crate::bitcoin_rpc_client::BitcoinRpcReadClient;
 use crate::cmio::CmioMessage;
 use crate::intents::{
     decode_intent_calldata, Intent, IntentCall, IntentCommandType, IntentData, IntentStatus,
@@ -10,8 +11,6 @@ use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
-use bitcoincore_rpc::Client;
-use bitcoincore_rpc::RpcApi;
 use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
 use cartesi_machine::config::runtime::RuntimeConfig;
 use cartesi_machine::types::cmio::AutomaticReason;
@@ -84,7 +83,7 @@ pub fn get_transaction_nonce(tx: &TxEnvelope) -> u64 {
 pub trait ProcessingContext {
     fn state_manager(&self) -> &StateManager;
     fn state_manager_mut(&mut self) -> &mut StateManager;
-    fn bitcoin_client_read(&self) -> Option<Arc<Client>>;
+    fn bitcoin_client_read(&self) -> Option<Arc<dyn BitcoinRpcReadClient>>;
     fn bitcoin_network(&self) -> bitcoin::Network;
     fn handle_cmio_query(
         &mut self,
@@ -1552,7 +1551,7 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
         })?;
 
     // Verify the transaction is in the correct block
-    if let Some(tx_block_hash) = tx_info.blockhash {
+    if let Some(tx_block_hash) = tx_info.block_hash {
         if tx_block_hash != block_hash {
             info!("Transaction {} not in expected block", txid);
             return Ok(false);
@@ -1562,9 +1561,7 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
         return Ok(false);
     }
 
-    let tx = &tx_info
-        .transaction()
-        .map_err(|e| anyhow!("Failed to decode transaction: {}", e))?;
+    let tx = &tx_info.transaction;
     let tag = intent_id.as_slice();
 
     // We expect at least two outputs: one payment and one OP_RETURN with the intent id

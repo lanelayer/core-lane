@@ -23,8 +23,10 @@ serde_repr = "0.1"
 serde_tuple = "1.1"
 clap = { version = "4.0", features = ["derive"] }
 rand = "0.8"
-bitcoincore-rpc = "0.19.0"
-bitcoincore-rpc-json = "0.19.0"
+corepc-client = { version = "0.10.0", features = ["client-sync"] }
+corepc-types = "0.10.0"
+# Enable minreq HTTPS so corepc works with https:// URLs (corepc-client uses jsonrpc with minreq_http)
+minreq = { version = "2.14", features = ["https"] }
 alloy-primitives = { version = "1.4.0", features = ["serde", "borsh"] }
 alloy-rlp = "0.3"
 alloy-consensus = { version = "1.0.38", features = ["secp256k1", "serde", "serde-bincode-compat"] }

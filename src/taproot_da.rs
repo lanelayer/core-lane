@@ -7,7 +7,7 @@ use bitcoin::{
     blockdata::script::Builder,
     Address as BitcoinAddress, Amount, FeeRate, ScriptBuf, Transaction, Witness,
 };
-use bitcoincore_rpc::{Client, RpcApi};
+use corepc_client::client_sync::v28;
 use secp256k1::rand::rngs::OsRng;
 use std::sync::Arc;
 
@@ -17,13 +17,20 @@ use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::{KeychainKind, Wallet};
 
 pub struct TaprootDA {
-    // Keep bitcoin_client for RPC operations (fee estimation, broadcasting)
-    bitcoin_client: Arc<Client>,
+    rpc_client: Arc<v28::Client>,
+    /// BDK Emitter (regtest sync) requires bitcoincore_rpc::Client - bdk_bitcoind_rpc's dependency
+    bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
 }
 
 impl TaprootDA {
-    pub fn new(bitcoin_client: Arc<Client>) -> Self {
-        Self { bitcoin_client }
+    pub fn new(
+        rpc_client: Arc<v28::Client>,
+        bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
+    ) -> Self {
+        Self {
+            rpc_client,
+            bdk_bitcoind_client,
+        }
     }
 
     /// Calculate exact reveal transaction fee based on payload size
@@ -147,8 +154,10 @@ impl TaprootDA {
 
     async fn calculate_optimal_fee_rate(&self) -> Result<u64> {
         // Get the minimum relay fee from the Bitcoin node
-        let minrelayfee_result: Result<serde_json::Value, _> =
-            self.bitcoin_client.call("getnetworkinfo", &[]);
+        let minrelayfee_result: Result<serde_json::Value, _> = self
+            .rpc_client
+            .call("getnetworkinfo", &[])
+            .map_err(|e| anyhow!(e).context("getnetworkinfo RPC call failed"));
         let min_relay_fee_sat_vb = match minrelayfee_result {
             Ok(network_info) => {
                 if let Some(minrelayfee) = network_info.get("relayfee").and_then(|v| v.as_f64()) {
@@ -172,10 +181,13 @@ impl TaprootDA {
         };
 
         // Get fee rate from estimatesmartfee
-        let fee_estimate: Result<serde_json::Value, _> = self.bitcoin_client.call(
-            "estimatesmartfee",
-            &[serde_json::json!(6), serde_json::json!("ECONOMICAL")],
-        );
+        let fee_estimate: Result<serde_json::Value, _> = self
+            .rpc_client
+            .call(
+                "estimatesmartfee",
+                &[serde_json::json!(6), serde_json::json!("ECONOMICAL")],
+            )
+            .map_err(|e| anyhow!(e).context("estimatesmartfee RPC call failed"));
 
         let sat_per_vb = match fee_estimate {
             Ok(result) => {
@@ -299,9 +311,13 @@ impl TaprootDA {
         tracing::info!("🔗 Syncing wallet...");
         if network_str == "regtest" {
             // Use Bitcoin RPC for regtest
+            let bdk_client = self
+                .bdk_bitcoind_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("BDK bitcoind client required for regtest wallet sync"))?;
             use bdk_bitcoind_rpc::Emitter;
             let mut emitter = Emitter::new(
-                self.bitcoin_client.as_ref(),
+                bdk_client.as_ref(),
                 wallet.latest_checkpoint().clone(),
                 0,
                 std::iter::empty::<Arc<Transaction>>(),
@@ -540,8 +556,9 @@ impl TaprootDA {
         tracing::info!("📝 Reveal transaction hex: {}", reveal_final_hex);
 
         let package_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
-            .call("submitpackage", &[serde_json::json!(package_txs)]);
+            .rpc_client
+            .call("submitpackage", &[serde_json::json!(package_txs)])
+            .map_err(|e| anyhow!(e).context("submitpackage RPC call failed"));
 
         match package_result {
             Ok(result) => {
@@ -691,9 +708,13 @@ impl TaprootDA {
         // Sync wallet based on network
         tracing::info!("🔗 Syncing wallet...");
         if network_str == "regtest" {
+            let bdk_client = self
+                .bdk_bitcoind_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("BDK bitcoind client required for regtest wallet sync"))?;
             use bdk_bitcoind_rpc::Emitter;
             let mut emitter = Emitter::new(
-                self.bitcoin_client.as_ref(),
+                bdk_client.as_ref(),
                 wallet.latest_checkpoint().clone(),
                 0,
                 std::iter::empty::<Arc<Transaction>>(),
@@ -874,8 +895,9 @@ impl TaprootDA {
         tracing::info!("📦 Submitting commit + reveal transactions as package...");
 
         let package_result: Result<serde_json::Value, _> = self
-            .bitcoin_client
-            .call("submitpackage", &[serde_json::json!(package_txs)]);
+            .rpc_client
+            .call("submitpackage", &[serde_json::json!(package_txs)])
+            .map_err(|e| anyhow!(e).context("submitpackage RPC call failed"));
 
         match package_result {
             Ok(_result) => {
