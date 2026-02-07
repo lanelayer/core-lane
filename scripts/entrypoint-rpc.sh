@@ -7,6 +7,7 @@ set -euo pipefail
 : "${ONLY_START:=}"
 BITCOIN_CACHE_HOST="${BITCOIN_CACHE_HOST:-127.0.0.1}"
 BITCOIN_CACHE_PORT="${BITCOIN_CACHE_PORT:-8332}"
+BITCOIN_CACHE_PROTOCOL="${BITCOIN_CACHE_PROTOCOL:-http}"
 BITCOIN_UPSTREAM_RPC_URL="${BITCOIN_UPSTREAM_RPC_URL:-https://bitcoin-rpc.publicnode.com}"
 BLOCK_ARCHIVE_URL="${BLOCK_ARCHIVE_URL:-http://144.76.56.210/blocks}"
 STARTING_BLOCK_COUNT="${STARTING_BLOCK_COUNT:-916201}"
@@ -195,7 +196,7 @@ if [ -z "${ONLY_START:-}" ] || [ "${ONLY_START:-}" = "core-lane" ]; then
     CORE_LANE_MNEMONIC="${CORE_LANE_MNEMONIC}" \
     "/app/core-lane-node" start \
       --data-dir "${DATA_DIR}" \
-      --bitcoin-rpc-read-url "http://${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}" \
+      --bitcoin-rpc-read-url "${BITCOIN_CACHE_PROTOCOL}://${BITCOIN_CACHE_HOST}:${BITCOIN_CACHE_PORT}" \
       --bitcoin-rpc-read-user "${RPC_USER}" \
       --bitcoin-rpc-read-password "${RPC_PASSWORD}" \
       --start-block "${STARTING_BLOCK_COUNT}" \

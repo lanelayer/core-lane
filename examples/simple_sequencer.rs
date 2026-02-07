@@ -3,7 +3,7 @@ use alloy_primitives::{Bytes, TxKind};
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::Result;
-use bitcoincore_rpc::{Auth, Client};
+use bitcoin::Network;
 /// Simple Sequencer Example
 ///
 /// This example demonstrates how to use core-lane as a library to build
@@ -11,37 +11,28 @@ use bitcoincore_rpc::{Auth, Client};
 ///
 /// Run with: cargo run --example simple_sequencer
 use core_lane::{
-    execute_transaction, Address, BundleStateManager, CoreLaneStateForLib, StateManager,
-    TxEnvelope, U256,
+    create_bitcoin_rpc_client, execute_transaction, Address, BundleStateManager,
+    CoreLaneStateForLib, StateManager, TxEnvelope, U256,
 };
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("🚀 Core Lane Simple Sequencer Example\n");
 
-    // 1. Setup Bitcoin RPC client
+    // 1. Setup Bitcoin RPC client (corepc)
     println!("📡 Connecting to Bitcoin RPC...");
-    let bitcoin_client = Client::new(
-        "http://127.0.0.1:18443",
-        Auth::UserPass("user".to_string(), "password".to_string()),
-    );
+    let bitcoin_client = create_bitcoin_rpc_client("http://127.0.0.1:18443", "user", "password");
 
     // Note: This will fail if Bitcoin isn't running, but that's ok for the example
     match bitcoin_client {
         Ok(client) => {
             println!("✅ Connected to Bitcoin RPC\n");
 
-            let client = Arc::new(client);
-
             // 2. Initialize state manager and context (same pattern as the main node)
             println!("💾 Initializing state manager...");
             let mut state = StateManager::new();
-            let mut state_context = CoreLaneStateForLib::new(
-                state.clone(),
-                Arc::clone(&client),
-                bitcoincore_rpc::bitcoin::Network::Regtest,
-            );
+            let mut state_context =
+                CoreLaneStateForLib::new(state.clone(), client.clone(), client, Network::Regtest);
             println!("✅ State manager initialized\n");
 
             // 3. Show account balances

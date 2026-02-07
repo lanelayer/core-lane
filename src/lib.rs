@@ -7,25 +7,16 @@
 //!
 //! ```no_run
 //! use core_lane::{StateManager, BundleStateManager};
-//! use bitcoincore_rpc::{Client, Auth};
 //!
-//! // Create a Bitcoin RPC client
-//! let bitcoin_client = Client::new(
-//!     "http://127.0.0.1:18443",
-//!     Auth::UserPass("user".to_string(), "password".to_string()),
-//! ).unwrap();
-//!
-//! // Initialize state managers
 //! let state_manager = StateManager::new();
 //! let mut bundle_state = BundleStateManager::new();
-//!
 //! // Process transactions into the bundle state
-//! // The bundle state accumulates changes that can later be applied atomically
 //! ```
 
 pub mod account;
 pub mod bitcoin_block;
 pub mod bitcoin_cache_rpc;
+pub mod bitcoin_rpc_client;
 pub mod block;
 pub mod cmio;
 pub mod intents;
@@ -53,10 +44,11 @@ pub use transaction::{
 // Re-export key external types for convenience
 pub use alloy_consensus::TxEnvelope;
 pub use alloy_primitives::{Address, Bytes, B256, U256};
-pub use bitcoincore_rpc::Client as BitcoinClient;
 
-use bitcoincore_rpc::Client;
 use std::sync::Arc;
+
+/// Bitcoin RPC client (corepc). Use for read and write operations.
+pub use bitcoin_rpc_client::{create_bitcoin_rpc_client, BitcoinRpcClient};
 
 /// A simple state context for processing transactions in external applications
 ///
@@ -68,18 +60,22 @@ use std::sync::Arc;
 /// ```no_run
 /// use core_lane::{CoreLaneStateForLib, StateManager, BundleStateManager};
 /// use core_lane::{execute_transaction, TxEnvelope, Address};
-/// use bitcoincore_rpc::{Client, Auth};
+/// use core_lane::bitcoin_rpc_client::{create_bitcoin_read_client, BitcoinRpcReadClient};
+/// use core_lane::{create_bitcoin_rpc_client, BitcoinRpcClient};
 /// use std::sync::Arc;
 ///
-/// let bitcoin_client = Client::new(
+/// let rpc_client = create_bitcoin_rpc_client(
 ///     "http://127.0.0.1:18443",
-///     Auth::UserPass("user".into(), "pass".into())
+///     "user",
+///     "pass"
 /// ).unwrap();
+/// let read_client = rpc_client.clone() as Arc<dyn BitcoinRpcReadClient>;
 ///
 /// let mut state = CoreLaneStateForLib::new(
 ///     StateManager::new(),
-///     Arc::new(bitcoin_client.clone()),
-///     bitcoincore_rpc::bitcoin::Network::Regtest
+///     read_client,
+///     rpc_client,
+///     bitcoin::Network::Regtest
 /// );
 ///
 /// let mut bundle = BundleStateManager::new();
@@ -87,34 +83,35 @@ use std::sync::Arc;
 /// ```
 pub struct CoreLaneStateForLib {
     account_manager: StateManager,
-    bitcoin_client_read: Arc<Client>,
-    bitcoin_client_write: Arc<Client>,
+    bitcoin_client_read: Arc<dyn bitcoin_rpc_client::BitcoinRpcReadClient>,
+    bitcoin_client_write: Arc<BitcoinRpcClient>,
     bitcoin_network: bitcoin::Network,
 }
 
 impl CoreLaneStateForLib {
-    /// Create a new state context with the given state manager and Bitcoin client
+    /// Create a new state context with separate read and write Bitcoin RPC clients.
     pub fn new(
         state_manager: StateManager,
-        bitcoin_client: Arc<Client>,
+        bitcoin_client_read: Arc<dyn bitcoin_rpc_client::BitcoinRpcReadClient>,
+        bitcoin_client_write: Arc<BitcoinRpcClient>,
         network: bitcoin::Network,
     ) -> Self {
         Self {
             account_manager: state_manager,
-            bitcoin_client_read: bitcoin_client.clone(),
-            bitcoin_client_write: bitcoin_client,
+            bitcoin_client_read,
+            bitcoin_client_write,
             bitcoin_network: network,
         }
     }
 }
 
 impl CoreLaneStateForLib {
-    pub fn bitcoin_client_read(&self) -> Arc<Client> {
+    pub fn bitcoin_client_read(&self) -> Arc<dyn bitcoin_rpc_client::BitcoinRpcReadClient> {
         self.bitcoin_client_read.clone()
     }
 
     #[allow(dead_code)]
-    pub fn bitcoin_client_write(&self) -> Arc<Client> {
+    pub fn bitcoin_client_write(&self) -> Arc<BitcoinRpcClient> {
         self.bitcoin_client_write.clone()
     }
 
@@ -136,7 +133,9 @@ impl transaction::ProcessingContext for CoreLaneStateForLib {
         &mut self.account_manager
     }
 
-    fn bitcoin_client_read(&self) -> Option<Arc<Client>> {
+    fn bitcoin_client_read(
+        &self,
+    ) -> Option<Arc<dyn crate::bitcoin_rpc_client::BitcoinRpcReadClient>> {
         Some(self.bitcoin_client_read.clone())
     }
 

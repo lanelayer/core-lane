@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::bitcoin_rpc_client::BitcoinRpcReadClient;
 use alloy_primitives::{Address, U256};
 use bitcoin::{
     hashes::Hash,
@@ -11,13 +12,12 @@ use bitcoin::{
     script::Instruction,
     Script, Transaction,
 };
-use bitcoincore_rpc::{Client, RpcApi};
 use tracing::{debug, info, trace, warn};
 
 use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn};
 
 pub fn process_bitcoin_block(
-    bitcoin_client: Arc<Client>,
+    bitcoin_client: Arc<dyn BitcoinRpcReadClient>,
     height: u64,
 ) -> Result<CoreLaneBlockParsed, anyhow::Error> {
     let bitcoin_start_time = Instant::now();
@@ -25,8 +25,8 @@ pub fn process_bitcoin_block(
         "📦 Processing Bitcoin block {} with height {}",
         height, height
     );
-    let hash = bitcoin_client.get_block_hash(height)?;
-    let block = bitcoin_client.get_block(&hash)?;
+    let hash_hex = bitcoin_client.get_block_hash_hex(height)?;
+    let block = bitcoin_client.get_block_by_hash_hex(&hash_hex)?;
 
     info!(
         "📦 Processing Bitcoin block {} with {} transactions",
@@ -34,16 +34,19 @@ pub fn process_bitcoin_block(
         block.txdata.len()
     );
 
-    let bitcoin_block_hash_bytes: Vec<u8> = hash.as_raw_hash().to_byte_array().to_vec(); // Store raw 32-byte hash
+    // Use hashes from the decoded block - avoids RPC roundtrip and byte-order issues
+    let hash = block.block_hash();
+    let bitcoin_block_hash_bytes: Vec<u8> = hash.as_raw_hash().to_byte_array().to_vec();
     let bitcoin_block_timestamp = block.header.time as u64;
 
-    // Get parent hash
-    let parent_hash = if height > 0 {
-        let parent_hash = bitcoin_client.get_block_hash(height - 1)?;
-        let parent_hash_bytes: Vec<u8> = parent_hash.as_raw_hash().to_byte_array().to_vec(); // Store raw 32-byte hash
-        parent_hash_bytes
+    let parent_hash: Vec<u8> = if height > 0 {
+        block
+            .header
+            .prev_blockhash
+            .as_raw_hash()
+            .to_byte_array()
+            .to_vec()
     } else {
-        // Genesis block has no parent
         Vec::new()
     };
 
@@ -57,7 +60,9 @@ pub fn process_bitcoin_block(
     for (tx_index, tx) in block.txdata.iter().enumerate() {
         let txid = tx.compute_txid();
 
-        if let Some((payload, burn_value)) = extract_burn_payload_from_tx(&bitcoin_client, tx) {
+        if let Some((payload, burn_value)) =
+            extract_burn_payload_from_tx(bitcoin_client.as_ref(), tx)
+        {
             info!(
                 "   🔥 Found Bitcoin burn in tx {}: {} ({}sats)",
                 tx_index, txid, burn_value
@@ -175,7 +180,10 @@ fn process_bitcoin_burn(
     }
 }
 
-fn extract_burn_payload_from_tx(_client: &Client, tx: &Transaction) -> Option<(Vec<u8>, u64)> {
+fn extract_burn_payload_from_tx(
+    _client: &dyn BitcoinRpcReadClient,
+    tx: &Transaction,
+) -> Option<(Vec<u8>, u64)> {
     // Look for hybrid P2WSH + OP_RETURN burn pattern
     let mut p2wsh_burn_value = 0u64;
     let mut brn1_payload = None;
