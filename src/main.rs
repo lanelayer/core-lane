@@ -46,7 +46,7 @@ impl MetaState {
 
 /// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
 /// When this is bumped, any existing tip file will be treated as invalid and all block data (blocks/, metastate/, deltas/, chain_index/, tip) will be wiped so the node starts from genesis.
-const TIP_FORMAT_VERSION: u8 = 3;
+const TIP_FORMAT_VERSION: u8 = 4;
 
 /// Persisted chain tip for restore-from-disk on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1620,13 +1620,20 @@ impl CoreLaneNode {
         info!("Connected to Bitcoin node successfully");
         info!("Core Lane state initialized");
 
-        // Initialize starting block if provided
+        // Only apply --start_block when we have no restored state (fresh start).
+        // If we restored from disk, last_processed_bitcoin_height is already set; overwriting
+        // it with start_block would re-scan from an older height and create duplicate Core Lane blocks.
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
-            // Set to Some(block - 1) since we'll add 1 when scanning
-            // This allows --start_block 0 to actually start at 0
-            state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
-            info!("Starting from block: {}", block);
+            if let Some(tip) = state.last_processed_bitcoin_height {
+                info!(
+                    "Resuming from restored tip (Bitcoin height {}); --start_block {} ignored",
+                    tip, block
+                );
+            } else {
+                state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+                info!("Starting from block: {}", block);
+            }
         }
 
         loop {
@@ -1656,7 +1663,9 @@ impl CoreLaneNode {
         );
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
-            state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+            if state.last_processed_bitcoin_height.is_none() {
+                state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+            }
         }
 
         loop {
