@@ -377,6 +377,20 @@ impl StateManager {
         self.kv_storage.get(key)
     }
 
+    /// Build a read-only snapshot as BundleStateManager for query execution (e.g. Cartesi machine).
+    /// Changes to the returned bundle are not applied anywhere.
+    pub fn to_bundle_state_snapshot(&self) -> BundleStateManager {
+        BundleStateManager {
+            accounts: self.accounts.clone(),
+            stored_blobs: self.stored_blobs.clone(),
+            kv_storage: self.kv_storage.clone(),
+            removed_keys: Vec::new(),
+            intents: self.intents.clone(),
+            transactions: self.transactions.clone(),
+            transaction_receipts: self.transaction_receipts.clone(),
+        }
+    }
+
     pub fn insert_kv(&mut self, key: String, value: Vec<u8>) {
         self.kv_storage.insert(key, value);
     }

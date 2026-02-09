@@ -7,16 +7,22 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
+use axum::body::to_bytes;
 use axum::{
-    extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
+    extract::{Json, Request},
+    http::StatusCode,
+    response::Json as JsonResponse,
+    routing::{get, post},
+    Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use core_lane::{run_cartesi_query, state::StateManager, QueryMethod};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 
 async fn fetch_core_lane_tip(rpc_url: &str) -> anyhow::Result<(u64, B256, B256)> {
@@ -160,6 +166,8 @@ pub struct RpcServer {
     sequencer_rpc_url: Option<String>,
     /// Channel sender for triggering on-demand block scans
     poll_trigger: Option<mpsc::Sender<()>>,
+    /// Limits concurrent Cartesi machine query executions (env: CORE_LANE_QUERY_CONCURRENCY, default 1)
+    query_semaphore: Arc<Semaphore>,
     espresso_submit_url: Option<String>,
     espresso_client: Option<reqwest::Client>,
     espresso_namespace: u64,
@@ -185,6 +193,12 @@ impl RpcServer {
             );
         }
 
+        let query_concurrency = std::env::var("CORE_LANE_QUERY_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+
         Ok(Self {
             state,
             bitcoin_client,
@@ -198,6 +212,7 @@ impl RpcServer {
             da_feed_address: None,
             sequencer_rpc_url: config.sequencer_rpc_url,
             poll_trigger,
+            query_semaphore: Arc::new(Semaphore::new(query_concurrency)),
             espresso_submit_url: None,
             espresso_client: None,
             espresso_namespace: 0,
@@ -212,6 +227,12 @@ impl RpcServer {
         sequencer_rpc_url: Option<String>,
         poll_trigger: Option<mpsc::Sender<()>>,
     ) -> Self {
+        let query_concurrency = std::env::var("CORE_LANE_QUERY_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+
         Self {
             state,
             bitcoin_client: None,
@@ -225,6 +246,7 @@ impl RpcServer {
             da_feed_address: Some(da_feed_address),
             sequencer_rpc_url,
             poll_trigger,
+            query_semaphore: Arc::new(Semaphore::new(query_concurrency)),
             espresso_submit_url: None,
             espresso_client: None,
             espresso_namespace: 0,
@@ -242,6 +264,12 @@ impl RpcServer {
         espresso_client: reqwest::Client,
         espresso_namespace: u64,
     ) -> Self {
+        let query_concurrency = std::env::var("CORE_LANE_QUERY_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+
         Self {
             state,
             bitcoin_client: None,
@@ -254,8 +282,9 @@ impl RpcServer {
             core_rpc_url,
             da_feed_address: None,
             sequencer_rpc_url,
-            espresso_submit_url,
             poll_trigger,
+            query_semaphore: Arc::new(Semaphore::new(query_concurrency)),
+            espresso_submit_url,
             espresso_client: Some(espresso_client),
             espresso_namespace,
         }
@@ -278,6 +307,7 @@ impl RpcServer {
                 "/get_latest_block",
                 axum::routing::get(Self::handle_get_latest_block),
             )
+            .route("/refs/head", axum::routing::get(Self::handle_refs_head))
             .route("/kv/:key", axum::routing::get(Self::handle_kv_get))
             .route("/health", axum::routing::get(Self::handle_health))
             .route(
@@ -285,6 +315,11 @@ impl RpcServer {
                 axum::routing::get(Self::handle_bitcoin_wallet_balance),
             )
             .route("/do_poll", post(Self::handle_do_poll))
+            .route("/query", get(Self::handle_query).post(Self::handle_query))
+            .route(
+                "/query/*path",
+                get(Self::handle_query).post(Self::handle_query),
+            )
             .with_state(Arc::new(self))
     }
 
@@ -2992,20 +3027,231 @@ impl RpcServer {
             .unwrap())
     }
 
+    /// GET /kv/:key?at=<snapshot>
+    /// If `at` is omitted, uses the latest head. With `at`: immutable cache. Without: max-age=2.
     async fn handle_kv_get(
         axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
         axum::extract::Path(key): axum::extract::Path<String>,
+        request: Request,
     ) -> Result<axum::response::Response, StatusCode> {
-        let state = rpc_state.state.lock().await;
+        let at_param = request.uri().query().and_then(|q| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("at="))
+                .filter(|s| !s.is_empty())
+                .map(|v| v.to_string())
+        });
 
-        if let Some(value) = state.account_manager.get_kv(&key) {
+        let (block_number, snapshot_pinned) = {
+            let state = rpc_state.state.lock().await;
+            let head_number = state.blocks.keys().max().copied().unwrap_or(0);
+            if let Some(ref snapshot) = at_param {
+                let hash_hex = snapshot.strip_prefix("0x").unwrap_or(snapshot);
+                let hash = B256::from_str(&format!("0x{}", hash_hex))
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                let block_number = state
+                    .block_hashes
+                    .get(&hash)
+                    .copied()
+                    .ok_or(StatusCode::NOT_FOUND)?;
+                (block_number, true)
+            } else {
+                if head_number == 0 && state.blocks.is_empty() {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                (head_number, false)
+            }
+        };
+
+        let block_file = std::path::Path::new(&rpc_state.data_dir)
+            .join("blocks")
+            .join(format!("{}", block_number));
+        let serialized = tokio::fs::read(&block_file).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+        let state_manager = StateManager::borsh_deserialize(&serialized)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(value) = state_manager.get_kv(&key) {
+            let cache_control = if snapshot_pinned {
+                "public, max-age=31536000, immutable"
+            } else {
+                "public, max-age=2"
+            };
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
+                .header("Cache-Control", cache_control)
                 .body(axum::body::Body::from(value.clone()))
                 .unwrap());
         }
         Err(StatusCode::NOT_FOUND)
+    }
+
+    /// GET /refs/head — chain tip and finality (snapshot hashes for ?at=).
+    async fn handle_refs_head(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        request: Request,
+    ) -> Result<JsonResponse<serde_json::Value>, StatusCode> {
+        let last_param = request.uri().query().and_then(|q| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("last="))
+                .map(|v| v.to_string())
+        });
+
+        let state = rpc_state.state.lock().await;
+        let head_number = state.blocks.keys().max().copied().unwrap_or(0);
+        let head_hash = state
+            .blocks
+            .get(&head_number)
+            .map(|b| format!("{:x}", b.hash))
+            .unwrap_or_default();
+
+        let mut resp = json!({
+            "head": head_hash,
+            "finalized": head_hash,
+        });
+
+        if let Some(last) = last_param {
+            let last_trimmed = last.strip_prefix("0x").unwrap_or(&last);
+            let last_hash = B256::from_str(&format!("0x{}", last_trimmed)).ok();
+            let still_valid = last_hash
+                .map(|h| state.block_hashes.contains_key(&h))
+                .unwrap_or(false);
+            if !still_valid {
+                resp["reorged"] = json!(true);
+            }
+        }
+
+        Ok(JsonResponse(resp))
+    }
+
+    /// GET or POST /query[/path]?at=<snapshot>
+    /// Runs a read-only Cartesi machine execution. If `at` omitted, uses latest head.
+    async fn handle_query(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        request: Request,
+    ) -> Result<axum::response::Response, StatusCode> {
+        let path = request
+            .uri()
+            .path()
+            .strip_prefix("/query")
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        if path.is_empty() {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "error": "sub_path_required",
+                        "message": "Use /query/<endpoint> with optional ?at=<snapshot> to pin to a block."
+                    })
+                    .to_string(),
+                ))
+                .unwrap());
+        }
+
+        let at_param = request.uri().query().and_then(|q| {
+            q.split('&')
+                .find_map(|pair| pair.strip_prefix("at="))
+                .filter(|s| !s.is_empty())
+                .map(|v| v.to_string())
+        });
+
+        let method = if request.method() == axum::http::Method::GET {
+            QueryMethod::Get
+        } else {
+            QueryMethod::Post
+        };
+
+        let body = match to_bytes(request.into_body(), usize::MAX).await {
+            Ok(b) => Bytes::from(b.to_vec()),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+
+        let (block_number, snapshot_pinned) = {
+            let state = rpc_state.state.lock().await;
+            let head_number = state.blocks.keys().max().copied().unwrap_or(0);
+            if let Some(ref snapshot) = at_param {
+                let hash_hex = snapshot.strip_prefix("0x").unwrap_or(snapshot);
+                let hash = B256::from_str(&format!("0x{}", hash_hex))
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                let block_number = state
+                    .block_hashes
+                    .get(&hash)
+                    .copied()
+                    .ok_or(StatusCode::NOT_FOUND)?;
+                (block_number, true)
+            } else {
+                if head_number == 0 && state.blocks.is_empty() {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                (head_number, false)
+            }
+        };
+
+        let data_dir = rpc_state.data_dir.clone();
+        let block_file = std::path::Path::new(&data_dir)
+            .join("blocks")
+            .join(format!("{}", block_number));
+        let serialized = tokio::fs::read(&block_file).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+        let state_manager = StateManager::borsh_deserialize(&serialized)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let bundle_state = state_manager.to_bundle_state_snapshot();
+        let block_timestamp = {
+            let state = rpc_state.state.lock().await;
+            state
+                .blocks
+                .get(&block_number)
+                .map(|b| b.timestamp)
+                .unwrap_or(0)
+        };
+
+        let _permit = rpc_state.query_semaphore.acquire().await.map_err(|_| {
+            info!("Query semaphore closed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let response_bytes = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(run_cartesi_query(
+                path,
+                method,
+                body,
+                bundle_state,
+                block_timestamp,
+            ))
+        })
+        .await
+        .map_err(|_| {
+            info!("Query task join failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            info!("Query execution failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let cache_control = if snapshot_pinned {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=2"
+        };
+        Ok(axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .header("Cache-Control", cache_control)
+            .body(axum::body::Body::from(response_bytes))
+            .unwrap())
     }
 
     // POST /do_poll
