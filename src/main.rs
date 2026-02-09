@@ -838,6 +838,75 @@ impl CoreLaneState {
         );
         Ok(())
     }
+
+    /// Resolve X-Revision-Height / X-Revision-Hash to a block number for read-only query.
+    /// Returns Ok(block_number) or Err(message) for 400/404.
+    /// - X-Revision-Hash (hash preferred if both set): match block by hash or hex prefix
+    /// - X-Revision-Height: block by number
+    /// - Neither or both empty: latest block
+    pub fn query_resolve_revision(
+        &self,
+        revision_height: Option<&str>,
+        revision_hash: Option<&str>,
+    ) -> Result<u64, String> {
+        let hash_trimmed = revision_hash.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+        let height_trimmed = revision_height.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+
+        if let Some(hash_val) = hash_trimmed {
+            let hash_prefix = hash_val
+                .strip_prefix("0x")
+                .unwrap_or(hash_val)
+                .to_lowercase();
+            if hash_prefix.is_empty() {
+                return Err("Empty X-Revision-Hash".to_string());
+            }
+            let matches: Vec<u64> = self
+                .block_hashes
+                .iter()
+                .filter(|(h, _)| hex::encode(h.as_slice()).starts_with(&hash_prefix))
+                .map(|(_, &n)| n)
+                .collect();
+            return match matches.len() {
+                0 => Err(format!("No block hash matching prefix {}", hash_prefix)),
+                1 => Ok(matches[0]),
+                _ => Err(format!(
+                    "Ambiguous hash prefix {} ({} matches)",
+                    hash_prefix,
+                    matches.len()
+                )),
+            };
+        }
+
+        if let Some(height_str) = height_trimmed {
+            let n: u64 = height_str
+                .parse()
+                .map_err(|_| format!("Invalid X-Revision-Height: {}", height_str))?;
+            if self.blocks.contains_key(&n) {
+                return Ok(n);
+            }
+            return Err(format!("Block height {} not found", n));
+        }
+
+        self.blocks
+            .keys()
+            .max()
+            .copied()
+            .ok_or_else(|| "No blocks".to_string())
+    }
 }
 
 impl transaction::ProcessingContext for CoreLaneState {
