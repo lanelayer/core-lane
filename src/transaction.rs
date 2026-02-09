@@ -1451,6 +1451,132 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     })
 }
 
+/// Run a read-only Cartesi machine query: load state at a revision, call the given
+/// endpoint (GET or POST), and return the response body without applying any state changes.
+/// Uses the same HTTP runner snapshot and KV store as transaction execution.
+pub async fn run_cartesi_query(
+    path: String,
+    method: QueryMethod,
+    body: Bytes,
+    bundle_state: BundleStateManager,
+    block_timestamp: u64,
+) -> Result<Vec<u8>> {
+    let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
+
+    let machine = Mutex::new(Machine::load(
+        std::path::Path::new(&snapshot_path),
+        &RuntimeConfig::default(),
+    )?);
+
+    let runner_state = Arc::new(Mutex::new(RunnerState::new()));
+
+    const GUEST_CID: u32 = 1;
+    const CONTAINER_PORT: u32 = 8080;
+    const HTTP_CLIENT_PORT: u32 = 9002;
+
+    let webhook_completion_handler: Arc<std::sync::Mutex<dyn runner::WebhookCompletionHandler>> =
+        Arc::new(std::sync::Mutex::new(WebhookCompletionHandlerImpl::new()));
+
+    {
+        let mut state_guard = runner_state.lock().await;
+        add_http_server_with_kv_store(
+            &mut state_guard,
+            Arc::new(std::sync::Mutex::new(bundle_state)),
+        );
+        add_webhook_delivery_service(
+            &mut state_guard,
+            HTTP_CLIENT_PORT,
+            3,
+            Some(Arc::clone(&webhook_completion_handler)),
+        );
+    }
+
+    let path_trimmed = path.trim_start_matches('/');
+    if path_trimmed.is_empty() {
+        return Err(anyhow::anyhow!("Query path cannot be empty"));
+    }
+    let webhook_path = format!("/{}", path_trimmed);
+
+    let payload = body;
+    let submission = build_submission_from_input(&payload, block_timestamp);
+    let body_bytes = serde_json::to_vec(&submission)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize submission: {}", e))?;
+
+    let content_type = match method {
+        QueryMethod::Get => "application/octet-stream",
+        QueryMethod::Post => "application/json",
+    };
+
+    let mut execution_state = None;
+    {
+        let mut state_guard = runner_state.lock().await;
+        if let Some(client) = state_guard.get_client(HTTP_CLIENT_PORT) {
+            client.queue_post_request(
+                HTTP_CLIENT_PORT,
+                webhook_path.clone(),
+                "localhost:8080".to_string(),
+                body_bytes,
+                content_type.to_string(),
+            );
+            if let Err(e) =
+                state_guard.initiate_connection(HTTP_CLIENT_PORT, GUEST_CID, CONTAINER_PORT)
+            {
+                info!("Query: failed to initiate connection: {}", e);
+            } else {
+                execution_state = Some(ExecutionState::WebhookSubmitted);
+            }
+        } else {
+            return Err(anyhow::anyhow!("HTTP client not found in runner state"));
+        }
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    let machine_arc = Arc::new(machine);
+    loop {
+        if execution_state == Some(ExecutionState::Done) {
+            break;
+        }
+        runner::utils::run_machine_loop_iteration(machine_arc.clone(), runner_state.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Machine loop iteration failed: {}", e))?;
+        match execution_state {
+            Some(ExecutionState::WebhookSubmitted) => {
+                let (succeeded, failed) = {
+                    let handler = webhook_completion_handler.lock().unwrap();
+                    (handler.has_succeeded(), handler.has_failed())
+                };
+                if succeeded {
+                    break;
+                }
+                if failed {
+                    return Err(anyhow::anyhow!(
+                        "Cartesi machine webhook delivery failed (guest did not respond successfully)"
+                    ));
+                }
+                tokio::task::yield_now().await;
+            }
+            Some(ExecutionState::Done) => break,
+            None => return Err(anyhow::anyhow!("Execution state not found")),
+        }
+    }
+
+    // Only reached when webhook succeeded; extract response from runner state
+    let mut state_guard = runner_state.lock().await;
+    if let Some(http_client) = state_guard.get_client(HTTP_CLIENT_PORT) {
+        if let Some(response_data) = http_client.get_write_data(HTTP_CLIENT_PORT) {
+            return Ok(response_data);
+        }
+    }
+    Err(anyhow::anyhow!("HTTP client or response not found"))
+}
+
+/// HTTP method for read-only query (machine currently only supports POST; GET is sent as POST with empty body).
+#[derive(Debug, Clone, Copy)]
+pub enum QueryMethod {
+    Get,
+    Post,
+}
+
 fn eip712_digest(domain: &Eip712Domain, intent: &[u8], nonce: U256, value: U256) -> B256 {
     let create_intent = CreateIntent {
         intent: Bytes::from(intent.to_vec()),

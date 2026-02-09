@@ -6,9 +6,15 @@ use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_signer_local::PrivateKeySigner;
+use axum::body::to_bytes;
 use axum::{
-    extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
+    extract::{Json, Request},
+    http::StatusCode,
+    response::Json as JsonResponse,
+    routing::{get, post},
+    Router,
 };
+use core_lane::{run_cartesi_query, state::StateManager, QueryMethod};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -222,6 +228,11 @@ impl RpcServer {
             .route(
                 "/bitcoin/wallet/balance",
                 axum::routing::get(Self::handle_bitcoin_wallet_balance),
+            )
+            .route("/query", get(Self::handle_query).post(Self::handle_query))
+            .route(
+                "/query/*path",
+                get(Self::handle_query).post(Self::handle_query),
             )
             .with_state(Arc::new(self))
     }
@@ -2838,6 +2849,123 @@ impl RpcServer {
                 .unwrap());
         }
         Err(StatusCode::NOT_FOUND)
+    }
+
+    /// GET or POST /query[/path]
+    /// Runs a read-only Cartesi machine execution at a given revision.
+    /// Headers: X-Revision-Hash (hash or hex prefix; preferred) and/or X-Revision-Height (block number).
+    /// Omit both for latest block. Response includes X-Revision-Height and X-Revision-Hash.
+    /// The path after /query is the endpoint to call inside the machine (e.g. /query/api/foo -> guest /api/foo).
+    async fn handle_query(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+        request: Request,
+    ) -> Result<axum::response::Response, StatusCode> {
+        use std::path::Path;
+
+        let path = request
+            .uri()
+            .path()
+            .strip_prefix("/query")
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        if path.is_empty() {
+            return Ok(axum::response::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "error": "sub_path_required",
+                        "message": "Use /query/<endpoint> to call a guest endpoint (e.g. /query/health)."
+                    })
+                    .to_string(),
+                ))
+                .unwrap());
+        }
+
+        let revision_height = request
+            .headers()
+            .get("X-Revision-Height")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let revision_hash = request
+            .headers()
+            .get("X-Revision-Hash")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let method = if request.method() == axum::http::Method::GET {
+            QueryMethod::Get
+        } else {
+            QueryMethod::Post
+        };
+
+        let body = match to_bytes(request.into_body(), usize::MAX).await {
+            Ok(b) => Bytes::from(b.to_vec()),
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
+        };
+
+        let (block_number, block_timestamp, block_hash) = {
+            let state = rpc_state.state.lock().await;
+            let block_number = state
+                .query_resolve_revision(revision_height.as_deref(), revision_hash.as_deref())
+                .map_err(|e| {
+                    if e.contains("not found") || e.contains("No block") {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    }
+                })?;
+            let block = state.blocks.get(&block_number);
+            let block_timestamp = block.map(|b| b.timestamp).unwrap_or(0);
+            let block_hash = block.map(|b| b.hash);
+            (block_number, block_timestamp, block_hash)
+        };
+
+        let blocks_dir = Path::new(&rpc_state.data_dir).join("blocks");
+        let block_file = blocks_dir.join(format!("{}", block_number));
+        let serialized = tokio::fs::read(&block_file).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        })?;
+        let state_manager = StateManager::borsh_deserialize(&serialized)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let bundle_state = state_manager.to_bundle_state_snapshot();
+
+        // run_cartesi_query is !Send (Cartesi Machine), so we use spawn_blocking to avoid
+        // tying up a tokio worker; the blocking pool runs the future via block_on.
+        let response_bytes = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(run_cartesi_query(
+                path,
+                method,
+                body,
+                bundle_state,
+                block_timestamp,
+            ))
+        })
+        .await
+        .map_err(|_| {
+            info!("Query task join failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|e| {
+            info!("Query execution failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let mut response = axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/octet-stream")
+            .header("X-Revision-Height", block_number.to_string());
+        if let Some(h) = block_hash {
+            response = response.header("X-Revision-Hash", format!("0x{:x}", h));
+        }
+        Ok(response
+            .body(axum::body::Body::from(response_bytes))
+            .unwrap())
     }
 
     /// GET /health

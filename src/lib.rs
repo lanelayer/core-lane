@@ -37,8 +37,8 @@ pub use intents::{
 };
 pub use state::{BundleStateManager, StateManager, StoredTransaction, TransactionReceipt};
 pub use transaction::{
-    execute_transaction, get_transaction_input_bytes, get_transaction_nonce, CoreLaneAddresses,
-    ExecutionResult, ProcessingContext,
+    execute_transaction, get_transaction_input_bytes, get_transaction_nonce, run_cartesi_query,
+    CoreLaneAddresses, ExecutionResult, ProcessingContext, QueryMethod,
 };
 
 // Re-export key external types for convenience
