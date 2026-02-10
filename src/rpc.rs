@@ -9,6 +9,7 @@ use alloy_signer_local::PrivateKeySigner;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -35,6 +36,12 @@ pub struct JsonRpcResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
     pub id: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HttpSubmitRequest {
+    pub namespace: u64,
+    pub payload: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +151,8 @@ pub struct RpcServer {
     sequencer_rpc_url: Option<String>,
     /// Channel sender for triggering on-demand block scans
     poll_trigger: Option<mpsc::Sender<()>>,
+    espresso_submit_url: Option<String>,
+    espresso_client: Option<reqwest::Client>,
 }
 
 impl RpcServer {
@@ -179,6 +188,8 @@ impl RpcServer {
             da_feed_address: None,
             sequencer_rpc_url: config.sequencer_rpc_url,
             poll_trigger,
+            espresso_submit_url: None,
+            espresso_client: None,
         })
     }
 
@@ -203,6 +214,34 @@ impl RpcServer {
             da_feed_address: Some(da_feed_address),
             sequencer_rpc_url,
             poll_trigger,
+            espresso_submit_url: None,
+            espresso_client: None,
+        }
+    }
+
+    pub fn with_local_state_only(
+        state: Arc<Mutex<CoreLaneState>>,
+        data_dir: String,
+        sequencer_rpc_url: Option<String>,
+        espresso_submit_url: Option<String>,
+        poll_trigger: Option<mpsc::Sender<()>>,
+        espresso_client: reqwest::Client,
+    ) -> Self {
+        Self {
+            state,
+            bitcoin_client: None,
+            bdk_bitcoind_client: None,
+            network: None,
+            wallet: None,
+            mnemonic: None,
+            electrum_url: None,
+            data_dir,
+            core_rpc_url: None,
+            da_feed_address: None,
+            sequencer_rpc_url,
+            espresso_submit_url,
+            poll_trigger,
+            espresso_client: Some(espresso_client),
         }
     }
 
@@ -210,6 +249,7 @@ impl RpcServer {
         Router::new()
             // JSON-RPC endpoint (POST)
             .route("/", post(Self::handle_request))
+            .route("/submit", post(Self::handle_http_submit))
             // Custom REST endpoints for raw data access (GET)
             .route(
                 "/get_raw_block/:block_number",
@@ -231,6 +271,150 @@ impl RpcServer {
             )
             .route("/do_poll", post(Self::handle_do_poll))
             .with_state(Arc::new(self))
+    }
+
+    async fn handle_http_submit(
+        axum::extract::State(server): axum::extract::State<Arc<Self>>,
+        Json(body): Json<HttpSubmitRequest>,
+    ) -> Result<JsonResponse<JsonRpcResponse>, StatusCode> {
+        let espresso_url = match &server.espresso_submit_url {
+            Some(url) => url,
+            None => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32601,
+                        message:
+                            "Espresso submit URL not configured; /submit is only supported in Espresso-derived mode"
+                                .to_string(),
+                    }),
+                    id: Value::Null,
+                }));
+            }
+        };
+
+        let hex_str = body.payload.strip_prefix("0x").unwrap_or(&body.payload);
+        let tx_data = match hex::decode(hex_str) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: format!("Invalid hex encoding in payload: {}", e),
+                    }),
+                    id: Value::Null,
+                }));
+            }
+        };
+
+        if tx_data.is_empty() {
+            return Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: "Empty transaction payload".to_string(),
+                }),
+                id: Value::Null,
+            }));
+        }
+
+        let submit_url = format!("{}/submit/submit", espresso_url.trim_end_matches('/'));
+        info!(
+            "Submitting transaction to Espresso: {} (namespace: {}, {} bytes)",
+            submit_url,
+            body.namespace,
+            tx_data.len()
+        );
+
+        let payload_base64 = BASE64_STANDARD.encode(&tx_data);
+
+        let json_body = json!({
+            "namespace": body.namespace,
+            "payload": payload_base64,
+        });
+
+        info!(
+            "Prepared Espresso submit body (namespace: {}, payload_bytes: {})",
+            body.namespace,
+            tx_data.len()
+        );
+
+        let espresso_client = match &server.espresso_client {
+            Some(client) => client,
+            None => {
+                return Ok(JsonResponse::from(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32603,
+                        message: "Espresso client not configured".to_string(),
+                    }),
+                    id: Value::Null,
+                }));
+            }
+        };
+
+        match espresso_client
+            .post(&submit_url)
+            .json(&json_body)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                info!("Response: {:?}", response);
+
+                if response.status().is_success() {
+                    match response.text().await {
+                        Ok(tx_hash) => {
+                            info!("Transaction submitted to Espresso: {}", tx_hash);
+                            Ok(JsonResponse::from(JsonRpcResponse {
+                                jsonrpc: "2.0".to_string(),
+                                result: Some(json!({
+                                    "status": "submitted",
+                                    "hash": tx_hash,
+                                })),
+                                error: None,
+                                id: Value::Null,
+                            }))
+                        }
+                        Err(e) => Ok(JsonResponse::from(JsonRpcResponse {
+                            jsonrpc: "2.0".to_string(),
+                            result: Some(json!({
+                                "status": "submitted",
+                                "warning": format!("Could not read Espresso response: {}", e),
+                            })),
+                            error: None,
+                            id: Value::Null,
+                        })),
+                    }
+                } else {
+                    let status = response.status();
+                    let error_text = response.text().await.unwrap_or_default();
+                    Ok(JsonResponse::from(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!("Espresso returned {}: {}", status, error_text),
+                        }),
+                        id: Value::Null,
+                    }))
+                }
+            }
+            Err(e) => Ok(JsonResponse::from(JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!("Failed to submit to Espresso: {}", e),
+                }),
+                id: Value::Null,
+            })),
+        }
     }
 
     async fn handle_request(
@@ -2108,9 +2292,9 @@ impl RpcServer {
             }
         };
 
-        // Get last processed Bitcoin height and current Core Lane block number
+        // Get last processed upstream anchor height and current Core Lane block number
         let state_guard = server.state.lock().await;
-        let last_processed_bitcoin = state_guard.last_processed_bitcoin_height;
+        let last_processed_bitcoin = state_guard.last_processed_anchor_height;
         let current_core_lane_block = state_guard.blocks.keys().max().copied().unwrap_or(0);
         drop(state_guard);
 
@@ -2929,7 +3113,7 @@ impl RpcServer {
             "status": "ok",
             "block_count": block_count,
             "latest_block": latest_block,
-            "last_processed_bitcoin_height": state.last_processed_bitcoin_height,
+            "last_processed_bitcoin_height": state.last_processed_anchor_height,
             // State metrics
             "total_accounts": total_accounts,
             "total_transactions": total_transactions,
