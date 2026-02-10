@@ -14,6 +14,7 @@ use bitcoin::Network;
 use clap::{Parser, Subcommand};
 use core_lane::bitcoin_rpc_client::BitcoinRpcReadClient;
 use core_lane::{create_bitcoin_rpc_client, BitcoinRpcClient};
+use futures::StreamExt;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, json};
@@ -26,6 +27,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaState {
     eip1559_fee_manager: eip1559::Eip1559FeeManager,
@@ -52,7 +54,7 @@ const TIP_FORMAT_VERSION: u8 = 4;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChainTip {
     core_lane_block_number: u64,
-    last_processed_bitcoin_height: u64,
+    last_processed_anchor_height: u64,
     bitcoin_block_hash: B256,
     core_lane_block: CoreLaneBlock,
 }
@@ -70,6 +72,7 @@ use core_lane::{bitcoin_cache_rpc, block, cmio, intents, state, taproot_da, tran
 
 // RPC module and EIP-1559 are specific to the binary (depends on CoreLaneState)
 mod derived;
+mod derived_espresso;
 mod eip1559;
 mod rpc;
 
@@ -87,14 +90,14 @@ mod tests;
 use alloy_consensus::TxEnvelope;
 use bitcoin_cache_rpc::{BitcoinCacheRpcServer, S3Config};
 use cmio::CmioMessage;
+use core_lane::bitcoin_rpc_client::create_bitcoin_read_client;
+use core_lane::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 use intents::create_anchor_bitcoin_fill_intent;
+use reqwest::Client;
 use rpc::RpcServer;
 use state::{StateManager, StoredTransaction, TransactionReceipt};
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
-
-use core_lane::bitcoin_rpc_client::create_bitcoin_read_client;
-use core_lane::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
 
 /// Helper function to construct wallet database path
 fn wallet_db_path(data_dir: &str, network: &str) -> String {
@@ -508,6 +511,28 @@ enum Commands {
         #[arg(long)]
         on_demand_polling: bool,
     },
+    /// Start a derived Core Lane node that reads bundles from an Espresso.
+    DerivedEspressoStart {
+        /// url for the Espresso query
+        #[arg(long, default_value = "https://query.decaf.testnet.espresso.network")]
+        espresso_base_url: String,
+        /// Namespace to read Core Lane bundles from in Espresso.
+        #[arg(long, default_value_t = 0)]
+        espresso_namespace: u64,
+        #[arg(long)]
+        start_block: Option<u64>,
+        #[arg(long, default_value = "127.0.0.1")]
+        http_host: String,
+        #[arg(long, default_value = "8545")]
+        http_port: u16,
+        /// Sequencer RPC URL - if set, eth_sendRawTransaction will forward transactions to this endpoint
+        #[arg(long)]
+        sequencer_rpc_url: Option<String>,
+        /// Sequencer address that receives priority fees (hex format, e.g., 0x...)
+        /// If not provided, defaults to a well-known test address (insecure for production)
+        #[arg(long)]
+        sequencer_address: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,7 +677,7 @@ impl CoreLaneBlock {
 #[derive(Clone)]
 struct CoreLaneState {
     account_manager: StateManager,
-    last_processed_bitcoin_height: Option<u64>,
+    last_processed_anchor_height: Option<u64>,
     blocks: HashMap<u64, CoreLaneBlock>, // Block number -> Block
     block_hashes: HashMap<B256, u64>,    // Block hash -> Block number
     bitcoin_height_to_hash: HashMap<u64, B256>, // Bitcoin height -> Bitcoin block hash (for reorg detection)
@@ -677,8 +702,8 @@ impl std::fmt::Debug for CoreLaneState {
         f.debug_struct("CoreLaneState")
             .field("account_manager", &self.account_manager)
             .field(
-                "last_processed_bitcoin_height",
-                &self.last_processed_bitcoin_height,
+                "last_processed_anchor_height",
+                &self.last_processed_anchor_height,
             )
             .field("blocks", &self.blocks)
             .field("block_hashes", &self.block_hashes)
@@ -773,7 +798,7 @@ impl CoreLaneState {
         self.account_manager = loaded_state;
 
         // Resolve the Bitcoin height that corresponds to target_block
-        // We need this because last_processed_bitcoin_height is a Bitcoin height, not a Core Lane block number
+        // We need this because last_processed_anchor_height is a Bitcoin height, not a Core Lane block number
         let bitcoin_height = self
             .bitcoin_height_to_core_block
             .iter()
@@ -837,8 +862,8 @@ impl CoreLaneState {
             heights_after
         );
 
-        // Update last_processed_bitcoin_height to the Bitcoin height (not the Core Lane block number)
-        self.last_processed_bitcoin_height = Some(bitcoin_height);
+        // Update last_processed_anchor_height to the Bitcoin height (not the Core Lane block number)
+        self.last_processed_anchor_height = Some(bitcoin_height);
 
         info!(
             "✅ Successfully rolled back to Core Lane block {} (Bitcoin height {})",
@@ -962,8 +987,8 @@ impl CoreLaneNode {
                                     .insert(entry.bitcoin_height, entry.bitcoin_block_hash);
                             }
                             info!(
-                                "✅ Restored full chain from disk: Core Lane blocks 0..{} (Bitcoin height {})",
-                                n, tip.last_processed_bitcoin_height
+                                "✅ Restored full chain from disk: Core Lane blocks 0..{} (upstream height {})",
+                                n, tip.last_processed_anchor_height
                             );
                         }
                         Err(e) => {
@@ -974,18 +999,18 @@ impl CoreLaneNode {
                             blocks.insert(n, tip.core_lane_block.clone());
                             block_hashes.insert(tip.core_lane_block.hash, n);
                             bitcoin_height_to_core_block
-                                .insert(tip.last_processed_bitcoin_height, n);
+                                .insert(tip.last_processed_anchor_height, n);
                             bitcoin_height_to_hash
-                                .insert(tip.last_processed_bitcoin_height, tip.bitcoin_block_hash);
+                                .insert(tip.last_processed_anchor_height, tip.bitcoin_block_hash);
                             info!(
-                                "✅ Restored state from disk (tip only): Core Lane block {} (Bitcoin height {})",
-                                n, tip.last_processed_bitcoin_height
+                                "✅ Restored state from disk (tip only): Core Lane block {} (upstream height {})",
+                                n, tip.last_processed_anchor_height
                             );
                         }
                     }
                     state = Some(CoreLaneState {
                         account_manager,
-                        last_processed_bitcoin_height: Some(tip.last_processed_bitcoin_height),
+                        last_processed_anchor_height: Some(tip.last_processed_anchor_height),
                         blocks,
                         block_hashes,
                         bitcoin_height_to_hash,
@@ -1028,7 +1053,7 @@ impl CoreLaneNode {
             block_hashes.insert(genesis_hash, 0);
             CoreLaneState {
                 account_manager: StateManager::new(),
-                last_processed_bitcoin_height: None,
+                last_processed_anchor_height: None,
                 blocks,
                 block_hashes,
                 bitcoin_height_to_hash: HashMap::new(),
@@ -1315,7 +1340,10 @@ impl CoreLaneNode {
                     .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", f.display(), e))?;
             }
         }
-        info!("Wiped block data and tip in {} (tip version change or unrecoverable state); will start from genesis", data_dir);
+        info!(
+            "Wiped block data and tip in {} (tip version change or unrecoverable state); will start from genesis",
+            data_dir
+        );
         Ok(())
     }
 
@@ -1634,17 +1662,17 @@ impl CoreLaneNode {
         info!("Core Lane state initialized");
 
         // Only apply --start_block when we have no restored state (fresh start).
-        // If we restored from disk, last_processed_bitcoin_height is already set; overwriting
+        // If we restored from disk, last_processed_anchor_height is already set; overwriting
         // it with start_block would re-scan from an older height and create duplicate Core Lane blocks.
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
-            if let Some(tip) = state.last_processed_bitcoin_height {
+            if let Some(tip) = state.last_processed_anchor_height {
                 info!(
-                    "Resuming from restored tip (Bitcoin height {}); --start_block {} ignored",
+                    "Resuming from restored tip (Bitcoin/anchor height {}); --start_block {} ignored",
                     tip, block
                 );
             } else {
-                state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+                state.last_processed_anchor_height = Some(block.saturating_sub(1));
                 info!("Starting from block: {}", block);
             }
         }
@@ -1658,7 +1686,9 @@ impl CoreLaneNode {
             info!(
                 "✅ Scanner initialized in on-demand mode. Waiting for POST /do_poll requests..."
             );
-            info!("⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans.");
+            info!(
+                "⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans."
+            );
 
             loop {
                 // Wait for trigger signal
@@ -1707,7 +1737,9 @@ impl CoreLaneNode {
                 "Starting derived Core Lane scanner with RPC URL: {} (on-demand polling mode)",
                 core_rpc_url
             );
-            info!("⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans.");
+            info!(
+                "⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans."
+            );
         } else {
             info!(
                 "Starting derived Core Lane scanner with RPC URL: {}",
@@ -1716,8 +1748,8 @@ impl CoreLaneNode {
         }
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
-            if state.last_processed_bitcoin_height.is_none() {
-                state.last_processed_bitcoin_height = Some(block.saturating_sub(1));
+            if state.last_processed_anchor_height.is_none() {
+                state.last_processed_anchor_height = Some(block.saturating_sub(1));
             }
         }
 
@@ -1783,7 +1815,7 @@ impl CoreLaneNode {
 
         let start_height = {
             let state = self.state.lock().await;
-            match state.last_processed_bitcoin_height {
+            match state.last_processed_anchor_height {
                 None => latest_block.saturating_sub(10),
                 Some(height) => height + 1,
             }
@@ -1816,7 +1848,7 @@ impl CoreLaneNode {
                                 return Err(anyhow::anyhow!("Reorg detected"));
                             }
                             let mut state = self.state.lock().await;
-                            state.last_processed_bitcoin_height = Some(height);
+                            state.last_processed_anchor_height = Some(height);
                             let _block_hash = if anchor_hash.len() == 32 {
                                 let h = B256::from_slice(&anchor_hash);
                                 state.bitcoin_height_to_hash.insert(height, h);
@@ -1855,7 +1887,7 @@ impl CoreLaneNode {
         // Get the starting block without holding the lock
         let start_block = {
             let state = self.state.lock().await;
-            match state.last_processed_bitcoin_height {
+            match state.last_processed_anchor_height {
                 None => {
                     // First run (no start block specified) - start from recent blocks
                     tip.saturating_sub(10)
@@ -1891,7 +1923,7 @@ impl CoreLaneNode {
                     }
                     // Update the last processed block and bitcoin_height_to_hash mapping (tip already written in process_block)
                     let mut state = self.state.lock().await;
-                    state.last_processed_bitcoin_height = Some(height);
+                    state.last_processed_anchor_height = Some(height);
                     // anchor_block_hash is now raw 32-byte hash
                     let block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
                     state.bitcoin_height_to_hash.insert(height, block_hash);
@@ -2089,10 +2121,7 @@ impl CoreLaneNode {
                     if cumulative_gas_used + tx_gas_limit > max_gas_limit {
                         warn!(
                             "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping transaction with gas_limit: {}",
-                            new_block.number,
-                            cumulative_gas_used,
-                            max_gas_limit,
-                            tx_gas_limit
+                            new_block.number, cumulative_gas_used, max_gas_limit, tx_gas_limit
                         );
                         // Skip remaining transactions as we've hit the maximum
                         break;
@@ -2104,10 +2133,7 @@ impl CoreLaneNode {
                     {
                         info!(
                             "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
-                            new_block.number,
-                            target_gas_usage,
-                            max_gas_limit,
-                            cumulative_gas_used
+                            new_block.number, target_gas_usage, max_gas_limit, cumulative_gas_used
                         );
                     }
 
@@ -2144,9 +2170,7 @@ impl CoreLaneNode {
                         if cumulative_gas_used > max_gas_limit {
                             warn!(
                                 "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
-                                new_block.number,
-                                cumulative_gas_used,
-                                max_gas_limit
+                                new_block.number, cumulative_gas_used, max_gas_limit
                             );
                             break;
                         }
@@ -2207,12 +2231,9 @@ impl CoreLaneNode {
 
                         if cumulative_gas_used + tx_gas_limit > max_gas_limit {
                             warn!(
-                                    "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
-                                    new_block.number,
-                                    cumulative_gas_used,
-                                    max_gas_limit,
-                                    tx_gas_limit
-                                );
+                                "🚫 Block {} reached EIP-1559 maximum gas limit ({}/{}). Skipping non-sequencer transaction with gas_limit: {}",
+                                new_block.number, cumulative_gas_used, max_gas_limit, tx_gas_limit
+                            );
                             break;
                         }
 
@@ -2220,12 +2241,12 @@ impl CoreLaneNode {
                             && cumulative_gas_used < target_gas_usage + tx_gas_limit
                         {
                             info!(
-                                    "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
-                                    new_block.number,
-                                    target_gas_usage,
-                                    max_gas_limit,
-                                    cumulative_gas_used
-                                );
+                                "🎯 Block {} exceeded EIP-1559 target gas usage (target: {}, max: {}, current: {})",
+                                new_block.number,
+                                target_gas_usage,
+                                max_gas_limit,
+                                cumulative_gas_used
+                            );
                         }
 
                         let tx_result = self
@@ -2257,11 +2278,9 @@ impl CoreLaneNode {
 
                             if cumulative_gas_used > max_gas_limit {
                                 warn!(
-                                        "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
-                                        new_block.number,
-                                        cumulative_gas_used,
-                                        max_gas_limit
-                                    );
+                                    "🚫 Block {} exceeded EIP-1559 maximum gas limit after execution ({}/{}). Stopping transaction processing.",
+                                    new_block.number, cumulative_gas_used, max_gas_limit
+                                );
                                 break;
                             }
                         }
@@ -2309,7 +2328,7 @@ impl CoreLaneNode {
         let bitcoin_block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
         let tip = ChainTip {
             core_lane_block_number: block_number,
-            last_processed_bitcoin_height: bitcoin_height,
+            last_processed_anchor_height: bitcoin_height,
             bitcoin_block_hash,
             core_lane_block: finalized_block.clone(),
         };
@@ -2452,7 +2471,10 @@ impl CoreLaneNode {
             let legacy_tx = tx.0.as_legacy().unwrap();
 
             if gas_price > legacy_tx.tx().gas_price {
-                warn!("      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}", tx.0);
+                warn!(
+                    "      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}",
+                    tx.0
+                );
                 return None;
             }
 
@@ -2660,7 +2682,7 @@ impl CoreLaneNode {
         use tokio::task;
 
         // Start from our last processed Bitcoin height and work backwards
-        let mut current_bitcoin_height = match state.last_processed_bitcoin_height {
+        let mut current_bitcoin_height = match state.last_processed_anchor_height {
             Some(height) => height,
             None => {
                 error!("❌ Cannot find fork point: no Bitcoin height has been processed yet");
@@ -2707,7 +2729,10 @@ impl CoreLaneNode {
 
                             if stored_hash.as_slice() == current_hash_bytes {
                                 // This height matches - this is the last common ancestor (fork point)
-                                info!("✅ Bitcoin height {} matches stored hash - this is the fork point (last common ancestor)", current_bitcoin_height);
+                                info!(
+                                    "✅ Bitcoin height {} matches stored hash - this is the fork point (last common ancestor)",
+                                    current_bitcoin_height
+                                );
                                 info!(
                                     "🔍 Fork point found at Bitcoin height {} (Core Lane block {})",
                                     current_bitcoin_height, core_block
@@ -2809,6 +2834,106 @@ impl CoreLaneNode {
         }
     }
 
+    async fn start_espresso_scanner(
+        &self,
+        espresso_base_url: String,
+        start_block: Option<u64>,
+        espresso_namespace: u64,
+    ) -> Result<()> {
+        info!(
+            "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
+            espresso_base_url, espresso_namespace
+        );
+
+        if let Some(block) = start_block {
+            let mut state = self.state.lock().await;
+            if state.last_processed_anchor_height.is_none() {
+                state.last_processed_anchor_height = Some(block.saturating_sub(1));
+            }
+        }
+
+        loop {
+            let result = async {
+                let latest_block =
+                    derived_espresso::fetch_espresso_block_number(&espresso_base_url).await?;
+
+                println!("latest_block in espresso is: {}", latest_block);
+
+                let start_height = latest_block.saturating_sub(10);
+
+                let base_url = Url::parse(&espresso_base_url)?;
+                let client = client::SequencerClient::new(base_url);
+                let mut sub = client.subscribe_blocks(start_height).await?;
+
+                while let Some(evt) = sub.next().await {
+                    let header = evt?;
+                    let height = header.height();
+
+                    match derived_espresso::process_espresso_block(
+                        &espresso_base_url,
+                        header,
+                        espresso_namespace,
+                    )
+                    .await
+                    {
+                        Ok(parsed_block) => {
+                            let anchor_hash = parsed_block.anchor_block_hash.clone();
+                            match self.process_block(parsed_block).await {
+                                Ok(core_lane_block_number) => {
+                                    if core_lane_block_number == 0 {
+                                        info!(
+                                            "Espresso-derived backend encountered reorg, restarting scan"
+                                        );
+                                        return Err(anyhow::anyhow!("Reorg detected"));
+                                    }
+
+                                    let mut state = self.state.lock().await;
+                                    state.last_processed_anchor_height = Some(height);
+                                    if anchor_hash.len() == 32 {
+                                        let h = B256::from_slice(&anchor_hash);
+                                        state.block_hashes.insert(h, core_lane_block_number);
+                                    } else {
+                                        warn!(
+                                            "Espresso anchor hash for block {} has unexpected length {}; skipping index update",
+                                            height,
+                                            anchor_hash.len()
+                                        );
+                                    };
+                                    let block = state.blocks[&core_lane_block_number].clone();
+                                    state.blocks.insert(core_lane_block_number, block);
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        "Failed to process Espresso-derived block {}: {}",
+                                        height, err
+                                    );
+                                    return Err(err);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!("Found error for Espresso block {}: {}", height, err);
+                            return Err(err);
+                        }
+                    }
+                }
+
+                warn!("Espresso block subscription stream ended; reconnecting...");
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                error!("Error in Espresso-derived scanner: {}", e);
+                info!("Retrying Espresso scanner in 30 seconds after error");
+                sleep(Duration::from_secs(30)).await;
+            } else {
+                info!("Espresso block subscription ended cleanly; reconnecting in 5 seconds");
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
     /// Perform the actual rollback after lock is released
     async fn perform_rollback(&self, fork_core_block: u64) -> Result<()> {
         // Rollback state to the fork point
@@ -2830,7 +2955,9 @@ impl CoreLaneNode {
                     state_mut.eip1559_fee_manager = metastate.eip1559_fee_manager;
                     state_mut.total_burned_amount = metastate.total_burned_amount;
                     state_mut.sequencer_address = metastate.sequencer_address;
-                    info!("✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address");
+                    info!(
+                        "✅ Restored EIP-1559 fee manager, total burned amount, and sequencer address"
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -2847,15 +2974,15 @@ impl CoreLaneNode {
             fork_core_block
         );
 
-        // Get the actual Bitcoin height that we'll restart from (the rollback set last_processed_bitcoin_height)
+        // Get the actual Bitcoin height that we'll restart from (the rollback set last_processed_anchor_height)
         let restart_bitcoin_height = {
             let state = self.state.lock().await;
-            match state.last_processed_bitcoin_height {
+            match state.last_processed_anchor_height {
                 Some(height) => height + 1,
                 None => {
-                    error!("❌ Rollback succeeded but last_processed_bitcoin_height is None");
+                    error!("❌ Rollback succeeded but last_processed_anchor_height is None");
                     return Err(anyhow::anyhow!(
-                        "Invalid state after rollback: last_processed_bitcoin_height is None"
+                        "Invalid state after rollback: last_processed_anchor_height is None"
                     ));
                 }
             }
@@ -2866,7 +2993,7 @@ impl CoreLaneNode {
             restart_bitcoin_height
         );
 
-        // The scanning loop will detect that last_processed_bitcoin_height has been reset
+        // The scanning loop will detect that last_processed_anchor_height has been reset
         // and automatically restart from the correct point
         info!("✅ Reorg recovery completed successfully");
         info!(
@@ -2878,7 +3005,7 @@ impl CoreLaneNode {
     }
 
     fn derive_local_fork_point(state: &CoreLaneState) -> Result<Option<u64>> {
-        let mut search_height = state.last_processed_bitcoin_height.ok_or_else(|| {
+        let mut search_height = state.last_processed_anchor_height.ok_or_else(|| {
             anyhow::anyhow!("Cannot recover from reorg without processed block history")
         })?;
 
@@ -3000,7 +3127,9 @@ async fn main() -> Result<()> {
                 .transpose()?;
 
             if sequencer_addr.is_none() {
-                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
             } else {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
             }
@@ -3558,7 +3687,9 @@ async fn main() -> Result<()> {
 
             if !finalized {
                 if !cli.plain {
-                    warn!("⚠️  Transaction not fully finalized by BDK, attempting manual finalization...");
+                    warn!(
+                        "⚠️  Transaction not fully finalized by BDK, attempting manual finalization..."
+                    );
                 }
 
                 // Try manual finalization with miniscript
@@ -3659,7 +3790,10 @@ async fn main() -> Result<()> {
                 println!("{}", txid);
             } else {
                 info!("✅ Wallet updated - inputs marked as spent");
-                info!("🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!", burn_amount, eth_addr);
+                info!(
+                    "🪙 Core Lane will automatically mint {} tokens to 0x{} when this transaction is confirmed!",
+                    burn_amount, eth_addr
+                );
             }
         }
 
@@ -3772,7 +3906,7 @@ async fn main() -> Result<()> {
                     return Err(anyhow::anyhow!(
                         "Invalid bundle marker: {}. Must be 'head' or 'standard'",
                         marker
-                    ))
+                    ));
                 }
             };
 
@@ -3913,7 +4047,10 @@ async fn main() -> Result<()> {
                                 Ok(json) => {
                                     if let Some(result) = json.get("result") {
                                         if let Some(count) = result.as_u64() {
-                                            info!("✅ Bitcoin RPC connection successful! Current block height: {}", count);
+                                            info!(
+                                                "✅ Bitcoin RPC connection successful! Current block height: {}",
+                                                count
+                                            );
                                         }
                                     } else if let Some(error) = json.get("error") {
                                         if !error.is_null() {
@@ -4019,7 +4156,9 @@ async fn main() -> Result<()> {
 
             let addr = format!("{}:{}", host, port);
             info!("📡 Bitcoin Cache RPC listening on http://{}", addr);
-            info!("📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only), getblockchaininfo");
+            info!(
+                "📋 Available methods: getblockcount, getblockhash, getblock (verbosity=0 only), getblockchaininfo"
+            );
 
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             axum::serve(listener, app).await?;
@@ -4352,7 +4491,9 @@ async fn main() -> Result<()> {
                 .transpose()?;
 
             if sequencer_addr.is_none() {
-                warn!("⚠️  No --sequencer-address provided, using default test address (insecure for production)");
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
             } else {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
             }
@@ -4419,6 +4560,80 @@ async fn main() -> Result<()> {
                     poll_trigger_receiver,
                 )
                 .await
+            });
+
+            let _ = tokio::try_join!(server_handle, scanner_handle)?;
+        }
+
+        Commands::DerivedEspressoStart {
+            espresso_base_url,
+            espresso_namespace,
+            start_block,
+            http_host,
+            http_port,
+            sequencer_rpc_url,
+            sequencer_address,
+        } => {
+            // Parse sequencer address if provided
+            let sequencer_addr = sequencer_address
+                .as_ref()
+                .map(|addr_str| {
+                    Address::from_str(addr_str).map_err(|e| {
+                        anyhow::anyhow!("Invalid sequencer address '{}': {}", addr_str, e)
+                    })
+                })
+                .transpose()?;
+
+            if sequencer_addr.is_none() {
+                warn!(
+                    "⚠️  No --sequencer-address provided, using default test address (insecure for production)"
+                );
+            } else {
+                info!("✅ Using sequencer address: {:?}", sequencer_addr);
+            }
+
+            info!(
+                "🔧 Starting derived Core Lane node in Espresso/Decaf mode (espresso_base_url = {}, must be a full Espresso server supporting both query and submit endpoints)",
+                espresso_base_url
+            );
+
+            let node =
+                CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
+
+            let shared_state = Arc::clone(&node.state);
+            // Pass the full Espresso server base URL (supports query and submit endpoints)
+            // so /submit can forward transactions to POST {espresso_base_url}/submit/submit.
+
+            let espresso_client = Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build Espresso HTTP client: {}", e))?;
+            let rpc_server = RpcServer::with_local_state_only(
+                shared_state,
+                cli.data_dir.clone(),
+                sequencer_rpc_url.clone(),
+                Some(espresso_base_url.clone()),
+                None,
+                espresso_client,
+            );
+            let app = rpc_server.router();
+            let addr = format!("{}:{}", http_host, http_port);
+            info!(
+                "🚀 Starting JSON-RPC server on http://{} (derived Espresso mode)",
+                addr
+            );
+
+            let server_handle = tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let start_block = *start_block;
+            let espresso_base_url = espresso_base_url.clone();
+            let espresso_namespace = *espresso_namespace;
+            let scanner_handle = tokio::spawn(async move {
+                node.start_espresso_scanner(espresso_base_url, start_block, espresso_namespace)
+                    .await
             });
 
             let _ = tokio::try_join!(server_handle, scanner_handle)?;

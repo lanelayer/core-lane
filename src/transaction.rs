@@ -11,24 +11,37 @@ use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::{Eip712Domain, SolStruct};
 use anyhow::{anyhow, Result};
 use bitcoin::Address as BitcoinAddress;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::config::machine::{MachineConfig, RAMConfig};
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::config::runtime::RuntimeConfig;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::types::cmio::AutomaticReason;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::types::cmio::CmioRequest;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::types::cmio::CmioResponseReason;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::types::cmio::ManualReason;
+#[cfg(feature = "cartesi-runner")]
 use cartesi_machine::Machine;
+#[cfg(feature = "cartesi-runner")]
 use runner::http_server::{add_http_server_with_kv_store, KvStore};
+#[cfg(feature = "cartesi-runner")]
 use runner::RunnerState;
+#[cfg(feature = "cartesi-runner")]
 use runner::{add_webhook_delivery_service, Submission};
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(feature = "cartesi-runner")]
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
+#[cfg(feature = "cartesi-runner")]
 fn build_submission_from_input(input: &Bytes, block_timestamp: u64) -> Submission {
+    use std::collections::HashMap;
+
     Submission {
         tx_hash: None,
         intent_id: None,
@@ -215,6 +228,11 @@ fn execute_transfer<T: ProcessingContext>(
     state: &mut T,
     block_timestamp: u64,
 ) -> Result<ExecutionResult> {
+    // When Cartesi support is disabled --no-default-features
+    // `block_timestamp` is currently unused. Keep signature stable but silence `-D warnings`.
+    #[cfg(not(feature = "cartesi-runner"))]
+    let _ = block_timestamp;
+
     let value = get_transaction_value(tx);
     let gas_used = U256::from(21000u64);
 
@@ -253,6 +271,7 @@ fn execute_transfer<T: ProcessingContext>(
         }
     };
 
+    #[cfg(feature = "cartesi-runner")]
     if to == CoreLaneAddresses::cartesi_http_runner() {
         let input = Bytes::from(get_transaction_input_bytes(tx));
         let bundle_state_arc = Arc::new(std::sync::Mutex::new(bundle_state.clone()));
@@ -271,6 +290,20 @@ fn execute_transfer<T: ProcessingContext>(
         }
 
         return result;
+    }
+
+    #[cfg(not(feature = "cartesi-runner"))]
+    if to == CoreLaneAddresses::cartesi_http_runner() {
+        return Ok(ExecutionResult {
+            success: false,
+            gas_used,
+            gas_refund: U256::ZERO,
+            output: Bytes::new(),
+            logs: vec!["Cartesi HTTP runner called but Cartesi support is disabled".to_string()],
+            error: Some(
+                "Cartesi runner is disabled; rebuild with --features cartesi-runner".to_string(),
+            ),
+        });
     }
 
     if to == CoreLaneAddresses::exit_marketplace() {
@@ -643,6 +676,8 @@ fn execute_transfer<T: ProcessingContext>(
                         Some(i) => (Some(i.status), IntentData::from_cbor(&i.data).ok()),
                         None => (None, None),
                     };
+                #[cfg(not(feature = "cartesi-runner"))]
+                let _ = intent_data.as_ref();
 
                 let status = match status_snapshot {
                     Some(s) => s,
@@ -669,28 +704,31 @@ fn execute_transfer<T: ProcessingContext>(
                                 .insert_intent(intent_id, updated_intent);
                         }
 
-                        if let Some(intent_data) = intent_data.as_ref() {
-                            if intent_data.intent_type == IntentType::RiscVProgram {
-                                let permission = check_riscv_intent_permission(
-                                    bundle_state,
-                                    state,
-                                    intent_data,
-                                    intent_id,
-                                )?;
-                                if permission == 1 {
-                                    if let Some(original_intent) = original_main_intent {
-                                        state
-                                            .state_manager_mut()
-                                            .insert_intent(intent_id, original_intent);
+                        #[cfg(feature = "cartesi-runner")]
+                        {
+                            if let Some(intent_data) = intent_data.as_ref() {
+                                if intent_data.intent_type == IntentType::RiscVProgram {
+                                    let permission = check_riscv_intent_permission(
+                                        bundle_state,
+                                        state,
+                                        intent_data,
+                                        intent_id,
+                                    )?;
+                                    if permission == 1 {
+                                        if let Some(original_intent) = original_main_intent {
+                                            state
+                                                .state_manager_mut()
+                                                .insert_intent(intent_id, original_intent);
+                                        }
+                                        return Ok(ExecutionResult {
+                                            success: false,
+                                            gas_used,
+                                            gas_refund: U256::ZERO,
+                                            output: Bytes::new(),
+                                            logs: vec!["Permission denied".to_string()],
+                                            error: Some("Permission denied".to_string()),
+                                        });
                                     }
-                                    return Ok(ExecutionResult {
-                                        success: false,
-                                        gas_used,
-                                        gas_refund: U256::ZERO,
-                                        output: Bytes::new(),
-                                        logs: vec!["Permission denied".to_string()],
-                                        error: Some("Permission denied".to_string()),
-                                    });
                                 }
                             }
                         }
@@ -913,23 +951,29 @@ fn execute_transfer<T: ProcessingContext>(
                             intent.status = IntentStatus::Solved;
                             intent.last_command = IntentCommandType::SolveIntent;
                             bundle_state.increment_nonce(state.state_manager(), sender)?;
-                            let permission = check_riscv_intent_permission(
-                                bundle_state,
-                                state,
-                                &cbor_intent,
-                                intent_id,
-                            )?;
 
-                            if permission == 1 {
-                                return Ok(ExecutionResult {
-                                    success: false,
-                                    gas_used,
-                                    gas_refund: U256::ZERO,
-                                    output: Bytes::new(),
-                                    logs: vec!["solveIntent: permission denied by RISC-V program"
-                                        .to_string()],
-                                    error: Some("Permission denied".to_string()),
-                                });
+                            #[cfg(feature = "cartesi-runner")]
+                            {
+                                let permission = check_riscv_intent_permission(
+                                    bundle_state,
+                                    state,
+                                    &cbor_intent,
+                                    intent_id,
+                                )?;
+
+                                if permission == 1 {
+                                    return Ok(ExecutionResult {
+                                        success: false,
+                                        gas_used,
+                                        gas_refund: U256::ZERO,
+                                        output: Bytes::new(),
+                                        logs: vec![
+                                            "solveIntent: permission denied by RISC-V program"
+                                                .to_string(),
+                                        ],
+                                        error: Some("Permission denied".to_string()),
+                                    });
+                                }
                             }
                         }
                         return Ok(ExecutionResult {
@@ -996,29 +1040,31 @@ fn execute_transfer<T: ProcessingContext>(
                                 .insert_intent(intent_id, updated_intent);
                         }
 
-                        let permission = check_riscv_intent_permission(
-                            bundle_state,
-                            state,
-                            &intent_data,
-                            intent_id,
-                        )?;
+                        #[cfg(feature = "cartesi-runner")]
+                        {
+                            let permission = check_riscv_intent_permission(
+                                bundle_state,
+                                state,
+                                &intent_data,
+                                intent_id,
+                            )?;
 
-                        if permission == 1 {
-                            if let Some(original_intent) = original_main_intent {
-                                state
-                                    .state_manager_mut()
-                                    .insert_intent(intent_id, original_intent);
+                            if permission == 1 {
+                                if let Some(original_intent) = original_main_intent {
+                                    state
+                                        .state_manager_mut()
+                                        .insert_intent(intent_id, original_intent);
+                                }
+                                return Ok(ExecutionResult {
+                                    success: false,
+                                    gas_used,
+                                    gas_refund: U256::ZERO,
+                                    output: Bytes::new(),
+                                    logs: vec!["cancelIntent: permission denied by RISC-V program"
+                                        .to_string()],
+                                    error: Some("Permission denied".to_string()),
+                                });
                             }
-                            return Ok(ExecutionResult {
-                                success: false,
-                                gas_used,
-                                gas_refund: U256::ZERO,
-                                output: Bytes::new(),
-                                logs: vec![
-                                    "cancelIntent: permission denied by RISC-V program".to_string()
-                                ],
-                                error: Some("Permission denied".to_string()),
-                            });
                         }
                     }
 
@@ -1068,30 +1114,33 @@ fn execute_transfer<T: ProcessingContext>(
                                         .insert_intent(intent_id, updated_intent);
                                 }
 
-                                let permission = check_riscv_intent_permission(
-                                    bundle_state,
-                                    state,
-                                    &intent_data,
-                                    intent_id,
-                                )?;
+                                #[cfg(feature = "cartesi-runner")]
+                                {
+                                    let permission = check_riscv_intent_permission(
+                                        bundle_state,
+                                        state,
+                                        &intent_data,
+                                        intent_id,
+                                    )?;
 
-                                if permission == 1 {
-                                    if let Some(original_intent) = original_main_intent {
-                                        state
-                                            .state_manager_mut()
-                                            .insert_intent(intent_id, original_intent);
+                                    if permission == 1 {
+                                        if let Some(original_intent) = original_main_intent {
+                                            state
+                                                .state_manager_mut()
+                                                .insert_intent(intent_id, original_intent);
+                                        }
+                                        return Ok(ExecutionResult {
+                                            success: false,
+                                            gas_used,
+                                            gas_refund: U256::ZERO,
+                                            output: Bytes::new(),
+                                            logs: vec![
+                                                "cancelIntentLock: permission denied by RISC-V program"
+                                                    .to_string(),
+                                            ],
+                                            error: Some("Permission denied".to_string()),
+                                        });
                                     }
-                                    return Ok(ExecutionResult {
-                                        success: false,
-                                        gas_used,
-                                        gas_refund: U256::ZERO,
-                                        output: Bytes::new(),
-                                        logs: vec![
-                                            "cancelIntentLock: permission denied by RISC-V program"
-                                                .to_string(),
-                                        ],
-                                        error: Some("Permission denied".to_string()),
-                                    });
                                 }
                             }
 
@@ -1173,6 +1222,7 @@ fn execute_transfer<T: ProcessingContext>(
     })
 }
 
+#[cfg(feature = "cartesi-runner")]
 impl KvStore for BundleStateManager {
     fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
         BundleStateManager::get_kv(self, key).cloned()
@@ -1189,6 +1239,7 @@ impl KvStore for BundleStateManager {
 
 /// State machine for execution flow
 #[derive(Debug, Clone, PartialEq)]
+#[cfg(feature = "cartesi-runner")]
 enum ExecutionState {
     /// Webhook submitted, waiting for response
     WebhookSubmitted,
@@ -1197,11 +1248,13 @@ enum ExecutionState {
 }
 
 /// Webhook completion handler that tracks webhook submission status deterministically
+#[cfg(feature = "cartesi-runner")]
 struct WebhookCompletionHandlerImpl {
     success: bool,
     failure: bool,
 }
 
+#[cfg(feature = "cartesi-runner")]
 impl WebhookCompletionHandlerImpl {
     fn new() -> Self {
         Self {
@@ -1211,6 +1264,7 @@ impl WebhookCompletionHandlerImpl {
     }
 }
 
+#[cfg(feature = "cartesi-runner")]
 impl runner::WebhookCompletionHandler for WebhookCompletionHandlerImpl {
     fn on_webhook_success(&mut self) {
         self.success = true;
@@ -1234,6 +1288,7 @@ impl runner::WebhookCompletionHandler for WebhookCompletionHandlerImpl {
     }
 }
 
+#[cfg(feature = "cartesi-runner")]
 async fn execute_cartesi_http_runner<T: ProcessingContext>(
     input: Bytes,
     gas_used: U256,
@@ -1254,7 +1309,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         if let Ok(initial_root_hash) = machine_guard.root_hash() {
             info!("🔷 INITIAL ROOT HASH: {}", hex::encode(initial_root_hash));
         } else {
-            warn!("Failed to get initial root hash");
+            tracing::warn!("Failed to get initial root hash");
         }
     }
 
@@ -1420,7 +1475,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     if let Some(root_hash) = state_guard.get_root_hash() {
         info!("🔷 FINAL ROOT HASH: {}", hex::encode(root_hash));
     } else {
-        warn!("Root hash not available after execution");
+        tracing::warn!("Root hash not available after execution");
         // Fallback: try to get it directly from the machine
         drop(state_guard);
         let mut machine_guard = machine_arc.lock().await;
@@ -1430,7 +1485,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
                 hex::encode(final_root_hash)
             );
         } else {
-            warn!("Failed to get final root hash from machine");
+            tracing::warn!("Failed to get final root hash from machine");
         }
     }
 
@@ -1636,6 +1691,7 @@ fn verify_intent_fill_on_bitcoin<T: ProcessingContext>(
     Ok(false)
 }
 
+#[cfg(feature = "cartesi-runner")]
 fn check_riscv_intent_permission<T: ProcessingContext>(
     bundle_state: &BundleStateManager,
     state: &mut T,
