@@ -22,7 +22,7 @@ use std::fs;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -306,6 +306,10 @@ enum Commands {
         /// If not provided, defaults to a well-known test address (insecure for production)
         #[arg(long)]
         sequencer_address: Option<String>,
+        /// Enable on-demand polling mode (disable constant block scanning)
+        /// When enabled, block scanning only occurs when triggered via POST /do_poll endpoint
+        #[arg(long)]
+        on_demand_polling: bool,
     },
 
     Burn {
@@ -499,6 +503,10 @@ enum Commands {
         /// If not provided, defaults to a well-known test address (insecure for production)
         #[arg(long)]
         sequencer_address: Option<String>,
+        /// Enable on-demand polling mode (disable constant block scanning)
+        /// When enabled, block scanning only occurs when triggered via POST /do_poll endpoint
+        #[arg(long)]
+        on_demand_polling: bool,
     },
 }
 
@@ -1615,7 +1623,12 @@ impl CoreLaneNode {
         Ok(finalized_block)
     }
 
-    async fn start_block_scanner(&self, start_block: Option<u64>) -> Result<()> {
+    async fn start_block_scanner(
+        &self,
+        start_block: Option<u64>,
+        on_demand_polling: bool,
+        poll_trigger_receiver: Option<mpsc::Receiver<()>>,
+    ) -> Result<()> {
         info!("Starting Core Lane block scanner...");
         info!("Connected to Bitcoin node successfully");
         info!("Core Lane state initialized");
@@ -1636,6 +1649,36 @@ impl CoreLaneNode {
             }
         }
 
+        // In on-demand mode, wait for channel signals to trigger scans
+        if on_demand_polling {
+            let mut receiver = poll_trigger_receiver.ok_or_else(|| {
+                anyhow::anyhow!("On-demand polling enabled but no channel receiver provided")
+            })?;
+
+            info!(
+                "✅ Scanner initialized in on-demand mode. Waiting for POST /do_poll requests..."
+            );
+            info!("⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans.");
+
+            loop {
+                // Wait for trigger signal
+                match receiver.recv().await {
+                    Some(_) => {
+                        info!("🔄 Poll trigger received, starting block scan...");
+                        if let Err(e) = self.scan_new_blocks().await {
+                            warn!("Error during on-demand scan: {}", e);
+                        }
+                    }
+                    None => {
+                        warn!("Poll trigger channel closed, scanner stopping");
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Continuous polling mode (original behavior)
         loop {
             match self.scan_new_blocks().await {
                 Ok(_) => {
@@ -1656,11 +1699,21 @@ impl CoreLaneNode {
         chain_id: u32,
         start_block: Option<u64>,
         derived_da_address: Address,
+        on_demand_polling: bool,
+        poll_trigger_receiver: Option<mpsc::Receiver<()>>,
     ) -> Result<()> {
-        info!(
-            "Starting derived Core Lane scanner with RPC URL: {}",
-            core_rpc_url
-        );
+        if on_demand_polling {
+            info!(
+                "Starting derived Core Lane scanner with RPC URL: {} (on-demand polling mode)",
+                core_rpc_url
+            );
+            info!("⚠️  On-demand polling enabled - block scanning disabled. Use POST /do_poll to trigger scans.");
+        } else {
+            info!(
+                "Starting derived Core Lane scanner with RPC URL: {}",
+                core_rpc_url
+            );
+        }
         if let Some(block) = start_block {
             let mut state = self.state.lock().await;
             if state.last_processed_bitcoin_height.is_none() {
@@ -1668,80 +1721,128 @@ impl CoreLaneNode {
             }
         }
 
-        loop {
-            let latest_block = match derived::fetch_core_block_number(&core_rpc_url).await {
-                Ok(height) => height,
-                Err(err) => {
-                    warn!("Failed to fetch derived block number: {err:?}");
-                    sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            let start_height = {
-                let state = self.state.lock().await;
-                match state.last_processed_bitcoin_height {
-                    None => latest_block.saturating_sub(10),
-                    Some(height) => height + 1,
-                }
-            };
-
-            if start_height > latest_block {
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
+        // In on-demand mode, wait for channel signals to trigger scans
+        if on_demand_polling {
+            let mut receiver = poll_trigger_receiver.ok_or_else(|| {
+                anyhow::anyhow!("On-demand polling enabled but no channel receiver provided")
+            })?;
 
             info!(
-                "Scanning derived blocks {} to {}...",
-                start_height, latest_block
+                "✅ Scanner initialized in on-demand mode. Waiting for POST /do_poll requests..."
             );
 
-            for height in start_height..=latest_block {
-                match derived::process_core_lane_block(
-                    &core_rpc_url,
-                    height,
-                    chain_id,
-                    derived_da_address,
-                )
-                .await
-                {
-                    Ok(parsed_block) => {
-                        let anchor_hash = parsed_block.anchor_block_hash.clone();
-                        match self.process_block(parsed_block).await {
-                            Ok(core_lane_block_number) => {
-                                if core_lane_block_number == 0 {
-                                    info!("Derived backend encountered reorg, restarting scan");
-                                    break;
-                                }
-                                let mut state = self.state.lock().await;
-                                state.last_processed_bitcoin_height = Some(height);
-                                let _block_hash = if anchor_hash.len() == 32 {
-                                    let h = B256::from_slice(&anchor_hash);
-                                    state.bitcoin_height_to_hash.insert(height, h);
-                                    h
-                                } else {
-                                    B256::ZERO
-                                };
-                                state
-                                    .bitcoin_height_to_core_block
-                                    .insert(height, core_lane_block_number);
-                                // Tip already written in process_block (state + tip committed together)
-                            }
-                            Err(err) => {
-                                warn!("Failed to process derived block {}: {}", height, err);
-                                break;
-                            }
+            loop {
+                // Wait for trigger signal
+                match receiver.recv().await {
+                    Some(_) => {
+                        info!("🔄 Poll trigger received, starting block scan...");
+                        if let Err(e) = self
+                            .scan_derived_blocks_once(&core_rpc_url, chain_id, derived_da_address)
+                            .await
+                        {
+                            warn!("Error during on-demand scan: {}", e);
                         }
                     }
-                    Err(err) => {
-                        warn!("Failed to fetch derived block {}: {}", height, err);
+                    None => {
+                        warn!("Poll trigger channel closed, scanner stopping");
                         break;
                     }
                 }
             }
-
-            sleep(Duration::from_secs(5)).await;
+            return Ok(());
         }
+
+        // Continuous polling mode (original behavior)
+        loop {
+            if let Err(e) = self
+                .scan_derived_blocks_once(&core_rpc_url, chain_id, derived_da_address)
+                .await
+            {
+                error!("Error scanning blocks: {}", e);
+                sleep(Duration::from_secs(30)).await;
+            } else {
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+
+    /// Perform a single scan cycle for derived blocks
+    async fn scan_derived_blocks_once(
+        &self,
+        core_rpc_url: &str,
+        chain_id: u32,
+        derived_da_address: Address,
+    ) -> Result<()> {
+        let latest_block = match derived::fetch_core_block_number(core_rpc_url).await {
+            Ok(height) => height,
+            Err(err) => {
+                warn!("Failed to fetch derived block number: {err:?}");
+                return Err(anyhow::anyhow!("Failed to fetch block number: {}", err));
+            }
+        };
+
+        let start_height = {
+            let state = self.state.lock().await;
+            match state.last_processed_bitcoin_height {
+                None => latest_block.saturating_sub(10),
+                Some(height) => height + 1,
+            }
+        };
+
+        if start_height > latest_block {
+            return Ok(()); // No new blocks to process
+        }
+
+        info!(
+            "Scanning derived blocks {} to {}...",
+            start_height, latest_block
+        );
+
+        for height in start_height..=latest_block {
+            match derived::process_core_lane_block(
+                core_rpc_url,
+                height,
+                chain_id,
+                derived_da_address,
+            )
+            .await
+            {
+                Ok(parsed_block) => {
+                    let anchor_hash = parsed_block.anchor_block_hash.clone();
+                    match self.process_block(parsed_block).await {
+                        Ok(core_lane_block_number) => {
+                            if core_lane_block_number == 0 {
+                                info!("Derived backend encountered reorg, restarting scan");
+                                return Err(anyhow::anyhow!("Reorg detected"));
+                            }
+                            let mut state = self.state.lock().await;
+                            state.last_processed_bitcoin_height = Some(height);
+                            let _block_hash = if anchor_hash.len() == 32 {
+                                let h = B256::from_slice(&anchor_hash);
+                                state.bitcoin_height_to_hash.insert(height, h);
+                                h
+                            } else {
+                                B256::ZERO
+                            };
+                            state
+                                .bitcoin_height_to_core_block
+                                .insert(height, core_lane_block_number);
+                            // Tip already written in process_block (state + tip committed together)
+                        }
+                        Err(err) => {
+                            warn!("Failed to process derived block {}: {}", height, err);
+                            return Err(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!("Failed to fetch derived block {}: {}", height, err);
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn scan_new_blocks(&self) -> Result<()> {
@@ -2886,6 +2987,7 @@ async fn main() -> Result<()> {
             electrum_url,
             sequencer_rpc_url,
             sequencer_address,
+            on_demand_polling,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -3072,12 +3174,23 @@ async fn main() -> Result<()> {
                 data_dir: cli.data_dir.clone(),
                 sequencer_rpc_url: sequencer_rpc_url.clone(),
             };
+
+            // Create channel for on-demand polling if enabled
+            let poll_trigger = if *on_demand_polling {
+                let (tx, rx) = mpsc::channel::<()>(1);
+                Some((tx, rx))
+            } else {
+                None
+            };
+
+            let poll_trigger_sender = poll_trigger.as_ref().map(|(tx, _)| tx.clone());
             let rpc_server = RpcServer::with_bitcoin_client(
                 shared_state,
                 bitcoin_client_write,
                 bdk_bitcoind_client,
                 Some(network),
                 rpc_config,
+                poll_trigger_sender,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create RPC server: {}", e))?;
 
@@ -3098,9 +3211,13 @@ async fn main() -> Result<()> {
 
             // Start block scanner in main task (only if bitcoin client is available)
             let start_block = *start_block;
+            let on_demand_polling = *on_demand_polling;
+            let poll_trigger_receiver = poll_trigger.map(|(_, rx)| rx);
             if let Some(node) = node_opt {
-                let scanner_handle =
-                    tokio::spawn(async move { node.start_block_scanner(start_block).await });
+                let scanner_handle = tokio::spawn(async move {
+                    node.start_block_scanner(start_block, on_demand_polling, poll_trigger_receiver)
+                        .await
+                });
                 let (_server_result, scanner_result) =
                     tokio::try_join!(server_handle, scanner_handle)?;
                 scanner_result?;
@@ -4222,6 +4339,7 @@ async fn main() -> Result<()> {
             http_port,
             sequencer_rpc_url,
             sequencer_address,
+            on_demand_polling,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -4251,12 +4369,23 @@ async fn main() -> Result<()> {
             })?;
 
             let shared_state = Arc::clone(&node.state);
+
+            // Create channel for on-demand polling if enabled
+            let poll_trigger = if *on_demand_polling {
+                let (tx, rx) = mpsc::channel::<()>(1);
+                Some((tx, rx))
+            } else {
+                None
+            };
+
+            let poll_trigger_sender = poll_trigger.as_ref().map(|(tx, _)| tx.clone());
             let rpc_server = RpcServer::with_derived(
                 shared_state,
                 core_rpc_url.clone(),
                 da_address,
                 cli.data_dir.clone(),
                 sequencer_rpc_url.clone(),
+                poll_trigger_sender,
             );
 
             if let Some(ref url) = sequencer_rpc_url {
@@ -4277,10 +4406,19 @@ async fn main() -> Result<()> {
 
             let start_block = *start_block;
             let chain_id = *chain_id;
+            let on_demand_polling = *on_demand_polling;
             let core_rpc_url = core_rpc_url.clone();
+            let poll_trigger_receiver = poll_trigger.map(|(_, rx)| rx);
             let scanner_handle = tokio::spawn(async move {
-                node.start_core_lane_scanner(core_rpc_url, chain_id, start_block, da_address)
-                    .await
+                node.start_core_lane_scanner(
+                    core_rpc_url,
+                    chain_id,
+                    start_block,
+                    da_address,
+                    on_demand_polling,
+                    poll_trigger_receiver,
+                )
+                .await
             });
 
             let _ = tokio::try_join!(server_handle, scanner_handle)?;

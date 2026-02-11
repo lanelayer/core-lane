@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::info;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -142,6 +142,8 @@ pub struct RpcServer {
     core_rpc_url: Option<String>,
     da_feed_address: Option<Address>,
     sequencer_rpc_url: Option<String>,
+    /// Channel sender for triggering on-demand block scans
+    poll_trigger: Option<mpsc::Sender<()>>,
 }
 
 impl RpcServer {
@@ -151,6 +153,7 @@ impl RpcServer {
         bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
         network: Option<bitcoin::Network>,
         config: BitcoinClientConfig,
+        poll_trigger: Option<mpsc::Sender<()>>,
     ) -> Result<Self, String> {
         // Validate configuration
         config.validate()?;
@@ -175,6 +178,7 @@ impl RpcServer {
             core_rpc_url: None,
             da_feed_address: None,
             sequencer_rpc_url: config.sequencer_rpc_url,
+            poll_trigger,
         })
     }
 
@@ -184,6 +188,7 @@ impl RpcServer {
         da_feed_address: Address,
         data_dir: String,
         sequencer_rpc_url: Option<String>,
+        poll_trigger: Option<mpsc::Sender<()>>,
     ) -> Self {
         Self {
             state,
@@ -197,6 +202,7 @@ impl RpcServer {
             core_rpc_url: Some(core_rpc_url),
             da_feed_address: Some(da_feed_address),
             sequencer_rpc_url,
+            poll_trigger,
         }
     }
 
@@ -223,6 +229,7 @@ impl RpcServer {
                 "/bitcoin/wallet/balance",
                 axum::routing::get(Self::handle_bitcoin_wallet_balance),
             )
+            .route("/do_poll", post(Self::handle_do_poll))
             .with_state(Arc::new(self))
     }
 
@@ -2838,6 +2845,58 @@ impl RpcServer {
                 .unwrap());
         }
         Err(StatusCode::NOT_FOUND)
+    }
+
+    // POST /do_poll
+    // Triggers an on-demand block scan when on-demand polling is enabled
+    async fn handle_do_poll(
+        axum::extract::State(rpc_state): axum::extract::State<Arc<Self>>,
+    ) -> Result<
+        (StatusCode, JsonResponse<serde_json::Value>),
+        (StatusCode, JsonResponse<serde_json::Value>),
+    > {
+        let poll_trigger = match &rpc_state.poll_trigger {
+            Some(sender) => sender,
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse::from(json!({
+                        "error": "On-demand polling not enabled. Start the node with --on-demand-polling flag."
+                    })),
+                ));
+            }
+        };
+
+        // Send trigger signal to scanner
+        match poll_trigger.try_send(()) {
+            Ok(()) => {
+                info!("✅ Poll trigger sent successfully");
+                Ok((
+                    StatusCode::OK,
+                    JsonResponse::from(json!({
+                        "status": "success",
+                        "message": "Block scan triggered"
+                    })),
+                ))
+            }
+            Err(mpsc::error::TrySendError::Full(())) => Ok((
+                StatusCode::OK,
+                JsonResponse::from(json!({
+                    "status": "busy",
+                    "message": "Scan already in progress"
+                })),
+            )),
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                warn!("⚠️  Failed to send poll trigger - scanner may have stopped");
+                Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    JsonResponse::from(json!({
+                        "status": "error",
+                        "message": "Failed to trigger scan - scanner may not be running"
+                    })),
+                ))
+            }
+        }
     }
 
     /// GET /health
