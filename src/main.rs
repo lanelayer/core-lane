@@ -5,7 +5,7 @@ use alloy_primitives::TxKind;
 use alloy_primitives::{hex, Address, Bytes, B256, U256};
 use alloy_provider::Provider;
 use alloy_provider::ProviderBuilder;
-use alloy_rpc_types::TransactionRequest;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::SolCall;
@@ -521,6 +521,8 @@ enum Commands {
         espresso_namespace: u64,
         #[arg(long)]
         start_block: Option<u64>,
+        #[arg(long)]
+        core_lane_rpc_url: String,
         #[arg(long, default_value = "127.0.0.1")]
         http_host: String,
         #[arg(long, default_value = "8545")]
@@ -907,6 +909,8 @@ struct CoreLaneNode {
     bdk_bitcoind_client: Option<Arc<bdk_bitcoind_rpc::bitcoincore_rpc::Client>>,
     state: Arc<Mutex<CoreLaneState>>,
     data_dir: String,
+    /// Set only in Espresso-derived mode: upstream Core Lane JSON-RPC URL for reorg fork-point search.
+    core_lane_rpc_url: Option<String>,
 }
 
 impl CoreLaneNode {
@@ -1087,6 +1091,7 @@ impl CoreLaneNode {
             bdk_bitcoind_client,
             state,
             data_dir,
+            core_lane_rpc_url: None,
         }
     }
 
@@ -1964,7 +1969,7 @@ impl CoreLaneNode {
             if let Some(existing_hash) = state.bitcoin_height_to_hash.get(&height) {
                 if existing_hash != &current_hash {
                     warn!(
-                        "🚨 REORG DETECTED! Height {} has different hash (same-height mismatch). Expected: {}, Got: {}",
+                        "🚨 REORG DETECTED! Upstream Core Lane block {} has different hash (same-height mismatch). Expected: {}, Got: {}",
                         height, existing_hash, current_hash
                     );
 
@@ -2002,7 +2007,7 @@ impl CoreLaneNode {
 
                     if prev_hash != &expected_parent_hash {
                         warn!(
-                            "🚨 REORG DETECTED! Height {} parent hash mismatch. Expected: {}, Got: {}",
+                            "🚨 REORG DETECTED! Upstream Core Lane block {} parent hash mismatch. Expected: {}, Got: {}",
                             height, prev_hash, expected_parent_hash
                         );
 
@@ -2801,6 +2806,107 @@ impl CoreLaneNode {
         Ok(None)
     }
 
+    async fn fetch_core_lane_tip(rpc_url: &str) -> Result<(u64, B256, B256)> {
+        let url: Url = rpc_url.parse()?;
+        let provider = ProviderBuilder::new().connect_http(url);
+        let height = derived::fetch_core_block_number(rpc_url).await?;
+        let block = provider
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Core Lane block {} not found", height))?;
+
+        let hash = block.header.hash;
+        let parent_hash = block.header.inner.parent_hash;
+        Ok((height, hash, parent_hash))
+    }
+
+    /// Find the fork point by comparing our stored anchor hashes with the upstream Core Lane chain (Espresso-derived mode).
+    async fn find_fork_point_from_core_lane_rpc(
+        &self,
+        rpc_url: &str,
+        state: &CoreLaneState,
+    ) -> Result<Option<u64>> {
+        let mut current_height = match state.last_processed_anchor_height {
+            Some(height) => height,
+            None => {
+                error!(
+                    "❌ Cannot find fork point: no anchor height has been processed yet (Core Lane RPC mode)"
+                );
+                return Err(anyhow::anyhow!(
+                    "Cannot find fork point when no blocks have been processed"
+                ));
+            }
+        };
+
+        let search_limit = 100;
+        let mut blocks_checked = 0;
+
+        info!(
+            "🔍 Starting fork point search from upstream Core Lane block {} (anchor height) via Core Lane RPC (limit: {} blocks)",
+            current_height, search_limit
+        );
+
+        while current_height > 0 && blocks_checked < search_limit {
+            blocks_checked += 1;
+
+            if let Some(&core_block) = state.bitcoin_height_to_core_block.get(&current_height) {
+                if let Some(&stored_hash) = state.bitcoin_height_to_hash.get(&current_height) {
+                    debug!(
+                        "🔍 Checking upstream Core Lane block {} (local Core Lane block {})",
+                        current_height, core_block
+                    );
+
+                    match ProviderBuilder::new()
+                        .connect_http(rpc_url.parse()?)
+                        .get_block(BlockId::Number(BlockNumberOrTag::Number(current_height)))
+                        .await
+                    {
+                        Ok(Some(block)) => {
+                            let current_hash = block.header.hash;
+                            if stored_hash == current_hash {
+                                info!(
+                                    "✅ Upstream Core Lane fork point found at block {} (local Core Lane block {})",
+                                    current_height, core_block
+                                );
+                                return Ok(Some(core_block));
+                            }
+                            warn!(
+                                "⚠️  Hash mismatch at upstream Core Lane block {} (local Core Lane block {}) current_hash: {}, stored_hash: {}",
+                                current_height, core_block,
+                                hex::encode(current_hash.as_slice()),
+                                hex::encode(stored_hash.as_slice())
+                            );
+                        }
+                        Ok(None) => {
+                            warn!(
+                                "⚠️  Core Lane RPC returned no block for height {}",
+                                current_height
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "⚠️  Failed to fetch Core Lane block at height {} from upstream RPC: {}",
+                                current_height, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            current_height -= 1;
+        }
+
+        if blocks_checked >= search_limit {
+            warn!(
+                "⚠️  Reached fork search limit ({} blocks) while searching upstream Core Lane RPC",
+                search_limit
+            );
+        } else {
+            warn!("⚠️  Could not find fork point via upstream Core Lane RPC, reached height 0");
+        }
+        Ok(None)
+    }
+
     /// Handle reorg by rolling back to fork point and restarting processing
     /// NOTE: This method returns the fork point block number for the caller to use
     /// The caller must DROP the state lock before calling this method's returned closure
@@ -2811,6 +2917,12 @@ impl CoreLaneNode {
         info!("🔍 Searching for fork point...");
         let fork_point = if let Some(bitcoin_client) = self.bitcoin_client_read.clone() {
             self.find_fork_point(bitcoin_client, state).await?
+        } else if let Some(ref rpc_url) = self.core_lane_rpc_url {
+            info!(
+                "🔍 Using upstream Core Lane JSON-RPC to find fork point (Espresso-derived mode)"
+            );
+            self.find_fork_point_from_core_lane_rpc(rpc_url, state)
+                .await?
         } else {
             warn!("⚠️  Bitcoin RPC unavailable, deriving fork point from local Core Lane history");
             Self::derive_local_fork_point(state)?
@@ -2839,6 +2951,7 @@ impl CoreLaneNode {
         espresso_base_url: String,
         start_block: Option<u64>,
         espresso_namespace: u64,
+        core_lane_rpc_url: String,
     ) -> Result<()> {
         info!(
             "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
@@ -2876,8 +2989,17 @@ impl CoreLaneNode {
                     )
                     .await
                     {
-                        Ok(parsed_block) => {
-                            let anchor_hash = parsed_block.anchor_block_hash.clone();
+                        Ok(mut parsed_block) => {
+                            let (cl_height, cl_hash, cl_parent) =
+                                Self::fetch_core_lane_tip(&core_lane_rpc_url).await?;
+
+                            parsed_block.anchor_block_hash = cl_hash.as_slice().to_vec();
+                            parsed_block.anchor_block_height = cl_height;
+                            parsed_block.parent_hash = cl_parent.as_slice().to_vec();
+
+                            let anchor_height = cl_height;
+                            let anchor_hash_bytes = cl_hash.as_slice().to_vec();
+
                             match self.process_block(parsed_block).await {
                                 Ok(core_lane_block_number) => {
                                     if core_lane_block_number == 0 {
@@ -2888,15 +3010,23 @@ impl CoreLaneNode {
                                     }
 
                                     let mut state = self.state.lock().await;
-                                    state.last_processed_anchor_height = Some(height);
-                                    if anchor_hash.len() == 32 {
-                                        let h = B256::from_slice(&anchor_hash);
+                                    state.last_processed_anchor_height = Some(anchor_height);
+
+                                    if anchor_hash_bytes.len() == 32 {
+                                        let h = B256::from_slice(&anchor_hash_bytes);
                                         state.block_hashes.insert(h, core_lane_block_number);
+
+                                        state
+                                            .bitcoin_height_to_hash
+                                            .insert(anchor_height, h);
+                                        state
+                                            .bitcoin_height_to_core_block
+                                            .insert(anchor_height, core_lane_block_number);
                                     } else {
                                         warn!(
                                             "Espresso anchor hash for block {} has unexpected length {}; skipping index update",
-                                            height,
-                                            anchor_hash.len()
+                                            anchor_height,
+                                            anchor_hash_bytes.len()
                                         );
                                     };
                                     let block = state.blocks[&core_lane_block_number].clone();
@@ -4569,6 +4699,7 @@ async fn main() -> Result<()> {
             espresso_base_url,
             espresso_namespace,
             start_block,
+            core_lane_rpc_url,
             http_host,
             http_port,
             sequencer_rpc_url,
@@ -4597,8 +4728,9 @@ async fn main() -> Result<()> {
                 espresso_base_url
             );
 
-            let node =
+            let mut node =
                 CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
+            node.core_lane_rpc_url = Some(core_lane_rpc_url.clone());
 
             let shared_state = Arc::clone(&node.state);
             // Pass the full Espresso server base URL (supports query and submit endpoints)
@@ -4631,9 +4763,15 @@ async fn main() -> Result<()> {
             let start_block = *start_block;
             let espresso_base_url = espresso_base_url.clone();
             let espresso_namespace = *espresso_namespace;
+            let core_lane_rpc_url = core_lane_rpc_url.clone();
             let scanner_handle = tokio::spawn(async move {
-                node.start_espresso_scanner(espresso_base_url, start_block, espresso_namespace)
-                    .await
+                node.start_espresso_scanner(
+                    espresso_base_url,
+                    start_block,
+                    espresso_namespace,
+                    core_lane_rpc_url,
+                )
+                .await
             });
 
             let _ = tokio::try_join!(server_handle, scanner_handle)?;
