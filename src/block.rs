@@ -648,7 +648,7 @@ impl CoreLaneBurn {
 pub struct CoreLaneBlockParsed {
     pub bundles: Vec<CoreLaneBundle>,
     pub burns: Vec<CoreLaneBurn>,
-    pub anchor_block_hash: Vec<u8>,
+    pub anchor_block_hash: [u8; 32],
     pub anchor_block_timestamp: u64,
     pub anchor_block_height: u64,
     pub parent_hash: Vec<u8>,
@@ -656,7 +656,7 @@ pub struct CoreLaneBlockParsed {
 
 impl CoreLaneBlockParsed {
     pub fn new(
-        anchor_block_hash: Vec<u8>,
+        anchor_block_hash: [u8; 32],
         anchor_block_timestamp: u64,
         anchor_block_height: u64,
         parent_hash: Vec<u8>,

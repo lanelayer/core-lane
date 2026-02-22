@@ -31,7 +31,7 @@ pub async fn process_core_lane_block(
         .await?
         .ok_or_else(|| anyhow!("Derived block {} not found", height))?;
 
-    let anchor_block_hash = block.header.hash.as_slice().to_vec();
+    let anchor_block_hash: [u8; 32] = block.header.hash.into();
     let parent_hash = block.header.inner.parent_hash.as_slice().to_vec();
     let anchor_block_timestamp = block.header.inner.timestamp;
 

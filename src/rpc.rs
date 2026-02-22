@@ -1,22 +1,37 @@
+use crate::derived;
 use crate::intents::{decode_intent_calldata, IntentCall, IntentStatus};
 use crate::CoreLaneState;
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_network::EthereumWallet;
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::TransactionRequest;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
 use axum::{
     extract::Json, http::StatusCode, response::Json as JsonResponse, routing::post, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
+
+async fn fetch_core_lane_tip(rpc_url: &str) -> anyhow::Result<(u64, B256, B256)> {
+    let url: Url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let height = derived::fetch_core_block_number(rpc_url).await?;
+    let block = provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Core Lane block {} not found", height))?;
+
+    let hash = block.header.hash;
+    let parent_hash = block.header.inner.parent_hash;
+    Ok((height, hash, parent_hash))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
@@ -147,6 +162,7 @@ pub struct RpcServer {
     poll_trigger: Option<mpsc::Sender<()>>,
     espresso_submit_url: Option<String>,
     espresso_client: Option<reqwest::Client>,
+    espresso_namespace: u64,
 }
 
 impl RpcServer {
@@ -184,6 +200,7 @@ impl RpcServer {
             poll_trigger,
             espresso_submit_url: None,
             espresso_client: None,
+            espresso_namespace: 0,
         })
     }
 
@@ -210,16 +227,20 @@ impl RpcServer {
             poll_trigger,
             espresso_submit_url: None,
             espresso_client: None,
+            espresso_namespace: 0,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_local_state_only(
         state: Arc<Mutex<CoreLaneState>>,
         data_dir: String,
         sequencer_rpc_url: Option<String>,
         espresso_submit_url: Option<String>,
+        core_rpc_url: Option<String>,
         poll_trigger: Option<mpsc::Sender<()>>,
         espresso_client: reqwest::Client,
+        espresso_namespace: u64,
     ) -> Self {
         Self {
             state,
@@ -230,12 +251,13 @@ impl RpcServer {
             mnemonic: None,
             electrum_url: None,
             data_dir,
-            core_rpc_url: None,
+            core_rpc_url,
             da_feed_address: None,
             sequencer_rpc_url,
             espresso_submit_url,
             poll_trigger,
             espresso_client: Some(espresso_client),
+            espresso_namespace,
         }
     }
 
@@ -600,7 +622,7 @@ impl RpcServer {
         if let (Some(espresso_url), Some(espresso_client)) =
             (&server.espresso_submit_url, &server.espresso_client)
         {
-            let tx_bytes = match hex::decode(raw_tx_hex) {
+            let mut tx_bytes = match hex::decode(raw_tx_hex) {
                 Ok(b) if !b.is_empty() => b,
                 Ok(_) => {
                     return Ok(JsonResponse::from(JsonRpcResponse {
@@ -625,9 +647,35 @@ impl RpcServer {
                     }));
                 }
             };
+            if let Some(core_rpc_url) = &server.core_rpc_url {
+                match fetch_core_lane_tip(core_rpc_url).await {
+                    Ok((height, hash, _parent_hash)) => {
+                        info!(
+                            "Espresso submit: prefixing tx with Core Lane tip hash {} at height {}",
+                            hex::encode(hash.as_slice()),
+                            height
+                        );
+                        let mut prefixed = Vec::with_capacity(tx_bytes.len() + 32);
+                        prefixed.extend_from_slice(hash.as_slice());
+                        prefixed.extend_from_slice(&tx_bytes);
+                        tx_bytes = prefixed;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch Core Lane tip for Espresso anchor prefix: {}. Sending tx without prefix.",
+                            e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "Core Lane RPC URL not configured; sending Espresso transaction without anchor prefix"
+                );
+            }
             let submit_url = format!("{}/submit/submit", espresso_url.trim_end_matches('/'));
             let payload_base64 = BASE64_STANDARD.encode(&tx_bytes);
-            let json_body = json!({ "namespace": 0u64, "payload": payload_base64 });
+            let json_body =
+                json!({ "namespace": server.espresso_namespace, "payload": payload_base64 });
             match espresso_client
                 .post(&submit_url)
                 .json(&json_body)

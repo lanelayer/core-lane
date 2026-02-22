@@ -36,7 +36,7 @@ pub fn process_bitcoin_block(
 
     // Use hashes from the decoded block - avoids RPC roundtrip and byte-order issues
     let hash = block.block_hash();
-    let bitcoin_block_hash_bytes: Vec<u8> = hash.as_raw_hash().to_byte_array().to_vec();
+    let bitcoin_block_hash_bytes: [u8; 32] = hash.as_raw_hash().to_byte_array();
     let bitcoin_block_timestamp = block.header.time as u64;
 
     let parent_hash: Vec<u8> = if height > 0 {

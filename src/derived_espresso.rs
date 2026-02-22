@@ -1,5 +1,8 @@
 use crate::block::decode_tx_envelope;
 use crate::block::CoreLaneBlockParsed;
+use alloy_primitives::B256;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::BlockId;
 use anyhow::{anyhow, Result};
 use espresso_types::v0::Header;
 use espresso_types::NamespaceProofQueryData;
@@ -12,12 +15,59 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use vbs::version::StaticVersion;
 
+const CORE_LANE_ANCHOR_PREFIX_LEN: usize = 32;
+
+fn parse_core_lane_anchor_prefix(tx_data: &[u8]) -> (Option<[u8; 32]>, &[u8]) {
+    // If length is less than the anchor prefix length + 1, return no prefix.
+    if tx_data.len() < CORE_LANE_ANCHOR_PREFIX_LEN + 1 {
+        return (None, tx_data);
+    }
+
+    let mut prefix_hash = [0u8; 32];
+    prefix_hash.copy_from_slice(&tx_data[..32]);
+    let remaining = &tx_data[32..];
+
+    if decode_tx_envelope(remaining).is_some() {
+        info!(
+            "Espresso: found Core Lane anchor tip hash in first transaction of block {}",
+            hex::encode(prefix_hash)
+        );
+        (Some(prefix_hash), remaining)
+    } else {
+        (None, tx_data)
+    }
+}
 const MAX_RETRY_COUNT: u32 = 5;
 
-fn height_to_hash(height: u64) -> Vec<u8> {
-    let mut bytes = vec![0u8; 32];
-    bytes[24..].copy_from_slice(&height.to_be_bytes());
-    bytes
+async fn fetch_core_lane_block_metadata(
+    core_rpc_url: &str,
+    hash: [u8; 32],
+) -> Option<(u64, Vec<u8>)> {
+    let url = match core_rpc_url.parse() {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("Invalid core_rpc_url '{}': {}", core_rpc_url, e);
+            return None;
+        }
+    };
+    let provider = ProviderBuilder::new().connect_http(url);
+    let block_hash = B256::from(hash);
+    match provider.get_block(BlockId::from(block_hash)).await {
+        Ok(Some(block)) => {
+            let height = block.header.number;
+            let parent_hash = block.header.inner.parent_hash.as_slice().to_vec();
+            Some((height, parent_hash))
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                "Failed to fetch Core Lane block metadata for {}: {}",
+                hex::encode(hash),
+                e
+            );
+            None
+        }
+    }
 }
 
 pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
@@ -30,20 +80,20 @@ pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
 
 pub async fn process_espresso_block(
     base_url: &str,
+    core_rpc_url: &str,
     header: Header,
     namespace: u64,
+    previous_core_lane_tip: [u8; 32],
+    previous_anchor_height: u64,
+    previous_anchor_parent_hash: Vec<u8>,
 ) -> Result<CoreLaneBlockParsed> {
     let height = header.height();
-    let anchor_block_hash = height_to_hash(height);
-
-    let parent_hash = if height > 0 {
-        height_to_hash(height.saturating_sub(1))
-    } else {
-        vec![0u8; 32]
-    };
-
-    let mut parsed_block =
-        CoreLaneBlockParsed::new(anchor_block_hash, header.timestamp(), height, parent_hash);
+    let mut core_lane_block = CoreLaneBlockParsed::new(
+        previous_core_lane_tip,
+        header.timestamp(),
+        previous_anchor_height,
+        previous_anchor_parent_hash,
+    );
 
     let mut attempt: u32 = 0;
     let transactions = loop {
@@ -88,23 +138,57 @@ pub async fn process_espresso_block(
         namespace
     );
 
+    let mut first_tx_processed = false;
+
     for tx_data in transactions {
-        if let Some((tx_envelope, sender)) = decode_tx_envelope(&tx_data) {
+        let (derived_core_lane_tip, tx_without_prefix) = parse_core_lane_anchor_prefix(&tx_data);
+
+        if !first_tx_processed {
+            if let Some(core_lane_tip_hash) = derived_core_lane_tip {
+                match fetch_core_lane_block_metadata(core_rpc_url, core_lane_tip_hash).await {
+                    Some((tip_height, tip_parent_hash)) => {
+                        info!(
+                            "Espresso: found Core Lane anchor tip hash in first transaction of block {}: {} (height {})",
+                            height,
+                            hex::encode(core_lane_tip_hash),
+                            tip_height,
+                        );
+                        core_lane_block.anchor_block_hash = core_lane_tip_hash;
+                        core_lane_block.anchor_block_height = tip_height;
+                        core_lane_block.parent_hash = tip_parent_hash;
+                    }
+                    None => {
+                        warn!(
+                            "Espresso: Core Lane tip hash {} claimed in block {} prefix not found in Core Lane; ignoring",
+                            hex::encode(core_lane_tip_hash),
+                            height
+                        );
+                    }
+                }
+            }
+            first_tx_processed = true;
+        }
+
+        if let Some((tx_envelope, sender)) = decode_tx_envelope(tx_without_prefix) {
             info!(
                 "Espresso: decoded transaction in block {} (sender: {})",
                 height, sender
             );
-            parsed_block.add_bundle_from_single_tx(tx_envelope, sender, tx_data);
+            core_lane_block.add_bundle_from_single_tx(
+                tx_envelope,
+                sender,
+                tx_without_prefix.to_vec(),
+            );
         } else {
             warn!(
                 "Espresso: failed to decode transaction in block {} ({} bytes)",
                 height,
-                tx_data.len()
+                tx_without_prefix.len()
             );
         }
     }
 
-    Ok(parsed_block)
+    Ok(core_lane_block)
 }
 
 pub async fn fetch_namespace_transactions(
