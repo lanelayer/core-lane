@@ -1845,7 +1845,7 @@ impl CoreLaneNode {
             .await
             {
                 Ok(parsed_block) => {
-                    let anchor_hash = parsed_block.anchor_block_hash.clone();
+                    let anchor_hash = parsed_block.anchor_block_hash;
                     match self.process_block(parsed_block).await {
                         Ok(core_lane_block_number) => {
                             if core_lane_block_number == 0 {
@@ -1854,13 +1854,8 @@ impl CoreLaneNode {
                             }
                             let mut state = self.state.lock().await;
                             state.last_processed_anchor_height = Some(height);
-                            let _block_hash = if anchor_hash.len() == 32 {
-                                let h = B256::from_slice(&anchor_hash);
-                                state.bitcoin_height_to_hash.insert(height, h);
-                                h
-                            } else {
-                                B256::ZERO
-                            };
+                            let h = B256::from(anchor_hash);
+                            state.bitcoin_height_to_hash.insert(height, h);
                             state
                                 .bitcoin_height_to_core_block
                                 .insert(height, core_lane_block_number);
@@ -1930,7 +1925,7 @@ impl CoreLaneNode {
                     let mut state = self.state.lock().await;
                     state.last_processed_anchor_height = Some(height);
                     // anchor_block_hash is now raw 32-byte hash
-                    let block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
+                    let block_hash = B256::from(bitcoin_block.anchor_block_hash);
                     state.bitcoin_height_to_hash.insert(height, block_hash);
                     state
                         .bitcoin_height_to_core_block
@@ -1951,10 +1946,10 @@ impl CoreLaneNode {
 
     async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<u64> {
         let block_start_time = Instant::now();
-        let bitcoin_height = bitcoin_block.anchor_block_height;
+        let anchor_height = bitcoin_block.anchor_block_height;
         info!(
-            "Starting block execution for Bitcoin block height: {}",
-            bitcoin_height
+            "Starting block execution (target anchor height: {})",
+            anchor_height
         );
 
         // 🔍 REORG DETECTION: Check for blockchain reorganizations
@@ -1962,8 +1957,7 @@ impl CoreLaneNode {
             let mut state = self.state.lock().await;
             let height = bitcoin_block.anchor_block_height;
 
-            // anchor_block_hash is now raw 32-byte hash
-            let current_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
+            let current_hash = B256::from(bitcoin_block.anchor_block_hash);
 
             // Check if we already have a hash for this height
             if let Some(existing_hash) = state.bitcoin_height_to_hash.get(&height) {
@@ -2330,10 +2324,10 @@ impl CoreLaneNode {
             .finalize_current_block(core_lane_transactions, new_block)
             .await?;
 
-        let bitcoin_block_hash = B256::from_slice(&bitcoin_block.anchor_block_hash);
+        let bitcoin_block_hash = B256::from(bitcoin_block.anchor_block_hash);
         let tip = ChainTip {
             core_lane_block_number: block_number,
-            last_processed_anchor_height: bitcoin_height,
+            last_processed_anchor_height: anchor_height,
             bitcoin_block_hash,
             core_lane_block: finalized_block.clone(),
         };
@@ -2342,7 +2336,7 @@ impl CoreLaneNode {
         }
         let chain_entry = ChainIndexEntry {
             core_lane_block: finalized_block,
-            bitcoin_height,
+            bitcoin_height: anchor_height,
             bitcoin_block_hash,
         };
         if let Err(e) = self.write_chain_index_entry(block_number, &chain_entry) {
@@ -2354,8 +2348,8 @@ impl CoreLaneNode {
 
         let block_execution_time = block_start_time.elapsed();
         info!(
-            "Block execution completed in {:?} for Bitcoin block height: {} -> Core Lane block: {}",
-            block_execution_time, bitcoin_height, core_lane_block_number
+            "Block execution completed in {:?} for Core Lane block: {} -> anchor height: {} anchor block hash: {}",
+            block_execution_time, core_lane_block_number, anchor_height, hex::encode(bitcoin_block.anchor_block_hash)
         );
 
         // Track block processing time
@@ -2705,8 +2699,6 @@ impl CoreLaneNode {
         );
 
         while current_bitcoin_height > 0 && blocks_checked < search_limit {
-            blocks_checked += 1;
-
             // Check if we have a record for this Bitcoin height
             if let Some(&core_block) = state
                 .bitcoin_height_to_core_block
@@ -2716,6 +2708,7 @@ impl CoreLaneNode {
                 if let Some(&stored_hash) =
                     state.bitcoin_height_to_hash.get(&current_bitcoin_height)
                 {
+                    blocks_checked += 1;
                     debug!(
                         "🔍 Checking Bitcoin height {} (Core Lane block {})",
                         current_bitcoin_height, core_block
@@ -2806,20 +2799,6 @@ impl CoreLaneNode {
         Ok(None)
     }
 
-    async fn fetch_core_lane_tip(rpc_url: &str) -> Result<(u64, B256, B256)> {
-        let url: Url = rpc_url.parse()?;
-        let provider = ProviderBuilder::new().connect_http(url);
-        let height = derived::fetch_core_block_number(rpc_url).await?;
-        let block = provider
-            .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Core Lane block {} not found", height))?;
-
-        let hash = block.header.hash;
-        let parent_hash = block.header.inner.parent_hash;
-        Ok((height, hash, parent_hash))
-    }
-
     /// Find the fork point by comparing our stored anchor hashes with the upstream Core Lane chain (Espresso-derived mode).
     async fn find_fork_point_from_core_lane_rpc(
         &self,
@@ -2847,10 +2826,9 @@ impl CoreLaneNode {
         );
 
         while current_height > 0 && blocks_checked < search_limit {
-            blocks_checked += 1;
-
             if let Some(&core_block) = state.bitcoin_height_to_core_block.get(&current_height) {
                 if let Some(&stored_hash) = state.bitcoin_height_to_hash.get(&current_height) {
+                    blocks_checked += 1;
                     debug!(
                         "🔍 Checking upstream Core Lane block {} (local Core Lane block {})",
                         current_height, core_block
@@ -2872,7 +2850,8 @@ impl CoreLaneNode {
                             }
                             warn!(
                                 "⚠️  Hash mismatch at upstream Core Lane block {} (local Core Lane block {}) current_hash: {}, stored_hash: {}",
-                                current_height, core_block,
+                                current_height,
+                                core_block,
                                 hex::encode(current_hash.as_slice()),
                                 hex::encode(stored_hash.as_slice())
                             );
@@ -2936,12 +2915,19 @@ impl CoreLaneNode {
                 Ok(fork_core_block)
             }
             None => {
-                error!("❌ Could not find fork point for reorg recovery");
-                warn!("💡 This might indicate a deeper issue with the blockchain state");
-                warn!("💡 Consider restarting the node to resync from a known good state");
-                Err(anyhow::anyhow!(
-                    "Unable to determine fork point for reorg recovery"
-                ))
+                warn!("⚠️  Fork point not found within stored history — entire stored chain is diverged");
+                warn!("💡 Rolling back to earliest stored Core Lane block for full resync");
+                let earliest = state
+                    .bitcoin_height_to_core_block
+                    .values()
+                    .copied()
+                    .min()
+                    .unwrap_or(0);
+                info!(
+                    "🔄 Falling back to earliest stored Core Lane block {}",
+                    earliest
+                );
+                Ok(earliest)
             }
         }
     }
@@ -2949,9 +2935,9 @@ impl CoreLaneNode {
     async fn start_espresso_scanner(
         &self,
         espresso_base_url: String,
+        core_rpc_url: String,
         start_block: Option<u64>,
         espresso_namespace: u64,
-        core_lane_rpc_url: String,
     ) -> Result<()> {
         info!(
             "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
@@ -2978,29 +2964,66 @@ impl CoreLaneNode {
                 let client = client::SequencerClient::new(base_url);
                 let mut sub = client.subscribe_blocks(start_height).await?;
 
+                // Resume anchor context across scanner reconnects. Without this, a WS reset
+                // causes temporary fallback to height 0 until a new prefixed tx arrives.
+                let (mut current_core_lane_tip, mut current_anchor_height, mut current_anchor_parent_hash) = {
+                    let state = self.state.lock().await;
+                    if let Some(last_anchor_height) = state.last_processed_anchor_height {
+                        let last_anchor_hash = match state.bitcoin_height_to_hash.get(&last_anchor_height) {
+                            Some(hash) => *hash,
+                            None => B256::ZERO,
+                        };
+
+                        let current_anchor_parent_hash = if last_anchor_height > 0 {
+                            state.bitcoin_height_to_hash
+                                .get(&(last_anchor_height - 1))
+                                .map(|h| h.to_vec())
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+
+                        (
+                            <[u8; 32]>::from(last_anchor_hash),
+                            last_anchor_height,
+                            current_anchor_parent_hash,
+                        )
+                    } else {
+                        ([0u8; 32], 0u64, Vec::new())
+                    }
+                };
+
+
+                info!(
+                    "Espresso scanner resume context: anchor_height={}, anchor_hash={}",
+                    current_anchor_height,
+                    hex::encode(current_core_lane_tip)
+                );
+
                 while let Some(evt) = sub.next().await {
                     let header = evt?;
                     let height = header.height();
 
                     match derived_espresso::process_espresso_block(
                         &espresso_base_url,
+                        &core_rpc_url,
                         header,
                         espresso_namespace,
+                        current_core_lane_tip,
+                        current_anchor_height,
+                        current_anchor_parent_hash.clone(),
                     )
                     .await
                     {
-                        Ok(mut parsed_block) => {
-                            let (cl_height, cl_hash, cl_parent) =
-                                Self::fetch_core_lane_tip(&core_lane_rpc_url).await?;
+                        Ok(core_lane_block) => {
+                            let anchor_hash = core_lane_block.anchor_block_hash;
+                            current_core_lane_tip = anchor_hash;
+                            current_anchor_height = core_lane_block.anchor_block_height;
+                            current_anchor_parent_hash = core_lane_block.parent_hash.clone();
 
-                            parsed_block.anchor_block_hash = cl_hash.as_slice().to_vec();
-                            parsed_block.anchor_block_height = cl_height;
-                            parsed_block.parent_hash = cl_parent.as_slice().to_vec();
+                            let anchor_hash_bytes = anchor_hash.to_vec();
 
-                            let anchor_height = cl_height;
-                            let anchor_hash_bytes = cl_hash.as_slice().to_vec();
-
-                            match self.process_block(parsed_block).await {
+                            match self.process_block(core_lane_block).await {
                                 Ok(core_lane_block_number) => {
                                     if core_lane_block_number == 0 {
                                         info!(
@@ -3010,22 +3033,17 @@ impl CoreLaneNode {
                                     }
 
                                     let mut state = self.state.lock().await;
-                                    state.last_processed_anchor_height = Some(anchor_height);
 
                                     if anchor_hash_bytes.len() == 32 {
                                         let h = B256::from_slice(&anchor_hash_bytes);
                                         state.block_hashes.insert(h, core_lane_block_number);
-
-                                        state
-                                            .bitcoin_height_to_hash
-                                            .insert(anchor_height, h);
-                                        state
-                                            .bitcoin_height_to_core_block
-                                            .insert(anchor_height, core_lane_block_number);
+                                        state.bitcoin_height_to_hash.insert(current_anchor_height, h);
+                                        state.bitcoin_height_to_core_block.insert(current_anchor_height, core_lane_block_number);
+                                        state.last_processed_anchor_height = Some(current_anchor_height);
                                     } else {
                                         warn!(
                                             "Espresso anchor hash for block {} has unexpected length {}; skipping index update",
-                                            anchor_height,
+                                            height,
                                             anchor_hash_bytes.len()
                                         );
                                     };
@@ -3056,7 +3074,7 @@ impl CoreLaneNode {
             if let Err(e) = result {
                 error!("Error in Espresso-derived scanner: {}", e);
                 info!("Retrying Espresso scanner in 30 seconds after error");
-                sleep(Duration::from_secs(30)).await;
+                sleep(Duration::from_secs(20)).await;
             } else {
                 info!("Espresso block subscription ended cleanly; reconnecting in 5 seconds");
                 sleep(Duration::from_secs(5)).await;
@@ -4745,8 +4763,10 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone(),
                 sequencer_rpc_url.clone(),
                 Some(espresso_base_url.clone()),
+                Some(core_lane_rpc_url.clone()),
                 None,
                 espresso_client,
+                *espresso_namespace,
             );
             let app = rpc_server.router();
             let addr = format!("{}:{}", http_host, http_port);
@@ -4763,13 +4783,13 @@ async fn main() -> Result<()> {
             let start_block = *start_block;
             let espresso_base_url = espresso_base_url.clone();
             let espresso_namespace = *espresso_namespace;
-            let core_lane_rpc_url = core_lane_rpc_url.clone();
+            let core_rpc_url = core_lane_rpc_url.clone();
             let scanner_handle = tokio::spawn(async move {
                 node.start_espresso_scanner(
                     espresso_base_url,
+                    core_rpc_url,
                     start_block,
                     espresso_namespace,
-                    core_lane_rpc_url,
                 )
                 .await
             });
