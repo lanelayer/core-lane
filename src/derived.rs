@@ -1,15 +1,11 @@
-use std::str::FromStr;
-
 use alloy_consensus::Transaction;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
-use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBurn};
-
-const DERIVED_BURN_ADDRESS_HEX: &str = "0x0000000000000000000000000000000000000666";
+use crate::block::{decode_tx_envelope, extract_burn, CoreLaneBlockParsed};
 
 pub async fn fetch_core_block_number(rpc_url: &str) -> Result<u64> {
     let url = rpc_url.parse()?;
@@ -92,7 +88,7 @@ pub async fn process_core_lane_block(
             }
         }
 
-        if let Some(burn) = extract_burn(tx, chain_id)? {
+        if let Some(burn) = extract_burn(tx, chain_id) {
             info!(
                 "🔥 Derived burn in block {} → {} (value: {})",
                 height, burn.address, burn.amount
@@ -118,65 +114,4 @@ fn extract_da_payload(
         return None;
     }
     Some(payload.to_vec())
-}
-
-fn extract_burn(
-    tx: &alloy_rpc_types::Transaction,
-    expected_chain_id: u32,
-) -> Result<Option<CoreLaneBurn>> {
-    let burn_address = Address::from_str(DERIVED_BURN_ADDRESS_HEX)
-        .map_err(|_| anyhow!("Invalid burn address constant"))?;
-
-    let Some(to) = tx.to() else {
-        return Ok(None);
-    };
-    if to != burn_address {
-        return Ok(None);
-    }
-
-    let input = tx.input();
-    if input.len() < 24 {
-        // Candidate burn (to the burn address) but calldata is too short
-        info!(
-            "Derived: tx to burn address but input too short (len={})",
-            input.len()
-        );
-        return Ok(None);
-    }
-
-    let chain_id = u32::from_be_bytes(input[0..4].try_into().unwrap());
-    if chain_id != expected_chain_id {
-        return Ok(None);
-    }
-
-    let mut addr_bytes = [0u8; 20];
-    addr_bytes.copy_from_slice(&input[4..24]);
-    let recipient = Address::from(addr_bytes);
-
-    let amount: U256 = tx.value();
-
-    info!(
-        "Derived: candidate burn tx, chain_id={}, expected_chain_id={}, recipient={}, amount={}",
-        chain_id, expected_chain_id, recipient, amount
-    );
-
-    if chain_id != expected_chain_id {
-        info!(
-            "Derived: rejecting burn tx due to chain_id mismatch (got {}, expected {})",
-            chain_id, expected_chain_id
-        );
-        return Ok(None);
-    }
-
-    if amount.is_zero() {
-        info!("Derived: rejecting burn tx due to zero amount");
-        return Ok(None);
-    }
-
-    info!(
-        "🔥 Derived burn in block (from extract_burn) → {} (value: {})",
-        recipient, amount
-    );
-
-    Ok(Some(CoreLaneBurn::new(amount, recipient)))
 }

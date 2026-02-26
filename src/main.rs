@@ -519,6 +519,8 @@ enum Commands {
         /// Namespace to read Core Lane bundles from in Espresso.
         #[arg(long, default_value_t = 0)]
         espresso_namespace: u64,
+        #[arg(long, default_value_t = 1281453634)]
+        chain_id: u32,
         #[arg(long)]
         start_block: Option<u64>,
         #[arg(long)]
@@ -2938,6 +2940,7 @@ impl CoreLaneNode {
         core_rpc_url: String,
         start_block: Option<u64>,
         espresso_namespace: u64,
+        chain_id: u32,
     ) -> Result<()> {
         info!(
             "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
@@ -3009,6 +3012,7 @@ impl CoreLaneNode {
                         &core_rpc_url,
                         header,
                         espresso_namespace,
+                        chain_id,
                         current_core_lane_tip,
                         current_anchor_height,
                         current_anchor_parent_hash.clone(),
@@ -4716,6 +4720,7 @@ async fn main() -> Result<()> {
         Commands::DerivedEspressoStart {
             espresso_base_url,
             espresso_namespace,
+            chain_id,
             start_block,
             core_lane_rpc_url,
             http_host,
@@ -4783,6 +4788,7 @@ async fn main() -> Result<()> {
             let start_block = *start_block;
             let espresso_base_url = espresso_base_url.clone();
             let espresso_namespace = *espresso_namespace;
+            let chain_id = *chain_id;
             let core_rpc_url = core_lane_rpc_url.clone();
             let scanner_handle = tokio::spawn(async move {
                 node.start_espresso_scanner(
@@ -4790,6 +4796,7 @@ async fn main() -> Result<()> {
                     core_rpc_url,
                     start_block,
                     espresso_namespace,
+                    chain_id,
                 )
                 .await
             });

@@ -23,7 +23,8 @@ DERIVED_CORE_LANE_DATA_DIR_DEFAULT="./derived-espresso-data"
 
 # Upstream Core Lane JSON-RPC URL for reorg detection (Bitcoin DA mode Core Lane)
 # The Espresso-derived node anchors each block to the upstream Core Lane tip and follows its reorgs.
-CORE_LANE_RPC_URL_DEFAULT=""
+CORE_LANE_RPC_URL_DEFAULT="http://127.0.0.1:8546"
+CORE_LANE_RPC_URL="${CORE_LANE_RPC_URL:-$CORE_LANE_RPC_URL_DEFAULT}"
 
 CORE_LANE_NODE_PID=0
 CORE_LANE_TAIL_PID=0
@@ -64,11 +65,7 @@ start_espresso_core_lane_node() {
     local espresso_namespace="${ESPRESSO_NAMESPACE:-$ESPRESSO_NAMESPACE_DEFAULT}"
     local data_dir="${DERIVED_CORE_LANE_DATA_DIR:-$DERIVED_CORE_LANE_DATA_DIR_DEFAULT}"
 
-    local core_lane_rpc_url="${CORE_LANE_RPC_URL:-}"
-    if [ -z "$core_lane_rpc_url" ]; then
-        print_error "CORE_LANE_RPC_URL environment variable is required"
-        exit 1
-    fi
+    local core_lane_rpc_url="${CORE_LANE_RPC_URL}"
     if [[ "$core_lane_rpc_url" == *":${DERIVED_CORE_LANE_RPC_PORT}"* ]]; then
         print_error "CORE_LANE_RPC_URL (${core_lane_rpc_url}) must not use the derived node port (${DERIVED_CORE_LANE_RPC_PORT})"
         print_error "Use a different port for the upstream Core Lane node (e.g. 8546) or change DERIVED_CORE_LANE_RPC_PORT in this script"
@@ -190,7 +187,7 @@ show_usage() {
     echo "Environment variables:"
     echo "  ESPRESSO_BASE_URL        Base URL for Espresso DA (default: ${ESPRESSO_BASE_URL_DEFAULT})"
     echo "  ESPRESSO_NAMESPACE       Namespace ID to use (default: ${ESPRESSO_NAMESPACE_DEFAULT})"
-    echo "  CORE_LANE_RPC_URL        Upstream Core Lane JSON-RPC URL for reorg detection (required)"
+    echo "  CORE_LANE_RPC_URL        Upstream Core Lane JSON-RPC URL for reorg detection (default: ${CORE_LANE_RPC_URL_DEFAULT})"
     echo "  DERIVED_CORE_LANE_DATA_DIR  Data directory for derived node state (default: ${DERIVED_CORE_LANE_DATA_DIR_DEFAULT})"
 }
 
@@ -212,7 +209,7 @@ start_dev_environment() {
     echo "  Espresso base URL:  ${ESPRESSO_BASE_URL:-$ESPRESSO_BASE_URL_DEFAULT}"
     echo "  Espresso namespace: ${ESPRESSO_NAMESPACE:-$ESPRESSO_NAMESPACE_DEFAULT}"
     echo "  Derived Core Lane data dir: ${data_dir}"
-    echo "  Upstream Core Lane RPC URL: ${CORE_LANE_RPC_URL:-<required>}"
+    echo "  Upstream Core Lane RPC URL: ${CORE_LANE_RPC_URL}"
     echo ""
     echo "🛑 Use '$0 stop' or press Ctrl+C to stop the environment"
     echo ""

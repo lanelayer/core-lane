@@ -1,5 +1,6 @@
+use crate::transaction::CoreLaneAddresses;
 use alloy_consensus::transaction::SignerRecoverable;
-use alloy_consensus::TxEnvelope;
+use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_primitives::{Address, U256};
 use alloy_rlp::Decodable;
 use anyhow::anyhow;
@@ -644,6 +645,45 @@ impl CoreLaneBurn {
         Self { amount, address }
     }
 }
+
+pub fn extract_burn<T: Transaction>(tx: &T, expected_chain_id: u32) -> Option<CoreLaneBurn> {
+    let burn_address = CoreLaneAddresses::burn();
+    let to = tx.to()?;
+    if to != burn_address {
+        return None;
+    }
+
+    let input = tx.input();
+    if input.len() < 24 {
+        info!(
+            "extract_burn: tx to burn address but input too short (len={})",
+            input.len()
+        );
+        return None;
+    }
+
+    let chain_id = u32::from_be_bytes(input[0..4].try_into().ok()?);
+    if chain_id != expected_chain_id {
+        info!(
+            "extract_burn: rejecting burn tx due to chain_id mismatch (got {}, expected {})",
+            chain_id, expected_chain_id
+        );
+        return None;
+    }
+
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&input[4..24]);
+    let recipient = Address::from(addr_bytes);
+
+    let amount = tx.value();
+    if amount.is_zero() {
+        info!("extract_burn: rejecting burn tx due to zero amount");
+        return None;
+    }
+
+    Some(CoreLaneBurn::new(amount, recipient))
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreLaneBlockParsed {
     pub bundles: Vec<CoreLaneBundle>,
