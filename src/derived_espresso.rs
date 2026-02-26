@@ -1,8 +1,7 @@
-use crate::block::decode_tx_envelope;
-use crate::block::CoreLaneBlockParsed;
+use crate::block::{decode_tx_envelope, extract_burn, CoreLaneBlockParsed, CoreLaneBurn};
 use alloy_primitives::B256;
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types::BlockId;
+use alloy_rpc_types::{BlockId, BlockNumberOrTag, BlockTransactions};
 use anyhow::{anyhow, Result};
 use espresso_types::v0::Header;
 use espresso_types::NamespaceProofQueryData;
@@ -70,6 +69,102 @@ async fn fetch_core_lane_block_metadata(
     }
 }
 
+async fn scan_block_for_burns(
+    provider: &impl Provider,
+    height: u64,
+    chain_id: u32,
+) -> Result<Vec<CoreLaneBurn>> {
+    let block = match provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            warn!("scan_block_for_burns: block {} not found", height);
+            return Err(anyhow!("scan_block_for_burns: block {} not found", height));
+        }
+        Err(e) => {
+            warn!(
+                "scan_block_for_burns: failed to fetch block {}: {}",
+                height, e
+            );
+            return Err(e.into());
+        }
+    };
+
+    let tx_hashes = match block.transactions {
+        BlockTransactions::Full(txs) => {
+            return Ok(txs
+                .iter()
+                .filter_map(|tx| extract_burn(tx, chain_id))
+                .collect());
+        }
+        BlockTransactions::Hashes(hashes) => hashes,
+        _ => return Ok(Vec::new()),
+    };
+
+    let mut burns = Vec::new();
+    for hash in tx_hashes {
+        let tx = match provider.get_transaction_by_hash(hash).await {
+            Ok(Some(tx)) => tx,
+            Ok(None) => {
+                warn!("scan_block_for_burns: tx {} not found", hash);
+                return Err(anyhow!("scan_block_for_burns: tx {} not found", hash));
+            }
+            Err(e) => {
+                warn!("scan_block_for_burns: failed to fetch tx {}: {}", hash, e);
+                return Err(e.into());
+            }
+        };
+        if let Some(burn) = extract_burn(&tx, chain_id) {
+            burns.push(burn);
+        }
+    }
+    Ok(burns)
+}
+
+async fn fetch_core_lane_burns(
+    core_rpc_url: &str,
+    from_height: u64,
+    to_height: u64,
+    chain_id: u32,
+) -> Result<Vec<CoreLaneBurn>> {
+    if from_height > to_height {
+        info!("fetch_core_lane_burns: range is empty (from > to), skipping");
+        return Ok(Vec::new());
+    }
+
+    let url = match core_rpc_url.parse() {
+        Ok(url) => url,
+        Err(e) => {
+            warn!(
+                "fetch_core_lane_burns: invalid core_rpc_url '{}': {}",
+                core_rpc_url, e
+            );
+            return Err(anyhow!(
+                "fetch_core_lane_burns: invalid core_rpc_url '{}': {}",
+                core_rpc_url,
+                e
+            ));
+        }
+    };
+    let provider = ProviderBuilder::new().connect_http(url);
+    let mut burns = Vec::new();
+
+    for height in from_height..=to_height {
+        let block_burns = scan_block_for_burns(&provider, height, chain_id).await?;
+        for burn in &block_burns {
+            info!(
+                "🔥 Core Lane burn for Espresso Lane detected in block {} → {} (value: {})",
+                height, burn.address, burn.amount
+            );
+        }
+        burns.extend(block_burns);
+    }
+
+    Ok(burns)
+}
+
 pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
     let client: Client<ServerError, StaticVersion<0, 1>> = Client::new(Url::parse(base_url)?);
 
@@ -78,11 +173,13 @@ pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
     Ok(height_plus_one.saturating_sub(1))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_espresso_block(
     base_url: &str,
     core_rpc_url: &str,
     header: Header,
     namespace: u64,
+    chain_id: u32,
     previous_core_lane_tip: [u8; 32],
     previous_anchor_height: u64,
     previous_anchor_parent_hash: Vec<u8>,
@@ -186,6 +283,17 @@ pub async fn process_espresso_block(
                 tx_without_prefix.len()
             );
         }
+    }
+
+    let burns = fetch_core_lane_burns(
+        core_rpc_url,
+        previous_anchor_height.saturating_add(1),
+        core_lane_block.anchor_block_height,
+        chain_id,
+    )
+    .await?;
+    for burn in burns {
+        core_lane_block.add_burn(burn);
     }
 
     Ok(core_lane_block)
