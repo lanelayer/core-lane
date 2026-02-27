@@ -524,6 +524,8 @@ enum Commands {
         #[arg(long)]
         start_block: Option<u64>,
         #[arg(long)]
+        start_anchor: Option<u64>,
+        #[arg(long)]
         core_lane_rpc_url: String,
         #[arg(long, default_value = "127.0.0.1")]
         http_host: String,
@@ -2939,6 +2941,7 @@ impl CoreLaneNode {
         espresso_base_url: String,
         core_rpc_url: String,
         start_block: Option<u64>,
+        start_anchor: Option<u64>,
         espresso_namespace: u64,
         chain_id: u32,
     ) -> Result<()> {
@@ -2947,10 +2950,14 @@ impl CoreLaneNode {
             espresso_base_url, espresso_namespace
         );
 
-        if let Some(block) = start_block {
+        if let Some(anchor) = start_anchor {
             let mut state = self.state.lock().await;
             if state.last_processed_anchor_height.is_none() {
-                state.last_processed_anchor_height = Some(block.saturating_sub(1));
+                info!(
+                    "Seeding anchor context from --start-anchor: height={}",
+                    anchor
+                );
+                state.last_processed_anchor_height = Some(anchor);
             }
         }
 
@@ -2961,7 +2968,7 @@ impl CoreLaneNode {
 
                 println!("latest_block in espresso is: {}", latest_block);
 
-                let start_height = latest_block.saturating_sub(10);
+                let start_height = start_block.unwrap_or_else(|| latest_block.saturating_sub(10));
 
                 let base_url = Url::parse(&espresso_base_url)?;
                 let client = client::SequencerClient::new(base_url);
@@ -2969,15 +2976,15 @@ impl CoreLaneNode {
 
                 // Resume anchor context across scanner reconnects. Without this, a WS reset
                 // causes temporary fallback to height 0 until a new prefixed tx arrives.
-                let (mut current_core_lane_tip, mut current_anchor_height, mut current_anchor_parent_hash) = {
+                let restored_anchor = {
                     let state = self.state.lock().await;
-                    if let Some(last_anchor_height) = state.last_processed_anchor_height {
+                    state.last_processed_anchor_height.map(|last_anchor_height| {
                         let last_anchor_hash = match state.bitcoin_height_to_hash.get(&last_anchor_height) {
                             Some(hash) => *hash,
                             None => B256::ZERO,
                         };
 
-                        let current_anchor_parent_hash = if last_anchor_height > 0 {
+                        let parent_hash = if last_anchor_height > 0 {
                             state.bitcoin_height_to_hash
                                 .get(&(last_anchor_height - 1))
                                 .map(|h| h.to_vec())
@@ -2986,15 +2993,28 @@ impl CoreLaneNode {
                             Vec::new()
                         };
 
-                        (
-                            <[u8; 32]>::from(last_anchor_hash),
-                            last_anchor_height,
-                            current_anchor_parent_hash,
-                        )
-                    } else {
-                        ([0u8; 32], 0u64, Vec::new())
-                    }
+                        (<[u8; 32]>::from(last_anchor_hash), last_anchor_height, parent_hash)
+                    })
                 };
+
+                let (mut current_core_lane_tip, mut current_anchor_height, mut current_anchor_parent_hash) =
+                    if let Some(anchor) = restored_anchor {
+                        anchor
+                    } else {
+                        match derived_espresso::fetch_core_lane_tip(&core_rpc_url).await {
+                            Ok(tip) => {
+                                info!(
+                                    "No persisted anchor state; seeding from Core Lane tip: height={}, hash={}",
+                                    tip.height, hex::encode(tip.hash)
+                                );
+                                (tip.hash, tip.height, tip.parent_hash)
+                            }
+                            Err(e) => {
+                                warn!("Failed to fetch Core Lane tip for anchor seed: {}", e);
+                                ([0u8; 32], 0u64, Vec::new())
+                            }
+                        }
+                    };
 
 
                 info!(
@@ -4722,6 +4742,7 @@ async fn main() -> Result<()> {
             espresso_namespace,
             chain_id,
             start_block,
+            start_anchor,
             core_lane_rpc_url,
             http_host,
             http_port,
@@ -4786,6 +4807,7 @@ async fn main() -> Result<()> {
             });
 
             let start_block = *start_block;
+            let start_anchor = *start_anchor;
             let espresso_base_url = espresso_base_url.clone();
             let espresso_namespace = *espresso_namespace;
             let chain_id = *chain_id;
@@ -4795,6 +4817,7 @@ async fn main() -> Result<()> {
                     espresso_base_url,
                     core_rpc_url,
                     start_block,
+                    start_anchor,
                     espresso_namespace,
                     chain_id,
                 )

@@ -14,6 +14,12 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 use vbs::version::StaticVersion;
 
+pub struct CoreLaneTip {
+    pub height: u64,
+    pub hash: [u8; 32],
+    pub parent_hash: Vec<u8>,
+}
+
 const CORE_LANE_ANCHOR_PREFIX_LEN: usize = 32;
 
 fn parse_core_lane_anchor_prefix(tx_data: &[u8]) -> (Option<[u8; 32]>, &[u8]) {
@@ -163,6 +169,21 @@ async fn fetch_core_lane_burns(
     }
 
     Ok(burns)
+}
+
+pub async fn fetch_core_lane_tip(rpc_url: &str) -> Result<CoreLaneTip> {
+    let url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let height = provider.get_block_number().await?;
+    let block = provider
+        .get_block(BlockId::Number(BlockNumberOrTag::Number(height)))
+        .await?
+        .ok_or_else(|| anyhow!("Core Lane tip block {} not found", height))?;
+    Ok(CoreLaneTip {
+        height,
+        hash: block.header.hash.into(),
+        parent_hash: block.header.inner.parent_hash.as_slice().to_vec(),
+    })
 }
 
 pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
