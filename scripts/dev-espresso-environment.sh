@@ -9,8 +9,8 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # Configuration for Espresso-derived Core Lane
-ESPRESSO_BASE_URL_DEFAULT="https://query.decaf.testnet.espresso.network"
-ESPRESSO_NAMESPACE_DEFAULT=0
+ESPRESSO_BASE_URL_DEFAULT="https://query.decaf.testnet.espresso.network/v1"
+ESPRESSO_NAMESPACE_DEFAULT=1281453637  # "LanE" as big-endian u32 (0x4C616E45)
 
 # JSON-RPC endpoint for the Espresso-derived Core Lane node itself
 # Must be different from the upstream Core Lane RPC URL port.

@@ -514,10 +514,14 @@ enum Commands {
     /// Start a derived Core Lane node that reads bundles from an Espresso.
     DerivedEspressoStart {
         /// url for the Espresso query
-        #[arg(long, default_value = "https://query.decaf.testnet.espresso.network")]
+        #[arg(
+            long,
+            default_value = "https://query.decaf.testnet.espresso.network/v1"
+        )]
         espresso_base_url: String,
         /// Namespace to read Core Lane bundles from in Espresso.
-        #[arg(long, default_value_t = 0)]
+        /// Default: "LanE" as big-endian u32 (0x4C616E45);
+        #[arg(long, default_value_t = 1281453637)]
         espresso_namespace: u64,
         #[arg(long, default_value_t = 1281453634)]
         chain_id: u32,
