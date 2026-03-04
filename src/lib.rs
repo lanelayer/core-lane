@@ -56,6 +56,9 @@ pub use alloy_consensus::TxEnvelope;
 pub use alloy_primitives::{Address, Bytes, B256, U256};
 pub use bitcoincore_rpc::Client as BitcoinClient;
 
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
+use anyhow::Result;
 use bitcoincore_rpc::Client;
 use std::sync::Arc;
 
@@ -91,6 +94,9 @@ pub struct CoreLaneStateForLib {
     bitcoin_client_read: Arc<Client>,
     bitcoin_client_write: Arc<Client>,
     bitcoin_network: bitcoin::Network,
+    /// Ethereum-compatible JSON-RPC URL for the core-lane node.
+    /// Used to fetch lane tips (block numbers and hashes).
+    core_lane_eth_url: Option<String>,
 }
 
 impl CoreLaneStateForLib {
@@ -105,7 +111,14 @@ impl CoreLaneStateForLib {
             bitcoin_client_read: bitcoin_client.clone(),
             bitcoin_client_write: bitcoin_client,
             bitcoin_network: network,
+            core_lane_eth_url: None,
         }
+    }
+
+    /// Set the Ethereum-compatible JSON-RPC URL for the core-lane node.
+    pub fn with_core_lane_eth_url(mut self, url: String) -> Self {
+        self.core_lane_eth_url = Some(url);
+        self
     }
 }
 
@@ -125,6 +138,36 @@ impl CoreLaneStateForLib {
     /// and want to update the context to use the new state.
     pub fn replace_state_manager(&mut self, new_state: StateManager) {
         self.account_manager = new_state;
+    }
+
+    /// Get the hash of a specific core-lane block by number.
+    pub async fn get_lane_block_hash(&self, block_number: u64) -> Result<[u8; 32]> {
+        let url = self.core_lane_eth_url.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No core-lane ETH URL configured"))?;
+        let url = url.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid core-lane URL: {}", e))?;
+        let provider = ProviderBuilder::new().connect_http(url);
+        let block = provider
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_number)))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get block {} from core-lane: {}", block_number, e))?
+            .ok_or_else(|| anyhow::anyhow!("Block {} not found in core-lane", block_number))?;
+        Ok(block.header.hash.0)
+    }
+
+    /// Get the latest lane tip: (block_number, block_hash).
+    pub async fn get_latest_lane_tip(&self) -> Result<(u64, [u8; 32])> {
+        let url = self.core_lane_eth_url.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No core-lane ETH URL configured"))?;
+        let url = url.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid core-lane URL: {}", e))?;
+        let provider = ProviderBuilder::new().connect_http(url);
+        let block = provider
+            .get_block(BlockId::latest())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get latest block from core-lane: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("No latest block found in core-lane"))?;
+        Ok((block.header.number, block.header.hash.0))
     }
 }
 
