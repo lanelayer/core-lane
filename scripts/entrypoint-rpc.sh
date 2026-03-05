@@ -29,6 +29,11 @@ CHAIN_ID="${CHAIN_ID:-}"
 DERIVED_DA_ADDRESS="${DERIVED_DA_ADDRESS:-}"
 START_BLOCK="${START_BLOCK:-0}"
 
+# Derived Espresso configuration (Espresso mainnet → Core Lane RPC anchor)
+ESPRESSO_BASE_URL="${ESPRESSO_BASE_URL:-}"
+ESPRESSO_NAMESPACE="${ESPRESSO_NAMESPACE:-1281453637}"
+CORE_LANE_RPC_URL="${CORE_LANE_RPC_URL:-}"
+START_ANCHOR="${START_ANCHOR:-}"
 
 # S3 configuration for uploading cached blocks to S3 storage
 DISABLE_ARCHIVE_FETCH="${DISABLE_ARCHIVE_FETCH:-false}"
@@ -293,7 +298,41 @@ if [ "${ONLY_START:-}" = "derive-node" ]; then
   fi
 fi
 
+# derived-espresso mode (Espresso mainnet → Core Lane RPC anchor)
+if [ "${ONLY_START:-}" = "derived-espresso" ]; then
+  # Validate required environment variables
+  if [ -z "${ESPRESSO_BASE_URL:-}" ] || [ -z "${CORE_LANE_RPC_URL:-}" ]; then
+    echo "[entrypoint] ERROR: ESPRESSO_BASE_URL and CORE_LANE_RPC_URL must be set for derived-espresso mode"
+    exit 1
+  fi
 
+  echo "[entrypoint] starting derived-espresso on ${HTTP_HOST}:${HTTP_PORT}"
+  args=(
+    derived-espresso-start
+    --data-dir "${DATA_DIR}"
+    --espresso-base-url "${ESPRESSO_BASE_URL}"
+    --espresso-namespace "${ESPRESSO_NAMESPACE}"
+    --chain-id "${CHAIN_ID:-1281453634}"
+    --core-lane-rpc-url "${CORE_LANE_RPC_URL}"
+    --http-host "${HTTP_HOST}"
+    --http-port "${HTTP_PORT}"
+  )
+  [ -n "${START_BLOCK:-}" ]         && args+=(--start-block "${START_BLOCK}")
+  [ -n "${START_ANCHOR:-}" ]        && args+=(--start-anchor "${START_ANCHOR}")
+  [ -n "${SEQUENCER_RPC_URL:-}" ]  && args+=(--sequencer-rpc-url "${SEQUENCER_RPC_URL}")
+  [ -n "${SEQUENCER_ADDRESS:-}" ]  && args+=(--sequencer-address "${SEQUENCER_ADDRESS}")
+
+  "/app/core-lane-node" "${args[@]}" &
+  DERIVED_ESPRESSO_PID=$!
+  child_pids+=("$DERIVED_ESPRESSO_PID")
+
+  echo "[entrypoint] waiting for derived-espresso to be ready on ${HTTP_HOST}:${HTTP_PORT}..."
+  if ! wait_for_service "${HTTP_HOST}" "${HTTP_PORT}" 60 "${DERIVED_ESPRESSO_PID}"; then
+    echo "[entrypoint] WARNING: derived-espresso did not become ready, but process is still running"
+  else
+    echo "[entrypoint] derived-espresso is ready!"
+  fi
+fi
 
 # Monitor child processes and handle exits gracefully
 set +e

@@ -1,0 +1,54 @@
+# fly.toml app configuration for Espresso Lane (Espresso mainnet → Core Lane RPC anchor)
+#
+# Deploys derived-espresso-start: reads LanE bundles from Espresso mainnet,
+# anchors each block to the upstream Core Lane RPC (Bitcoin DA mode).
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+
+app = 'lane-espresso'
+primary_region = 'cdg'
+
+[build]
+  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
+
+[env]
+  ONLY_START = 'derived-espresso'
+  HTTP_PORT = '8545'
+  HTTP_HOST = '0.0.0.0'
+  DATA_DIR = '/data'
+
+  # Espresso mainnet
+  ESPRESSO_BASE_URL = 'https://query.main.net.espresso.network/v1'
+  ESPRESSO_NAMESPACE = '1281453637'
+  CHAIN_ID = '1281453634'
+
+  # Upstream Core Lane RPC (Bitcoin DA mode) for reorg detection / anchoring
+  CORE_LANE_RPC_URL = 'https://rpc.lanelayer.com'
+
+  # Start from specific Espresso block and Core Lane anchor
+  START_BLOCK = '11059050'
+  START_ANCHOR = '23193'
+
+
+[[mounts]]
+  source = 'core_lane_espresso_storage'
+  destination = '/data'
+
+[http_service]
+  internal_port = 8545
+  force_https = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '10s'
+    grace_period = '1m0s'
+    method = 'get'
+    path = '/health'
+    protocol = 'http'
+
+[[vm]]
+  memory = '2gb'
+  cpu_kind = 'shared'
+  cpus = 2
