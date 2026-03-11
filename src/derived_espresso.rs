@@ -1,4 +1,6 @@
-use crate::block::{decode_tx_envelope, extract_burn, CoreLaneBlockParsed, CoreLaneBurn};
+use crate::block::{
+    decode_tx_envelope, extract_burn, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn,
+};
 use alloy_primitives::B256;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, BlockTransactions};
@@ -32,7 +34,10 @@ fn parse_core_lane_anchor_prefix(tx_data: &[u8]) -> (Option<[u8; 32]>, &[u8]) {
     prefix_hash.copy_from_slice(&tx_data[..32]);
     let remaining = &tx_data[32..];
 
-    if decode_tx_envelope(remaining).is_some() {
+    let is_valid_payload =
+        CoreLaneBundleCbor::from_cbor(remaining).is_ok() || decode_tx_envelope(remaining).is_some();
+
+    if is_valid_payload {
         info!(
             "Espresso: found Core Lane anchor tip hash in first transaction of block {}",
             hex::encode(prefix_hash)
@@ -259,9 +264,13 @@ pub async fn process_espresso_block(
     let mut first_tx_processed = false;
 
     for tx_data in transactions {
-        let (derived_core_lane_tip, tx_without_prefix) = parse_core_lane_anchor_prefix(&tx_data);
+        let (derived_core_lane_tip, tx_without_prefix) = if !first_tx_processed {
+            parse_core_lane_anchor_prefix(&tx_data)
+        } else {
+            (None, tx_data.as_slice())
+        };
 
-        if !first_tx_processed {
+        let pending_anchor = if !first_tx_processed {
             if let Some(core_lane_tip_hash) = derived_core_lane_tip {
                 match fetch_core_lane_block_metadata(core_rpc_url, core_lane_tip_hash).await {
                     Some((tip_height, tip_parent_hash)) => {
@@ -271,9 +280,7 @@ pub async fn process_espresso_block(
                             hex::encode(core_lane_tip_hash),
                             tip_height,
                         );
-                        core_lane_block.anchor_block_hash = core_lane_tip_hash;
-                        core_lane_block.anchor_block_height = tip_height;
-                        core_lane_block.parent_hash = tip_parent_hash;
+                        Some((core_lane_tip_hash, tip_height, tip_parent_hash))
                     }
                     None => {
                         warn!(
@@ -281,28 +288,60 @@ pub async fn process_espresso_block(
                             hex::encode(core_lane_tip_hash),
                             height
                         );
+                        None
                     }
                 }
+            } else {
+                None
             }
-            first_tx_processed = true;
-        }
-
-        if let Some((tx_envelope, sender)) = decode_tx_envelope(tx_without_prefix) {
-            info!(
-                "Espresso: decoded transaction in block {} (sender: {})",
-                height, sender
-            );
-            core_lane_block.add_bundle_from_single_tx(
-                tx_envelope,
-                sender,
-                tx_without_prefix.to_vec(),
-            );
         } else {
-            warn!(
-                "Espresso: failed to decode transaction in block {} ({} bytes)",
-                height,
-                tx_without_prefix.len()
-            );
+            None
+        };
+        first_tx_processed = true;
+
+        match CoreLaneBundleCbor::from_cbor(tx_without_prefix) {
+            Ok(cbor_bundle) => {
+                info!(
+                    "Espresso: decoded CBOR bundle in block {} ({} transactions)",
+                    height,
+                    cbor_bundle.transactions.len()
+                );
+                if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
+                    warn!(
+                        "Espresso: failed to process CBOR bundle in block {}: {}",
+                        height, e
+                    );
+                } else if let Some((tip_hash, tip_height, tip_parent_hash)) = pending_anchor {
+                    core_lane_block.anchor_block_hash = tip_hash;
+                    core_lane_block.anchor_block_height = tip_height;
+                    core_lane_block.parent_hash = tip_parent_hash;
+                }
+            }
+            Err(_) => {
+                // Fall back to raw transaction envelope
+                if let Some((tx_envelope, sender)) = decode_tx_envelope(tx_without_prefix) {
+                    info!(
+                        "Espresso: decoded legacy RLP transaction in block {} (sender: {})",
+                        height, sender
+                    );
+                    core_lane_block.add_bundle_from_single_tx(
+                        tx_envelope,
+                        sender,
+                        tx_without_prefix.to_vec(),
+                    );
+                    if let Some((tip_hash, tip_height, tip_parent_hash)) = pending_anchor {
+                        core_lane_block.anchor_block_hash = tip_hash;
+                        core_lane_block.anchor_block_height = tip_height;
+                        core_lane_block.parent_hash = tip_parent_hash;
+                    }
+                } else {
+                    warn!(
+                        "Espresso: failed to decode transaction in block {} ({} bytes)",
+                        height,
+                        tx_without_prefix.len()
+                    );
+                }
+            }
         }
     }
 
