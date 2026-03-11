@@ -719,10 +719,12 @@ impl RpcServer {
             {
                 Ok(response) if response.status().is_success() => {
                     use alloy_primitives::keccak256;
+                    let espresso_hash = response.text().await.unwrap_or_default();
                     let tx_hash = keccak256(&tx_bytes);
                     let tx_hash_hex = format!("0x{}", hex::encode(tx_hash));
                     info!(
                         core_tx_hash = %tx_hash_hex,
+                        espresso_hash = %espresso_hash.trim(),
                         "Transaction submitted to Espresso via eth_sendRawTransaction"
                     );
                     return Ok(JsonResponse::from(JsonRpcResponse {
