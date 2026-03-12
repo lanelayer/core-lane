@@ -27,6 +27,7 @@ NETWORK="${NETWORK:-mainnet}"
 # Derived node configuration
 CHAIN_ID="${CHAIN_ID:-}"
 DERIVED_DA_ADDRESS="${DERIVED_DA_ADDRESS:-}"
+DERIVED_NO_POLL="${DERIVED_NO_POLL:-false}"
 START_BLOCK="${START_BLOCK:-0}"
 
 # Derived Espresso configuration (Espresso mainnet → Core Lane RPC anchor)
@@ -253,19 +254,21 @@ if [ "${ONLY_START:-}" = "derive-node" ]; then
     exit 1
   fi
 
-  if [ -f "${DATA_DIR}/vc-cm-snapshot.squashfs" ]; then
-    VC_CM_SNAPSHOT_FILE="${DATA_DIR}/vc-cm-snapshot.squashfs"
-  else if [ -f "/vc-cm-snapshot.squashfs" ]; then
-    VC_CM_SNAPSHOT_FILE="/vc-cm-snapshot.squashfs"
+  if [ -f "${DATA_DIR}/vc-cm-snapshot/config.json" ]; then
+    echo "[entrypoint] vc-cm-snapshot/config.json exists, using existing snapshot directory"
   else
-    echo "[entrypoint] ERROR: vc-cm-snapshot.squashfs not found"
-    exit 1
-  fi
+    if [ -f "${DATA_DIR}/vc-cm-snapshot.squashfs" ]; then
+      VC_CM_SNAPSHOT_FILE="${DATA_DIR}/vc-cm-snapshot.squashfs"
+    elif [ -f "/vc-cm-snapshot.squashfs" ]; then
+      VC_CM_SNAPSHOT_FILE="/vc-cm-snapshot.squashfs"
+    else
+      echo "[entrypoint] ERROR: vc-cm-snapshot.squashfs not found"
+      exit 1
+    fi
 
     echo "[entrypoint] mounting vc-cm-snapshot.squashfs from ${DATA_DIR}"
     mkdir -p "${DATA_DIR}/vc-cm-snapshot"
     # mount -o loop won't work in docker but it'll work in fly.io
-    
     if mount -t squashfs -o loop "${VC_CM_SNAPSHOT_FILE}" "${DATA_DIR}/vc-cm-snapshot"; then
       echo "[entrypoint] Successfully mounted vc-cm-snapshot.squashfs using mount"
     elif unsquashfs -f -d "${DATA_DIR}/vc-cm-snapshot" "${VC_CM_SNAPSHOT_FILE}"; then
@@ -279,6 +282,12 @@ if [ "${ONLY_START:-}" = "derive-node" ]; then
   echo "[entrypoint] starting derive-node on ${HTTP_HOST}:${HTTP_PORT}"
   export LANE_LAYER_SNAPSHOT_DIR="${DATA_DIR}/vc-cm-snapshot"
   CORE_RPC_URL="${CORE_RPC_URL:-https://rpc.lanelayer.com}"
+  derived_no_poll_normalized="${DERIVED_NO_POLL,,}"
+  derived_on_demand_flag=()
+  if [ "$derived_no_poll_normalized" = "true" ] || [ "$derived_no_poll_normalized" = "1" ] || [ "$derived_no_poll_normalized" = "yes" ]; then
+    derived_on_demand_flag=(--on-demand-polling)
+    echo "[entrypoint] DERIVED_NO_POLL enabled - on-demand polling mode, use POST /do_poll to trigger scans"
+  fi
   "/app/core-lane-node" derived-start \
     --data-dir "${DATA_DIR}" \
     --core-rpc-url "${CORE_RPC_URL}" \
@@ -286,7 +295,8 @@ if [ "${ONLY_START:-}" = "derive-node" ]; then
     --derived-da-address "${DERIVED_DA_ADDRESS}" \
     --start-block "${START_BLOCK}" \
     --http-host "${HTTP_HOST}" \
-    --http-port "${HTTP_PORT}" &
+    --http-port "${HTTP_PORT}" \
+    "${derived_on_demand_flag[@]}" &
   DERIVE_NODE_PID=$!
   child_pids+=("$DERIVE_NODE_PID")
 
