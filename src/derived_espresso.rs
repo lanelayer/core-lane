@@ -1,7 +1,8 @@
 use crate::block::{
-    decode_tx_envelope, extract_burn, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn,
+    decode_tx_envelope, extract_burn, AnchorSource, CoreLaneBlockParsed, CoreLaneBundleCbor,
+    CoreLaneBurn,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, BlockTransactions};
 use anyhow::{anyhow, Result};
@@ -209,6 +210,7 @@ pub async fn process_espresso_block(
     previous_core_lane_tip: [u8; 32],
     previous_anchor_height: u64,
     previous_anchor_parent_hash: Vec<u8>,
+    sequencer_address: Option<Address>,
 ) -> Result<CoreLaneBlockParsed> {
     let height = header.height();
     let mut core_lane_block = CoreLaneBlockParsed::new(
@@ -216,6 +218,7 @@ pub async fn process_espresso_block(
         header.timestamp(),
         previous_anchor_height,
         previous_anchor_parent_hash,
+        AnchorSource::CoreLane,
     );
 
     let mut attempt: u32 = 0;
@@ -306,7 +309,36 @@ pub async fn process_espresso_block(
                     height,
                     cbor_bundle.transactions.len()
                 );
-                if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
+
+                // Verify anchor is from the authorized sequencer if configured
+                let anchor_authorized = if let Some(expected) = sequencer_address {
+                    match cbor_bundle.recover_signer_address() {
+                        Ok(signer) if signer == expected => true,
+                        Ok(signer) => {
+                            warn!(
+                                "Espresso block {}: anchor rejected — signer {} != sequencer {}",
+                                height, signer, expected
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Espresso block {}: anchor rejected — no valid signature: {}",
+                                height, e
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+
+                if !anchor_authorized {
+                    warn!(
+                        "Espresso block {}: bundle dropped — unauthorized sequencer",
+                        height
+                    );
+                } else if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
                     warn!(
                         "Espresso: failed to process CBOR bundle in block {}: {}",
                         height, e

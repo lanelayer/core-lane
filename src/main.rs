@@ -91,7 +91,10 @@ use alloy_consensus::TxEnvelope;
 use bitcoin_cache_rpc::{BitcoinCacheRpcServer, S3Config};
 use cmio::CmioMessage;
 use core_lane::bitcoin_rpc_client::create_bitcoin_read_client;
-use core_lane::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed};
+use core_lane::{
+    bitcoin_block::process_bitcoin_block,
+    block::{AnchorSource, CoreLaneBlockParsed},
+};
 use intents::create_anchor_bitcoin_fill_intent;
 use reqwest::Client;
 use rpc::RpcServer;
@@ -1955,6 +1958,10 @@ impl CoreLaneNode {
     async fn process_block(&self, bitcoin_block: CoreLaneBlockParsed) -> Result<u64> {
         let block_start_time = Instant::now();
         let anchor_height = bitcoin_block.anchor_block_height;
+        let anchor_hash_label = match &bitcoin_block.anchor_source {
+            AnchorSource::Bitcoin => "btc block hash",
+            AnchorSource::CoreLane => "core lane tip hash",
+        };
         info!(
             "Starting block execution (target anchor height: {})",
             anchor_height
@@ -2356,8 +2363,12 @@ impl CoreLaneNode {
 
         let block_execution_time = block_start_time.elapsed();
         info!(
-            "Block execution completed in {:?} for Core Lane block: {} -> anchor height: {} anchor block hash: {}",
-            block_execution_time, core_lane_block_number, anchor_height, hex::encode(bitcoin_block.anchor_block_hash)
+            "Block execution completed in {:?} for Core Lane block: {} -> anchor height: {} {}: {}",
+            block_execution_time,
+            core_lane_block_number,
+            anchor_height,
+            anchor_hash_label,
+            hex::encode(bitcoin_block.anchor_block_hash)
         );
 
         // Track block processing time
@@ -2940,6 +2951,7 @@ impl CoreLaneNode {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_espresso_scanner(
         &self,
         espresso_base_url: String,
@@ -2948,6 +2960,7 @@ impl CoreLaneNode {
         start_anchor: Option<u64>,
         espresso_namespace: u64,
         chain_id: u32,
+        sequencer_address: Option<Address>,
     ) -> Result<()> {
         info!(
             "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
@@ -3040,6 +3053,7 @@ impl CoreLaneNode {
                         current_core_lane_tip,
                         current_anchor_height,
                         current_anchor_parent_hash.clone(),
+                        sequencer_address,
                     )
                     .await
                     {
@@ -4824,6 +4838,7 @@ async fn main() -> Result<()> {
                     start_anchor,
                     espresso_namespace,
                     chain_id,
+                    sequencer_addr,
                 )
                 .await
             });
