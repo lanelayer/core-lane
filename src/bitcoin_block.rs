@@ -14,7 +14,9 @@ use bitcoin::{
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::block::{decode_tx_envelope, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn};
+use crate::block::{
+    decode_tx_envelope, AnchorSource, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn,
+};
 
 pub fn process_bitcoin_block(
     bitcoin_client: Arc<dyn BitcoinRpcReadClient>,
@@ -55,6 +57,7 @@ pub fn process_bitcoin_block(
         bitcoin_block_timestamp,
         height,
         parent_hash,
+        AnchorSource::Bitcoin,
     );
 
     for (tx_index, tx) in block.txdata.iter().enumerate() {

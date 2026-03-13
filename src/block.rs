@@ -685,6 +685,14 @@ pub fn extract_burn<T: Transaction>(tx: &T, expected_chain_id: u32) -> Option<Co
 }
 
 #[derive(Debug, Clone)]
+pub enum AnchorSource {
+    /// anchor_block_hash is a Bitcoin block hash
+    Bitcoin,
+    /// anchor_block_hash is a Core Lane EVM block hash (used by derived/Espresso lanes)
+    CoreLane,
+}
+
+#[derive(Debug, Clone)]
 pub struct CoreLaneBlockParsed {
     pub bundles: Vec<CoreLaneBundle>,
     pub burns: Vec<CoreLaneBurn>,
@@ -692,6 +700,7 @@ pub struct CoreLaneBlockParsed {
     pub anchor_block_timestamp: u64,
     pub anchor_block_height: u64,
     pub parent_hash: Vec<u8>,
+    pub anchor_source: AnchorSource,
 }
 
 impl CoreLaneBlockParsed {
@@ -700,6 +709,7 @@ impl CoreLaneBlockParsed {
         anchor_block_timestamp: u64,
         anchor_block_height: u64,
         parent_hash: Vec<u8>,
+        anchor_source: AnchorSource,
     ) -> Self {
         Self {
             bundles: Vec::new(),
@@ -708,6 +718,7 @@ impl CoreLaneBlockParsed {
             anchor_block_timestamp,
             anchor_block_height,
             parent_hash,
+            anchor_source,
         }
     }
 

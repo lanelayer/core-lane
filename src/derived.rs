@@ -5,7 +5,7 @@ use alloy_rpc_types::{BlockId, BlockNumberOrTag};
 use anyhow::{anyhow, Result};
 use tracing::{info, warn};
 
-use crate::block::{decode_tx_envelope, extract_burn, CoreLaneBlockParsed};
+use crate::block::{decode_tx_envelope, extract_burn, AnchorSource, CoreLaneBlockParsed};
 
 pub async fn fetch_core_block_number(rpc_url: &str) -> Result<u64> {
     let url = rpc_url.parse()?;
@@ -36,6 +36,7 @@ pub async fn process_core_lane_block(
         anchor_block_timestamp,
         height,
         parent_hash,
+        AnchorSource::CoreLane,
     );
 
     let txs: Vec<alloy_rpc_types::Transaction> = match &block.transactions {
