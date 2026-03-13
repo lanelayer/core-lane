@@ -1,7 +1,7 @@
 use crate::block::{
     decode_tx_envelope, extract_burn, CoreLaneBlockParsed, CoreLaneBundleCbor, CoreLaneBurn,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag, BlockTransactions};
 use anyhow::{anyhow, Result};
@@ -209,6 +209,7 @@ pub async fn process_espresso_block(
     previous_core_lane_tip: [u8; 32],
     previous_anchor_height: u64,
     previous_anchor_parent_hash: Vec<u8>,
+    sequencer_address: Option<Address>,
 ) -> Result<CoreLaneBlockParsed> {
     let height = header.height();
     let mut core_lane_block = CoreLaneBlockParsed::new(
@@ -261,43 +262,16 @@ pub async fn process_espresso_block(
         namespace
     );
 
-    let mut first_tx_processed = false;
+    // The sequencer's bundle has anchor prefix and is signed by a sequencer
+    let mut sequencer_bundle_found = false;
 
     for tx_data in transactions {
-        let (derived_core_lane_tip, tx_without_prefix) = if !first_tx_processed {
+        // Only attempt to find the anchor prefix if we haven't found the sequencer's bundle yet.
+        let (core_lane_tip_hash, tx_without_prefix) = if !sequencer_bundle_found {
             parse_core_lane_anchor_prefix(&tx_data)
         } else {
             (None, tx_data.as_slice())
         };
-
-        let pending_anchor = if !first_tx_processed {
-            if let Some(core_lane_tip_hash) = derived_core_lane_tip {
-                match fetch_core_lane_block_metadata(core_rpc_url, core_lane_tip_hash).await {
-                    Some((tip_height, tip_parent_hash)) => {
-                        info!(
-                            "Espresso: found Core Lane anchor tip hash in first transaction of block {}: {} (height {})",
-                            height,
-                            hex::encode(core_lane_tip_hash),
-                            tip_height,
-                        );
-                        Some((core_lane_tip_hash, tip_height, tip_parent_hash))
-                    }
-                    None => {
-                        warn!(
-                            "Espresso: Core Lane tip hash {} claimed in block {} prefix not found in Core Lane; ignoring",
-                            hex::encode(core_lane_tip_hash),
-                            height
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        first_tx_processed = true;
 
         match CoreLaneBundleCbor::from_cbor(tx_without_prefix) {
             Ok(cbor_bundle) => {
@@ -306,15 +280,78 @@ pub async fn process_espresso_block(
                     height,
                     cbor_bundle.transactions.len()
                 );
-                if let Err(e) = core_lane_block.add_bundle_from_cbor(cbor_bundle) {
-                    warn!(
-                        "Espresso: failed to process CBOR bundle in block {}: {}",
-                        height, e
-                    );
-                } else if let Some((tip_hash, tip_height, tip_parent_hash)) = pending_anchor {
-                    core_lane_block.anchor_block_hash = tip_hash;
-                    core_lane_block.anchor_block_height = tip_height;
-                    core_lane_block.parent_hash = tip_parent_hash;
+
+                // Check if this is the sequencer's bundle: has anchor prefix + valid signature.
+                let has_anchor_prefix = core_lane_tip_hash.is_some();
+                let is_signed_by_sequencer = if !has_anchor_prefix {
+                    false
+                } else {
+                    match sequencer_address {
+                        None => true,
+                        Some(expected) => match cbor_bundle.recover_signer_address() {
+                            Ok(signer) if signer == expected => true,
+                            Ok(signer) => {
+                                warn!(
+                                    "Espresso block {}: bundle has anchor prefix but signer {} != sequencer {}, treating as standard",
+                                    height, signer, expected
+                                );
+                                false
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Espresso block {}: bundle has anchor prefix but no valid signature: {}, treating as standard",
+                                    height, e
+                                );
+                                false
+                            }
+                        },
+                    }
+                };
+                let is_sequencer_bundle =
+                    !sequencer_bundle_found && has_anchor_prefix && is_signed_by_sequencer;
+
+                // For the sequencer's bundle, fetch the Core Lane block it anchors to
+                // and promote the bundle to HEAD if the anchor resolves successfully.
+                let anchor = if is_sequencer_bundle {
+                    let tip_hash = core_lane_tip_hash.unwrap();
+                    match fetch_core_lane_block_metadata(core_rpc_url, tip_hash).await {
+                        Some((tip_height, tip_parent_hash)) => {
+                            info!(
+                                "Espresso: HEAD bundle in block {} anchors to Core Lane tip {} (height {})",
+                                height,
+                                hex::encode(tip_hash),
+                                tip_height,
+                            );
+                            Some((tip_hash, tip_height, tip_parent_hash))
+                        }
+                        None => {
+                            warn!(
+                                "Espresso: Core Lane tip hash {} claimed in block {} not found in Core Lane; anchor not applied",
+                                hex::encode(tip_hash),
+                                height
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                match core_lane_block.add_bundle_from_cbor(cbor_bundle) {
+                    Ok(()) => {
+                        if let Some((tip_hash, tip_height, tip_parent_hash)) = anchor {
+                            core_lane_block.anchor_block_hash = tip_hash;
+                            core_lane_block.anchor_block_height = tip_height;
+                            core_lane_block.parent_hash = tip_parent_hash;
+                            sequencer_bundle_found = true;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Espresso: failed to process CBOR bundle in block {}: {}",
+                            height, e
+                        );
+                    }
                 }
             }
             Err(_) => {
@@ -329,11 +366,6 @@ pub async fn process_espresso_block(
                         sender,
                         tx_without_prefix.to_vec(),
                     );
-                    if let Some((tip_hash, tip_height, tip_parent_hash)) = pending_anchor {
-                        core_lane_block.anchor_block_hash = tip_hash;
-                        core_lane_block.anchor_block_height = tip_height;
-                        core_lane_block.parent_hash = tip_parent_hash;
-                    }
                 } else {
                     warn!(
                         "Espresso: failed to decode transaction in block {} ({} bytes)",
@@ -341,6 +373,31 @@ pub async fn process_espresso_block(
                         tx_without_prefix.len()
                     );
                 }
+            }
+        }
+    }
+
+    // If no HEAD bundle was found, advance the anchor to the current Core Lane tip
+    // so burns are not skipped during blocks without a sequencer bundle.
+    if !sequencer_bundle_found {
+        match fetch_core_lane_tip(core_rpc_url).await {
+            Ok(tip) => {
+                info!(
+                    "Espresso block {}: no HEAD bundle, advancing anchor to Core Lane tip {} (height {})",
+                    height,
+                    hex::encode(tip.hash),
+                    tip.height,
+                );
+                core_lane_block.anchor_block_hash = tip.hash;
+                core_lane_block.anchor_block_height = tip.height;
+                core_lane_block.parent_hash = tip.parent_hash;
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "Espresso block {}: no HEAD bundle and failed to fetch Core Lane tip: {}",
+                    height,
+                    e
+                ));
             }
         }
     }
