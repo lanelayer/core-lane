@@ -1,3 +1,5 @@
+use crate::account::CoreLaneAccount;
+use crate::intents::Intent;
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
@@ -5,10 +7,9 @@ use anyhow::Result;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Write;
-
-use crate::account::CoreLaneAccount;
-use crate::intents::Intent;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct Log {
@@ -89,7 +90,9 @@ pub struct StateManager {
     stored_blobs: BTreeMap<B256, Vec<u8>>,
     kv_storage: BTreeMap<String, Vec<u8>>,
     intents: BTreeMap<B256, Intent>,
+    #[borsh(skip)]
     transactions: Vec<StoredTransaction>,
+    #[borsh(skip)]
     transaction_receipts: BTreeMap<String, TransactionReceipt>,
 }
 
@@ -453,11 +456,56 @@ impl StateManager {
             .map_err(|e| anyhow::anyhow!("Failed to borsh serialize StateManager: {}", e))
     }
 
+    /// Restore transactions and transaction_receipts from persisted delta files.
+    /// Snapshots skip those two fields.
+    /// Call this after deserialization to rebuild.
+    pub fn rebuild_index_from_deltas(
+        &mut self,
+        data_dir: &str,
+        block_number: u64,
+    ) -> Result<usize> {
+        let deltas_dir = Path::new(data_dir).join("deltas");
+
+        // Read and deserialize every block into a temporary Vec.
+        let mut bundles: Vec<BundleStateManager> = Vec::with_capacity(block_number as usize);
+        for block_num in 1..=block_number {
+            let bytes = fs::read(deltas_dir.join(block_num.to_string())).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "Delta file missing for block {} (expected in {})",
+                        block_num,
+                        deltas_dir.display()
+                    )
+                } else {
+                    anyhow::anyhow!("Could not read delta for block {}: {}", block_num, e)
+                }
+            })?;
+            let bundle = BundleStateManager::borsh_deserialize(&bytes).map_err(|e| {
+                anyhow::anyhow!("Could not deserialize delta for block {}: {}", block_num, e)
+            })?;
+            bundles.push(bundle);
+        }
+
+        // Apply to self.
+        let mut total_txs = 0usize;
+        for bundle in bundles {
+            total_txs += bundle.transactions.len();
+            for tx in bundle.transactions {
+                self.add_transaction(tx);
+            }
+            for (hash, receipt) in bundle.transaction_receipts {
+                self.add_receipt(hash, receipt);
+            }
+        }
+        Ok(total_txs)
+    }
+
     /// Deserialize a StateManager from a byte slice using borsh.
     /// On "not all bytes read" style errors, the error message includes file length and bytes consumed.
     pub fn borsh_deserialize(bytes: &[u8]) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(bytes);
-        let result = borsh::BorshDeserialize::deserialize_reader(&mut cursor);
+        let result: std::io::Result<StateManager> =
+            borsh::BorshDeserialize::deserialize_reader(&mut cursor);
         let consumed = cursor.position() as usize;
         match result {
             Ok(value) => {

@@ -757,51 +757,14 @@ impl CoreLaneState {
         self.bitcoin_client_write.clone()
     }
 
-    /// Rollback state to the specified Core Lane block number
+    /// Rollback state to the specified Core Lane block number.
     /// This loads the state from disk for the target block and updates tracking maps
-    pub fn rollback_to_block(&mut self, target_block: u64, data_dir: &str) -> Result<()> {
+    pub fn rollback_to_block(
+        &mut self,
+        target_block: u64,
+        loaded_state: state::StateManager,
+    ) -> Result<()> {
         info!("🔄 Rolling back state to Core Lane block {}", target_block);
-
-        // Load the state from disk for the target block
-        let loaded_state = {
-            use std::fs;
-            use std::path::Path;
-
-            let blocks_dir = Path::new(data_dir).join("blocks");
-            let block_file = blocks_dir.join(format!("{}", target_block));
-
-            info!("💾 Looking for state file: {}", block_file.display());
-            if !block_file.exists() {
-                return Err(anyhow::anyhow!(
-                    "State file not found for block {}",
-                    target_block
-                ));
-            }
-
-            info!("💾 Reading state file for block {}", target_block);
-            let serialized_state = fs::read(&block_file)?;
-            info!(
-                "💾 Deserializing state for block {} ({} bytes)",
-                target_block,
-                serialized_state.len()
-            );
-
-            match StateManager::borsh_deserialize(&serialized_state) {
-                Ok(state) => {
-                    info!("✅ Successfully loaded state for block {}", target_block);
-                    state
-                }
-                Err(e) => {
-                    error!(
-                        "❌ Failed to deserialize state for block {} (file length {} bytes): {}",
-                        target_block,
-                        serialized_state.len(),
-                        e
-                    );
-                    return Err(e);
-                }
-            }
-        };
 
         // Replace the current state with the loaded state
         info!("🔄 Replacing current state with loaded state");
@@ -1468,14 +1431,24 @@ impl CoreLaneNode {
             ));
         }
         let serialized_state = fs::read(&block_file)?;
-        StateManager::borsh_deserialize(&serialized_state).map_err(|e| {
+        let mut state = StateManager::borsh_deserialize(&serialized_state).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to deserialize state for block {} (file length {} bytes): {}",
                 block_number,
                 serialized_state.len(),
                 e
             )
-        })
+        })?;
+
+        // Snapshots only store execution state (accounts, blobs, kv, intents).
+        // Restore transactions and receipts from delta files.
+        let total_txs = state.rebuild_index_from_deltas(data_dir, block_number)?;
+        info!(
+            "✅ Loaded state for block {} with {} transactions from deltas",
+            block_number, total_txs
+        );
+
+        Ok(state)
     }
 
     /// Load MetaState for a block from disk (static, for use at startup).
@@ -2305,13 +2278,15 @@ impl CoreLaneNode {
         {
             let mut state = self.state.lock().await;
 
-            // Write the delta (changes) to disk before applying them
-            if let Err(e) = self.write_delta_to_disk(block_number, &bundle_state) {
-                error!(
-                    "Failed to write delta for block {} to disk: {}",
-                    block_number, e
-                );
-            }
+            // Write the delta (changes) to disk before applying them.
+            self.write_delta_to_disk(block_number, &bundle_state)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to write delta for block {} to disk: {}",
+                        block_number,
+                        e
+                    )
+                })?;
 
             // Apply the changes to the actual state
             state.account_manager.apply_changes(bundle_state);
@@ -3116,19 +3091,25 @@ impl CoreLaneNode {
         }
     }
 
-    /// Perform the actual rollback after lock is released
+    /// Perform the actual rollback after lock is released.
     async fn perform_rollback(&self, fork_core_block: u64) -> Result<()> {
         // Rollback state to the fork point
         info!("💾 Loading state from disk for block {}", fork_core_block);
-        {
-            let mut state_mut = self.state.lock().await;
-            state_mut.rollback_to_block(fork_core_block, &self.data_dir)?;
-        }
+        let loaded_state = CoreLaneNode::load_state_from_disk(&self.data_dir, fork_core_block)?;
+        let metastate_result = self.read_metastate_from_disk(fork_core_block);
 
-        // Load and restore metastate (EIP-1559 fee manager and total burned amount)
-        {
+        let restart_bitcoin_height = {
             let mut state_mut = self.state.lock().await;
-            match self.read_metastate_from_disk(fork_core_block) {
+
+            state_mut.rollback_to_block(fork_core_block, loaded_state)?;
+
+            info!(
+                "🔄 Successfully rolled back to Core Lane block {}",
+                fork_core_block
+            );
+
+            // Install metastate (EIP-1559 fee manager and total burned amount)
+            match metastate_result {
                 Ok(metastate) => {
                     info!(
                         "✅ Successfully loaded metastate for block {}",
@@ -3149,17 +3130,9 @@ impl CoreLaneNode {
                     warn!("⚠️ Continuing with current metastate (may not match historical state)");
                 }
             }
-        }
 
-        info!(
-            "🔄 Successfully rolled back to Core Lane block {}",
-            fork_core_block
-        );
-
-        // Get the actual Bitcoin height that we'll restart from (the rollback set last_processed_anchor_height)
-        let restart_bitcoin_height = {
-            let state = self.state.lock().await;
-            match state.last_processed_anchor_height {
+            // Read back the Bitcoin height set by rollback_to_block while still under the lock
+            match state_mut.last_processed_anchor_height {
                 Some(height) => height + 1,
                 None => {
                     error!("❌ Rollback succeeded but last_processed_anchor_height is None");
