@@ -26,11 +26,11 @@ use cartesi_machine::types::cmio::ManualReason;
 #[cfg(feature = "cartesi-runner")]
 use cartesi_machine::Machine;
 #[cfg(feature = "cartesi-runner")]
+use runner::add_webhook_delivery_service;
+#[cfg(feature = "cartesi-runner")]
 use runner::http_server::{add_http_server_with_kv_store, KvStore};
 #[cfg(feature = "cartesi-runner")]
 use runner::RunnerState;
-#[cfg(feature = "cartesi-runner")]
-use runner::{add_webhook_delivery_service, Submission};
 use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -38,26 +38,27 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+/// Separator bytes in tx input: <path><sep><payload>. Sep byte selects Content-Type.
 #[cfg(feature = "cartesi-runner")]
-fn build_submission_from_input(input: &Bytes, block_timestamp: u64) -> Submission {
-    use std::collections::HashMap;
+const CONTENT_TYPES: [&str; 10] = [
+    "application/octet-stream",          // \0
+    "application/json",                  // \1
+    "text/plain",                        // \2
+    "application/x-www-form-urlencoded", // \3
+    "multipart/form-data",               // \4
+    "application/xml",                   // \5
+    "text/xml",                          // \6
+    "application/cbor",                  // \7
+    "application/protobuf",              // \8
+    "text/html",                         // \9
+];
 
-    Submission {
-        tx_hash: None,
-        intent_id: None,
-        user: "core-lane".to_string(),
-        action: "execute".to_string(),
-        params: Some({
-            let mut params = HashMap::new();
-            params.insert(
-                "input".to_string(),
-                serde_json::Value::String(hex::encode(input.as_ref())),
-            );
-            params
-        }),
-        timestamp: block_timestamp.to_string(),
-        block_height: None,
-        confirmations: None,
+#[cfg(feature = "cartesi-runner")]
+fn content_type_from_sep(sep: u8) -> &'static str {
+    if sep < CONTENT_TYPES.len() as u8 {
+        CONTENT_TYPES[sep as usize]
+    } else {
+        CONTENT_TYPES[0] // default to octet-stream for unknown
     }
 }
 
@@ -1294,7 +1295,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     gas_used: U256,
     _state: &mut T,
     bundle_state: Arc<std::sync::Mutex<BundleStateManager>>,
-    block_timestamp: u64,
+    _block_timestamp: u64,
 ) -> Result<ExecutionResult> {
     let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
 
@@ -1335,12 +1336,22 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         );
     }
 
-    // Parse input format: <path>\0<payload> (null byte separator is required)
-    // Note: path in transaction data does NOT include the leading /, we add it here
-    let (webhook_path, payload) = if let Some(null_pos) = input.iter().position(|&b| b == 0) {
-        // Format: <path>\0<payload> where path is without leading /
-        let path_bytes = &input[..null_pos];
-        let payload_bytes = &input[null_pos + 1..];
+    // Parse input format: <path><sep><payload>
+    // Sep is a single byte 0x00..=0x09 mapping to Content-Type (0=octet-stream, 1=json, 2=text/plain, etc.)
+    // Path does NOT include leading /; we add it here
+    let (webhook_path, payload, content_type) = {
+        let sep_pos = input
+            .iter()
+            .position(|&b| b <= 9)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Input must contain separator byte (0x00..=0x09) between path and payload, got {} bytes",
+                    input.len()
+                )
+            })?;
+        let sep = input[sep_pos];
+        let path_bytes = &input[..sep_pos];
+        let payload_bytes = &input[sep_pos + 1..];
 
         if path_bytes.is_empty() {
             return Err(anyhow::anyhow!("Webhook path cannot be empty"));
@@ -1348,28 +1359,17 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
 
         let path = String::from_utf8(path_bytes.to_vec())
             .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in webhook path: {}", e))?;
-
-        // Add leading / to construct the webhook path
         let full_path = format!("/{}", path);
-
-        info!("Using webhook path: {}", full_path);
-        (full_path, Bytes::from(payload_bytes.to_vec()))
-    } else {
-        // Null byte separator is required - fail if not present
-        return Err(anyhow::anyhow!(
-            "Input must contain null byte separator (format: <path>\\0<payload>), got {} bytes without separator",
-            input.len()
-        ));
+        let ct = content_type_from_sep(sep);
+        info!("Using webhook path: {}, content-type: {}", full_path, ct);
+        (
+            full_path,
+            Bytes::from(payload_bytes.to_vec()),
+            ct.to_string(),
+        )
     };
 
-    // Prepare webhook submission data from payload
-    let submission = build_submission_from_input(&payload, block_timestamp);
-    let body = match serde_json::to_vec(&submission) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Failed to serialize submission: {}", e));
-        }
-    };
+    let body = payload.to_vec();
 
     // State machine state
     let mut execution_state = None;
@@ -1379,7 +1379,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         webhook_path,
         "localhost:8080".to_string(),
         body,
-        "application/json".to_string(),
+        content_type,
     ));
 
     if let Some((port, path, host, body, content_type)) = webhook_data.take() {
@@ -1513,8 +1513,9 @@ pub async fn run_cartesi_query(
     path: String,
     method: QueryMethod,
     body: Bytes,
+    content_type: Option<String>,
     bundle_state: BundleStateManager,
-    block_timestamp: u64,
+    _block_timestamp: u64,
 ) -> Result<Vec<u8>> {
     let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
 
@@ -1552,27 +1553,31 @@ pub async fn run_cartesi_query(
     }
     let webhook_path = format!("/{}", path_trimmed);
 
-    let payload = body;
-    let submission = build_submission_from_input(&payload, block_timestamp);
-    let body_bytes = serde_json::to_vec(&submission)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize submission: {}", e))?;
-
-    let content_type = match method {
-        QueryMethod::Get => "application/octet-stream",
-        QueryMethod::Post => "application/json",
-    };
+    let body_bytes = body.to_vec();
+    let content_type = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     let mut execution_state = None;
     {
         let mut state_guard = runner_state.lock().await;
         if let Some(client) = state_guard.get_client(HTTP_CLIENT_PORT) {
-            client.queue_post_request(
-                HTTP_CLIENT_PORT,
-                webhook_path.clone(),
-                "localhost:8080".to_string(),
-                body_bytes,
-                content_type.to_string(),
-            );
+            match method {
+                QueryMethod::Get => {
+                    client.queue_get_request(
+                        HTTP_CLIENT_PORT,
+                        webhook_path.clone(),
+                        "localhost:8080".to_string(),
+                    );
+                }
+                QueryMethod::Post => {
+                    client.queue_post_request(
+                        HTTP_CLIENT_PORT,
+                        webhook_path.clone(),
+                        "localhost:8080".to_string(),
+                        body_bytes,
+                        content_type,
+                    );
+                }
+            }
             if let Err(e) =
                 state_guard.initiate_connection(HTTP_CLIENT_PORT, GUEST_CID, CONTAINER_PORT)
             {
@@ -1625,7 +1630,7 @@ pub async fn run_cartesi_query(
     Err(anyhow::anyhow!("HTTP client or response not found"))
 }
 
-/// HTTP method for read-only query (machine currently only supports POST; GET is sent as POST with empty body).
+/// HTTP method for read-only query (GET and POST are passed through to the guest).
 #[derive(Debug, Clone, Copy)]
 pub enum QueryMethod {
     Get,
