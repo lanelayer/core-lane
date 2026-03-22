@@ -2256,7 +2256,7 @@ dependencies = [
  "bitflags 2.10.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -3055,7 +3055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3758,7 +3758,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5909,8 +5909,8 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite 0.2.16",
- "socket2 0.6.1",
- "system-configuration 0.5.1",
+ "socket2 0.5.10",
+ "system-configuration 0.6.1",
  "tokio",
  "tower-service",
  "tracing",
@@ -8789,7 +8789,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.35",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -8826,7 +8826,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -9460,7 +9460,7 @@ checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 [[package]]
 name = "runner"
 version = "0.1.0"
-source = "git+https://github.com/lanelayer/cli?rev=966d8997305c978e7f783d54e7e12307fbbde121#966d8997305c978e7f783d54e7e12307fbbde121"
+source = "git+https://github.com/lanelayer/cli?rev=1a5022308227df8f5b2426ca1eea44ada1c2ddae#1a5022308227df8f5b2426ca1eea44ada1c2ddae"
 dependencies = [
  "bytes 1.11.0",
  "cartesi-machine",
@@ -12267,7 +12267,7 @@ dependencies = [
 [[package]]
 name = "vsock-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lanelayer/cli?rev=966d8997305c978e7f783d54e7e12307fbbde121#966d8997305c978e7f783d54e7e12307fbbde121"
+source = "git+https://github.com/lanelayer/cli?rev=1a5022308227df8f5b2426ca1eea44ada1c2ddae#1a5022308227df8f5b2426ca1eea44ada1c2ddae"
 
 [[package]]
 name = "wait-timeout"
@@ -12546,7 +12546,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

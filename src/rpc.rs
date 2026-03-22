@@ -3170,6 +3170,12 @@ impl RpcServer {
             QueryMethod::Post
         };
 
+        let content_type = request
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         let body = match to_bytes(request.into_body(), usize::MAX).await {
             Ok(b) => Bytes::from(b.to_vec()),
             Err(_) => return Err(StatusCode::BAD_REQUEST),
@@ -3229,6 +3235,7 @@ impl RpcServer {
                 path,
                 method,
                 body,
+                content_type,
                 bundle_state,
                 block_timestamp,
             ))
