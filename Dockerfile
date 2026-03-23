@@ -33,6 +33,7 @@ WORKDIR /app
 
 
 COPY --from=builder /app/target/release/core-lane-node .
+COPY --from=builder /app/target/release/espresso-watcher .
 COPY scripts/entrypoint-rpc.sh /app/entrypoint-rpc.sh
 RUN chmod +x /app/entrypoint-rpc.sh
 

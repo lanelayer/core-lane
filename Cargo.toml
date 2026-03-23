@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "core-lane-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "espresso-watcher"
+path = "src/bin/espresso_watcher.rs"
+
 [features]
 default = ["cartesi-runner"]
 cartesi-runner = ["cartesi-machine"]

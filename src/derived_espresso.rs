@@ -199,11 +199,15 @@ pub async fn fetch_espresso_block_number(base_url: &str) -> Result<u64> {
     Ok(height_plus_one.saturating_sub(1))
 }
 
+/// Process a single Espresso lane block by height (DA namespace fetch + bundle decode).
+/// `block_timestamp` is used for the derived Core Lane block metadata; prefer the real
+/// Espresso header timestamp when available (see [`process_espresso_block`]).
 #[allow(clippy::too_many_arguments)]
-pub async fn process_espresso_block(
+pub async fn process_espresso_block_at_height(
     base_url: &str,
     core_rpc_url: &str,
-    header: Header,
+    height: u64,
+    block_timestamp: u64,
     namespace: u64,
     chain_id: u32,
     previous_core_lane_tip: [u8; 32],
@@ -211,10 +215,9 @@ pub async fn process_espresso_block(
     previous_anchor_parent_hash: Vec<u8>,
     sequencer_address: Option<Address>,
 ) -> Result<CoreLaneBlockParsed> {
-    let height = header.height();
     let mut core_lane_block = CoreLaneBlockParsed::new(
         previous_core_lane_tip,
-        header.timestamp(),
+        block_timestamp,
         previous_anchor_height,
         previous_anchor_parent_hash,
     );
@@ -414,6 +417,33 @@ pub async fn process_espresso_block(
     }
 
     Ok(core_lane_block)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_espresso_block(
+    base_url: &str,
+    core_rpc_url: &str,
+    header: Header,
+    namespace: u64,
+    chain_id: u32,
+    previous_core_lane_tip: [u8; 32],
+    previous_anchor_height: u64,
+    previous_anchor_parent_hash: Vec<u8>,
+    sequencer_address: Option<Address>,
+) -> Result<CoreLaneBlockParsed> {
+    process_espresso_block_at_height(
+        base_url,
+        core_rpc_url,
+        header.height(),
+        header.timestamp(),
+        namespace,
+        chain_id,
+        previous_core_lane_tip,
+        previous_anchor_height,
+        previous_anchor_parent_hash,
+        sequencer_address,
+    )
+    .await
 }
 
 pub async fn fetch_namespace_transactions(

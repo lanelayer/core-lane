@@ -317,6 +317,12 @@ if [ "${ONLY_START:-}" = "derived-espresso" ]; then
   fi
 
   echo "[entrypoint] starting derived-espresso on ${HTTP_HOST}:${HTTP_PORT}"
+  derived_no_poll_normalized="${DERIVED_NO_POLL,,}"
+  derived_on_demand_flag=()
+  if [ "$derived_no_poll_normalized" = "true" ] || [ "$derived_no_poll_normalized" = "1" ] || [ "$derived_no_poll_normalized" = "yes" ]; then
+    derived_on_demand_flag=(--on-demand-polling)
+    echo "[entrypoint] DERIVED_NO_POLL enabled for derived-espresso — use POST /do_poll or espresso-watcher"
+  fi
   args=(
     derived-espresso-start
     --data-dir "${DATA_DIR}"
@@ -331,6 +337,7 @@ if [ "${ONLY_START:-}" = "derived-espresso" ]; then
   [ -n "${START_ANCHOR:-}" ]        && args+=(--start-anchor "${START_ANCHOR}")
   [ -n "${SEQUENCER_RPC_URL:-}" ]  && args+=(--sequencer-rpc-url "${SEQUENCER_RPC_URL}")
   [ -n "${SEQUENCER_ADDRESS:-}" ]  && args+=(--sequencer-address "${SEQUENCER_ADDRESS}")
+  args+=("${derived_on_demand_flag[@]}")
 
   "/app/core-lane-node" "${args[@]}" &
   DERIVED_ESPRESSO_PID=$!
