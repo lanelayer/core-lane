@@ -2610,18 +2610,17 @@ impl RpcServer {
         let start_block = newest_block.saturating_sub(block_count.saturating_sub(1));
         let end_block = newest_block;
 
-        // Get base fee history from EIP-1559 fee manager
-        let _base_fee_history = state
-            .eip1559_fee_manager
-            .get_base_fee_history(start_block, end_block);
-
         // Build base fee array
         let mut base_fees = Vec::new();
         let mut gas_used_ratios = Vec::new();
         let mut rewards = Vec::new();
 
         for block_num in start_block..=end_block {
-            if let Some(base_fee) = state.eip1559_fee_manager.get_base_fee_for_block(block_num) {
+            if let Some(base_fee) = state
+                .blocks
+                .get(&block_num)
+                .and_then(|b| b.base_fee_per_gas)
+            {
                 base_fees.push(format!("0x{:x}", base_fee));
 
                 // Get gas used ratio for this block
@@ -2658,8 +2657,9 @@ impl RpcServer {
                                     // For non-1559 transactions, use the excess over base fee as priority fee
                                     alloy_consensus::TxEnvelope::Legacy(tx) => {
                                         if let Some(base_fee) = state
-                                            .eip1559_fee_manager
-                                            .get_base_fee_for_block(block_num)
+                                            .blocks
+                                            .get(&block_num)
+                                            .and_then(|b| b.base_fee_per_gas)
                                         {
                                             let tx_gas_price = U256::from(tx.tx().gas_price);
                                             if tx_gas_price > base_fee {
