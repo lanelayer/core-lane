@@ -48,7 +48,7 @@ impl MetaState {
 
 /// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
 /// When this is bumped, any existing tip file will be treated as invalid and all block data (blocks/, metastate/, deltas/, chain_index/, tip) will be wiped so the node starts from genesis.
-const TIP_FORMAT_VERSION: u8 = 4;
+const TIP_FORMAT_VERSION: u8 = 5;
 
 /// Persisted chain tip for restore-from-disk on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1208,6 +1208,7 @@ impl CoreLaneNode {
                 let _ = dir.sync_all();
             }
         }
+
         info!(
             "💾 Wrote metastate for block {} to {}",
             block_number,

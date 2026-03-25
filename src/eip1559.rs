@@ -1,7 +1,6 @@
 use alloy_primitives::U256;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// EIP-1559 fee parameters and state management
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,8 +39,6 @@ pub struct Eip1559FeeManager {
     config: Eip1559Config,
     /// Current base fee per gas
     current_base_fee: U256,
-    /// Block number to base fee mapping for historical tracking
-    base_fee_history: HashMap<u64, U256>,
 }
 
 impl Eip1559FeeManager {
@@ -50,7 +47,6 @@ impl Eip1559FeeManager {
         let config = Eip1559Config::default();
         Self {
             current_base_fee: config.initial_base_fee,
-            base_fee_history: HashMap::new(),
             config,
         }
     }
@@ -60,7 +56,6 @@ impl Eip1559FeeManager {
     pub fn with_config(config: Eip1559Config) -> Self {
         Self {
             current_base_fee: config.initial_base_fee,
-            base_fee_history: HashMap::new(),
             config,
         }
     }
@@ -68,11 +63,6 @@ impl Eip1559FeeManager {
     /// Get the current base fee per gas
     pub fn current_base_fee(&self) -> U256 {
         self.current_base_fee
-    }
-
-    /// Get the base fee for a specific block number
-    pub fn get_base_fee_for_block(&self, block_number: u64) -> Option<U256> {
-        self.base_fee_history.get(&block_number).copied()
     }
 
     /// Calculate the base fee for the next block based on current block's gas usage
@@ -125,15 +115,9 @@ impl Eip1559FeeManager {
     }
 
     /// Update the base fee for a new block
-    pub fn update_base_fee(&mut self, block_number: u64, gas_used: U256) -> U256 {
+    pub fn update_base_fee(&mut self, _block_number: u64, gas_used: U256) -> U256 {
         let new_base_fee = self.calculate_next_base_fee(gas_used);
-
-        // Store the base fee for this block
-        self.base_fee_history.insert(block_number, new_base_fee);
-
-        // Update current base fee
         self.current_base_fee = new_base_fee;
-
         new_base_fee
     }
 
@@ -262,17 +246,6 @@ impl Eip1559FeeManager {
     /// Get the target gas usage per block (EIP-1559 target)
     pub fn target_gas_usage(&self) -> U256 {
         self.config.target_gas_usage
-    }
-
-    /// Get the base fee history for a range of blocks
-    pub fn get_base_fee_history(&self, start_block: u64, end_block: u64) -> Vec<(u64, U256)> {
-        (start_block..=end_block)
-            .filter_map(|block_num| {
-                self.base_fee_history
-                    .get(&block_num)
-                    .map(|&base_fee| (block_num, base_fee))
-            })
-            .collect()
     }
 
     /// Get gas used ratio for a block (for fee history)
