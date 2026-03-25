@@ -2533,7 +2533,7 @@ impl CoreLaneNode {
         };
 
         // Convert string logs to proper Log objects
-        let logs: Vec<state::Log> = execution_result
+        let mut logs: Vec<state::Log> = execution_result
             .logs
             .iter()
             .enumerate()
@@ -2550,6 +2550,23 @@ impl CoreLaneNode {
                 removed: false,
             })
             .collect();
+
+        // Persist execution output as an emitted receipt log so it is fetchable via eth_getTransactionReceipt.
+        if !execution_result.output.is_empty() {
+            let output_log_index = logs.len();
+            logs.push(state::Log {
+                address: "0x0000000000000000000000000000000000000000".to_string(),
+                topics: vec!["0x636f72656c616e652e657865637574696f6e2e6f7574707574".to_string()],
+                data: format!("0x{}", hex::encode(execution_result.output.as_ref())),
+                block_number: format!("0x{:x}", block_number),
+                transaction_hash: tx_hash.clone(),
+                transaction_index: format!("0x{:x}", tx_number),
+                block_hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                log_index: format!("0x{:x}", output_log_index),
+                removed: false,
+            });
+        }
 
         let receipt = TransactionReceipt {
             transaction_hash: tx_hash.clone(),
