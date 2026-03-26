@@ -298,6 +298,14 @@ impl RpcServer {
             {
                 let state = rpc_state.state.lock().await;
                 if let Some(receipt) = state.account_manager.get_receipt(&normalized_hash) {
+                    if receipt.status != "0x1" {
+                        return Err(anyhow::anyhow!(
+                            "Forwarded query transaction failed in receipt: tx={}, status={}",
+                            normalized_hash,
+                            receipt.status
+                        ));
+                    }
+
                     if let Some(output_log) = receipt.logs.iter().find(|log| {
                         log.topics
                             .iter()
@@ -312,11 +320,8 @@ impl RpcServer {
                         return Ok(Self::parse_raw_http_response(bytes));
                     }
                     return Ok(ForwardedQueryResponse {
-                        status: StatusCode::OK,
-                        headers: vec![(
-                            "Content-Type".to_string(),
-                            "application/octet-stream".to_string(),
-                        )],
+                        status: StatusCode::NO_CONTENT,
+                        headers: Vec::new(),
                         body: Vec::new(),
                     });
                 }
@@ -3377,11 +3382,17 @@ impl RpcServer {
                     Self::wait_for_receipt_output(&rpc_state, &tx_hash, Duration::from_secs(60))
                         .await
                         .map_err(|e| {
-                            warn!(
-                                "Timed out waiting for forwarded query receipt output: {}",
-                                e
-                            );
-                            StatusCode::GATEWAY_TIMEOUT
+                            let msg = e.to_string();
+                            if msg.contains("Timed out waiting for receipt output") {
+                                warn!(
+                                    "Timed out waiting for forwarded query receipt output: {}",
+                                    msg
+                                );
+                                StatusCode::GATEWAY_TIMEOUT
+                            } else {
+                                warn!("Forwarded query receipt indicated failure: {}", msg);
+                                StatusCode::BAD_GATEWAY
+                            }
                         })?;
 
                 let mut builder = axum::response::Response::builder()
