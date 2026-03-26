@@ -9,7 +9,7 @@ app = 'lane-espresso'
 primary_region = 'cdg'
 
 [build]
-  image = 'ghcr.io/lanelayer/core-lane/core-lane:latest'
+  image = 'ghcr.io/lanelayer/core-lane/core-lane@sha256:132078ed8da02c2825726f884e544f63dac8e93d6c7f73bb4b95cf3b962fef1d'
 
 [env]
   ONLY_START = 'derived-espresso'
