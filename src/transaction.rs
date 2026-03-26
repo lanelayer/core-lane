@@ -1453,7 +1453,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     let (machine_output, execution_success) = {
         let mut state_guard = state_clone.lock().await;
         if let Some(http_client) = state_guard.get_client(HTTP_CLIENT_PORT) {
-            if let Some(response_data) = http_client.get_write_data(HTTP_CLIENT_PORT) {
+            if let Some(response_data) = http_client.get_response_data(HTTP_CLIENT_PORT) {
                 info!(
                     "Retrieved HTTP response from client: {} bytes",
                     response_data.len()
@@ -1623,7 +1623,7 @@ pub async fn run_cartesi_query(
     // Only reached when webhook succeeded; extract response from runner state
     let mut state_guard = runner_state.lock().await;
     if let Some(http_client) = state_guard.get_client(HTTP_CLIENT_PORT) {
-        if let Some(response_data) = http_client.get_write_data(HTTP_CLIENT_PORT) {
+        if let Some(response_data) = http_client.get_response_data(HTTP_CLIENT_PORT) {
             return Ok(response_data);
         }
     }
