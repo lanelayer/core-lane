@@ -10,7 +10,7 @@ use alloy_signer_local::PrivateKeySigner;
 use axum::body::to_bytes;
 use axum::{
     extract::{Json, Request},
-    http::StatusCode,
+    http::{HeaderName, HeaderValue, StatusCode},
     response::Json as JsonResponse,
     routing::{get, post},
     Router,
@@ -23,7 +23,16 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn};
+
+const EXECUTION_OUTPUT_TOPIC: &str = "0x636f72656c616e652e657865637574696f6e2e6f7574707574";
+
+struct ForwardedQueryResponse {
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
 
 async fn fetch_core_lane_tip(rpc_url: &str) -> anyhow::Result<(u64, B256, B256)> {
     let url: Url = rpc_url.parse()?;
@@ -174,6 +183,156 @@ pub struct RpcServer {
 }
 
 impl RpcServer {
+    async fn forward_query_post_to_sequencer(
+        sequencer_rpc_url: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<String, anyhow::Error> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to create HTTP client: {}", e))?;
+
+        let rpc_path = format!("/{}", path.trim_start_matches('/'));
+        let payload_hex = format!("0x{}", hex::encode(body));
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "lane_post",
+            "params": [rpc_path, content_type, payload_hex]
+        });
+
+        let response = client
+            .post(sequencer_rpc_url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send query to sequencer RPC: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Sequencer RPC returned error status: {}",
+                response.status()
+            ));
+        }
+
+        let json_response: Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {}", e))?;
+
+        if let Some(error) = json_response.get("error") {
+            if !error.is_null() {
+                let error_msg = error
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("Unknown error");
+                return Err(anyhow::anyhow!("Sequencer RPC error: {}", error_msg));
+            }
+        }
+
+        let tx_hash = json_response
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| anyhow::anyhow!("No result in sequencer RPC response"))?;
+        Ok(tx_hash.to_string())
+    }
+
+    fn parse_raw_http_response(raw: Vec<u8>) -> ForwardedQueryResponse {
+        if raw.starts_with(b"HTTP/") {
+            if let Some(split_idx) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = &raw[..split_idx];
+                let body = raw[split_idx + 4..].to_vec();
+                if let Ok(head_str) = std::str::from_utf8(head) {
+                    let mut lines = head_str.split("\r\n");
+                    let mut status = StatusCode::OK;
+                    if let Some(status_line) = lines.next() {
+                        let parts: Vec<&str> = status_line.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            if let Ok(code) = parts[1].parse::<u16>() {
+                                if let Ok(s) = StatusCode::from_u16(code) {
+                                    status = s;
+                                }
+                            }
+                        }
+                    }
+                    let mut headers = Vec::new();
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            headers.push((k.trim().to_string(), v.trim().to_string()));
+                        }
+                    }
+                    return ForwardedQueryResponse {
+                        status,
+                        headers,
+                        body,
+                    };
+                }
+            }
+        }
+
+        ForwardedQueryResponse {
+            status: StatusCode::OK,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
+            body: raw,
+        }
+    }
+
+    async fn wait_for_receipt_output(
+        rpc_state: &Arc<Self>,
+        tx_hash: &str,
+        timeout: Duration,
+    ) -> Result<ForwardedQueryResponse, anyhow::Error> {
+        let deadline = Instant::now() + timeout;
+        let normalized_hash = if tx_hash.starts_with("0x") {
+            tx_hash.to_lowercase()
+        } else {
+            format!("0x{}", tx_hash).to_lowercase()
+        };
+
+        loop {
+            {
+                let state = rpc_state.state.lock().await;
+                if let Some(receipt) = state.account_manager.get_receipt(&normalized_hash) {
+                    if let Some(output_log) = receipt.logs.iter().find(|log| {
+                        log.topics
+                            .iter()
+                            .any(|t| t.eq_ignore_ascii_case(EXECUTION_OUTPUT_TOPIC))
+                    }) {
+                        let raw = output_log
+                            .data
+                            .strip_prefix("0x")
+                            .unwrap_or(&output_log.data);
+                        let bytes = hex::decode(raw)
+                            .map_err(|e| anyhow::anyhow!("Invalid execution output hex: {}", e))?;
+                        return Ok(Self::parse_raw_http_response(bytes));
+                    }
+                    return Ok(ForwardedQueryResponse {
+                        status: StatusCode::OK,
+                        headers: vec![(
+                            "Content-Type".to_string(),
+                            "application/octet-stream".to_string(),
+                        )],
+                        body: Vec::new(),
+                    });
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "Timed out waiting for receipt output for tx {}",
+                    normalized_hash
+                ));
+            }
+
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     pub fn with_bitcoin_client(
         state: Arc<Mutex<CoreLaneState>>,
         bitcoin_client: Option<Arc<core_lane::BitcoinRpcClient>>,
@@ -3170,6 +3329,8 @@ impl RpcServer {
             QueryMethod::Post
         };
 
+        let query_only_header_present = request.headers().get("x-query-only").is_some();
+
         let content_type = request
             .headers()
             .get("content-type")
@@ -3180,6 +3341,72 @@ impl RpcServer {
             Ok(b) => Bytes::from(b.to_vec()),
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
+
+        if request_method_is_post(&method) && !query_only_header_present {
+            if let Some(sequencer_rpc_url) = &rpc_state.sequencer_rpc_url {
+                if at_param.is_some() {
+                    return Ok(axum::response::Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "error": "snapshot_not_supported_for_forwarded_post",
+                                "message": "POST /query with ?at is not supported when forwarding to sequencer"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap());
+                }
+
+                let query_content_type = content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let tx_hash = Self::forward_query_post_to_sequencer(
+                    sequencer_rpc_url,
+                    &path,
+                    &query_content_type,
+                    body.as_ref(),
+                )
+                .await
+                .map_err(|e| {
+                    warn!("Failed to forward POST /query to sequencer: {}", e);
+                    StatusCode::BAD_GATEWAY
+                })?;
+
+                let output =
+                    Self::wait_for_receipt_output(&rpc_state, &tx_hash, Duration::from_secs(60))
+                        .await
+                        .map_err(|e| {
+                            warn!(
+                                "Timed out waiting for forwarded query receipt output: {}",
+                                e
+                            );
+                            StatusCode::GATEWAY_TIMEOUT
+                        })?;
+
+                let mut builder = axum::response::Response::builder()
+                    .status(output.status)
+                    .header("Cache-Control", "no-store")
+                    .header("X-Forwarded-Tx-Hash", tx_hash);
+
+                for (k, v) in &output.headers {
+                    let skip = k.eq_ignore_ascii_case("connection")
+                        || k.eq_ignore_ascii_case("transfer-encoding")
+                        || k.eq_ignore_ascii_case("content-length");
+                    if skip {
+                        continue;
+                    }
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(v),
+                    ) {
+                        builder = builder.header(name, value);
+                    }
+                }
+
+                return Ok(builder.body(axum::body::Body::from(output.body)).unwrap());
+            }
+        }
 
         let (block_number, snapshot_pinned) = {
             let state = rpc_state.state.lock().await;
@@ -3691,6 +3918,10 @@ impl RpcServer {
             })),
         }
     }
+}
+
+fn request_method_is_post(method: &QueryMethod) -> bool {
+    matches!(method, QueryMethod::Post)
 }
 
 // Helper function to parse Address from string
