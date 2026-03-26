@@ -59,7 +59,7 @@ bdk_bitcoind_rpc = "0.22.0"
 bdk_electrum = { version = "0.23.0", features = ["use-openssl"] }
 cartesi-machine = { git = "https://github.com/lanelayer/cm-rust-bindings", rev = "80aa8ef3c76ca768c546b035a23524f72e948d47", features = ["download_uarch"], optional = true }
 alloy-network = "1.0.27"
-runner = { git = "https://github.com/lanelayer/cli", rev = "1a5022308227df8f5b2426ca1eea44ada1c2ddae", package = "runner" }
+runner = { git = "https://github.com/lanelayer/cli", rev = "c4ee96be2dd3f436518b51a0c553db57959d835c", package = "runner" }
 base64 = "0.22"
 vbs = "0.1.7"
 surf-disco = "0.9.5"
