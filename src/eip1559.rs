@@ -17,6 +17,20 @@ pub struct Eip1559Config {
     pub base_fee_change_denominator: U256,
     /// Elasticity multiplier (typically 2)
     pub elasticity_multiplier: U256,
+    /// When true, base fee is fixed at zero: no L2 gas-token burn; sequencing is paid on the
+    /// sequencer / data-availability layer (e.g. derived lanes without a native gas token).
+    #[serde(default)]
+    pub zero_base_fee: bool,
+}
+
+impl Eip1559Config {
+    /// Configuration for derived lanes that do not charge a base (burn) fee on-chain.
+    pub fn derived_lane_zero_base_fee() -> Self {
+        let mut c = Self::default();
+        c.zero_base_fee = true;
+        c.initial_base_fee = U256::ZERO;
+        c
+    }
 }
 
 impl Default for Eip1559Config {
@@ -28,6 +42,7 @@ impl Default for Eip1559Config {
             target_gas_usage: U256::from(15_000_000u64),    // 15M gas (50% of limit)
             base_fee_change_denominator: U256::from(8u64),
             elasticity_multiplier: U256::from(2u64),
+            zero_base_fee: false,
         }
     }
 }
@@ -54,8 +69,13 @@ impl Eip1559FeeManager {
     /// Create a new EIP-1559 fee manager with custom configuration
     #[allow(dead_code)]
     pub fn with_config(config: Eip1559Config) -> Self {
+        let current_base_fee = if config.zero_base_fee {
+            U256::ZERO
+        } else {
+            config.initial_base_fee
+        };
         Self {
-            current_base_fee: config.initial_base_fee,
+            current_base_fee,
             config,
         }
     }
@@ -70,6 +90,9 @@ impl Eip1559FeeManager {
     /// base_fee = parent_base_fee + parent_base_fee * gas_used_delta / parent_gas_limit / base_fee_change_denominator
     /// where gas_used_delta = parent_gas_used - parent_gas_target
     pub fn calculate_next_base_fee(&self, gas_used: U256) -> U256 {
+        if self.config.zero_base_fee {
+            return U256::ZERO;
+        }
         let parent_base_fee = self.current_base_fee;
         let _parent_gas_limit = self.config.gas_limit;
         let parent_gas_target = self.config.target_gas_usage;
@@ -236,6 +259,9 @@ impl Eip1559FeeManager {
     #[allow(dead_code)]
     pub fn update_config(&mut self, config: Eip1559Config) {
         self.config = config;
+        if self.config.zero_base_fee {
+            self.current_base_fee = U256::ZERO;
+        }
     }
 
     /// Get the maximum block gas limit (EIP-1559 maximum)
@@ -355,5 +381,19 @@ mod tests {
         assert_eq!(base_fee_portion, base_fee * gas_limit);
         assert_eq!(priority_fee_portion, priority_fee * gas_limit);
         assert_eq!(total_fee, base_fee_portion + priority_fee_portion);
+    }
+
+    #[test]
+    fn test_zero_base_fee_stays_zero() {
+        let config = Eip1559Config::derived_lane_zero_base_fee();
+        let mut manager = Eip1559FeeManager::with_config(config);
+        assert_eq!(manager.current_base_fee(), U256::ZERO);
+        let high_gas = manager.config().gas_limit;
+        let next = manager.update_base_fee(1, high_gas);
+        assert_eq!(next, U256::ZERO);
+        assert_eq!(manager.current_base_fee(), U256::ZERO);
+        assert!(manager
+            .validate_eip1559_transaction(U256::ZERO, U256::ZERO, U256::from(21_000u64))
+            .is_ok());
     }
 }
