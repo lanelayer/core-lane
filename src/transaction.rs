@@ -28,7 +28,10 @@ use cartesi_machine::Machine;
 #[cfg(feature = "cartesi-runner")]
 use runner::add_webhook_delivery_service;
 #[cfg(feature = "cartesi-runner")]
-use runner::http_server::{add_http_server_with_kv_store, KvStore};
+use runner::http_server::{
+    add_http_server_with_kv_store, add_http_server_with_kv_store_and_metadata, BlockMetadata,
+    KvStore,
+};
 #[cfg(feature = "cartesi-runner")]
 use runner::RunnerState;
 use std::borrow::Cow;
@@ -155,8 +158,17 @@ pub fn execute_transaction<T: ProcessingContext>(
     bundle_state: &mut BundleStateManager,
     state: &mut T,
     block_timestamp: u64,
+    #[cfg(feature = "cartesi-runner")] block_metadata: Option<BlockMetadata>,
 ) -> Result<ExecutionResult> {
-    execute_transfer(tx, sender, bundle_state, state, block_timestamp)
+    execute_transfer(
+        tx,
+        sender,
+        bundle_state,
+        state,
+        block_timestamp,
+        #[cfg(feature = "cartesi-runner")]
+        block_metadata,
+    )
 }
 
 /// Get gas limit from transaction
@@ -228,6 +240,7 @@ fn execute_transfer<T: ProcessingContext>(
     bundle_state: &mut BundleStateManager,
     state: &mut T,
     block_timestamp: u64,
+    #[cfg(feature = "cartesi-runner")] block_metadata: Option<BlockMetadata>,
 ) -> Result<ExecutionResult> {
     // When Cartesi support is disabled --no-default-features
     // `block_timestamp` is currently unused. Keep signature stable but silence `-D warnings`.
@@ -283,6 +296,7 @@ fn execute_transfer<T: ProcessingContext>(
                 state,
                 bundle_state_arc.clone(),
                 block_timestamp,
+                block_metadata,
             ))
         });
         {
@@ -1296,6 +1310,7 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     _state: &mut T,
     bundle_state: Arc<std::sync::Mutex<BundleStateManager>>,
     _block_timestamp: u64,
+    block_metadata: Option<BlockMetadata>,
 ) -> Result<ExecutionResult> {
     let snapshot_path = std::env::var("LANELAYER_HTTP_RUNNER_SNAPSHOT")?;
 
@@ -1327,7 +1342,18 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
     // Set up HTTP server and webhook service
     {
         let mut state_guard = runner_state.lock().await;
-        add_http_server_with_kv_store(&mut state_guard, bundle_state.clone());
+        match block_metadata {
+            Some(meta) => {
+                add_http_server_with_kv_store_and_metadata(
+                    &mut state_guard,
+                    bundle_state.clone(),
+                    meta,
+                );
+            }
+            None => {
+                add_http_server_with_kv_store(&mut state_guard, bundle_state.clone());
+            }
+        }
         add_webhook_delivery_service(
             &mut state_guard,
             HTTP_CLIENT_PORT,

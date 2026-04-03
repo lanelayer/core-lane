@@ -95,6 +95,8 @@ use core_lane::{bitcoin_block::process_bitcoin_block, block::CoreLaneBlockParsed
 use intents::create_anchor_bitcoin_fill_intent;
 use reqwest::Client;
 use rpc::RpcServer;
+#[cfg(feature = "cartesi-runner")]
+use runner::BlockMetadata;
 use state::{StateManager, StoredTransaction, TransactionReceipt};
 use taproot_da::TaprootDA;
 use transaction::execute_transaction;
@@ -2032,6 +2034,16 @@ impl CoreLaneNode {
         // Track cumulative gas used for this block (EIP-1559 maximum enforcement)
         let mut cumulative_gas_used = U256::ZERO;
 
+        // Block metadata exposed to the Cartesi guest via /metadata/json
+        #[cfg(feature = "cartesi-runner")]
+        let block_metadata = BlockMetadata {
+            timestamp: new_block.timestamp,
+            block_number: new_block.number,
+            parent_block_hash: format!("0x{:x}", new_block.parent_hash),
+            anchor_block_hash: format!("0x{}", hex::encode(bitcoin_block.anchor_block_hash)),
+            anchor_block_number: bitcoin_block.anchor_block_height,
+        };
+
         // Create a single bundle state manager for the entire block
         let mut bundle_state = state::BundleStateManager::new();
 
@@ -2128,6 +2140,8 @@ impl CoreLaneNode {
                             cumulative_gas_used,
                             Some(bundle.sequencer_payment_recipient),
                             new_block.timestamp,
+                            #[cfg(feature = "cartesi-runner")]
+                            block_metadata.clone(),
                         )
                         .await;
 
@@ -2240,6 +2254,8 @@ impl CoreLaneNode {
                                 cumulative_gas_used,
                                 Some(bundle.sequencer_payment_recipient),
                                 new_block.timestamp,
+                                #[cfg(feature = "cartesi-runner")]
+                                block_metadata.clone(),
                             )
                             .await;
 
@@ -2359,6 +2375,7 @@ impl CoreLaneNode {
         cumulative_gas_used: U256,
         sequencer_payment_recipient: Option<Address>,
         block_timestamp: u64,
+        #[cfg(feature = "cartesi-runner")] block_metadata: BlockMetadata,
     ) -> Option<(StoredTransaction, TransactionReceipt, String)> {
         let tx_start_time = Instant::now();
 
@@ -2483,15 +2500,21 @@ impl CoreLaneNode {
         }
 
         // Execute transaction with bundle state
-        let execution_result =
-            match execute_transaction(&tx.0, tx.1, bundle_state, &mut *state, block_timestamp) {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!("      ⚠️  Transaction execution failed with error: {}", e);
-                    // Return None to skip this transaction
-                    return None;
-                }
-            };
+        let execution_result = match execute_transaction(
+            &tx.0,
+            tx.1,
+            bundle_state,
+            &mut *state,
+            block_timestamp,
+            #[cfg(feature = "cartesi-runner")]
+            Some(block_metadata),
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("      ⚠️ Transaction execution failed with error: {}", e);
+                return None;
+            }
+        };
 
         // Log execution outcome
         if execution_result.success {
