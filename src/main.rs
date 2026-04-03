@@ -1068,7 +1068,9 @@ impl CoreLaneNode {
                 genesis_block: genesis_block.clone(),
                 bitcoin_client_read: bitcoin_client_read.clone(),
                 bitcoin_client_write: bitcoin_client_write.clone(),
-                eip1559_fee_manager: eip1559::Eip1559FeeManager::with_config(eip1559_config.clone()),
+                eip1559_fee_manager: eip1559::Eip1559FeeManager::with_config(
+                    eip1559_config.clone(),
+                ),
                 sequencer_address: sequencer_addr,
                 total_burned_amount: U256::ZERO,
                 bitcoin_network: network,
