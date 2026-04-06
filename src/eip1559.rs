@@ -26,10 +26,11 @@ pub struct Eip1559Config {
 impl Eip1559Config {
     /// Configuration for derived lanes that do not charge a base (burn) fee on-chain.
     pub fn derived_lane_zero_base_fee() -> Self {
-        let mut c = Self::default();
-        c.zero_base_fee = true;
-        c.initial_base_fee = U256::ZERO;
-        c
+        Self {
+            zero_base_fee: true,
+            initial_base_fee: U256::ZERO,
+            ..Default::default()
+        }
     }
 }
 
