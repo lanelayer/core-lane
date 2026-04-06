@@ -48,7 +48,8 @@ impl MetaState {
 
 /// Version byte for tip file format. Enables schema evolution; change when ChainTip/CoreLaneBlock layout changes.
 /// When this is bumped, any existing tip file will be treated as invalid and all block data (blocks/, metastate/, deltas/, chain_index/, tip) will be wiped so the node starts from genesis.
-const TIP_FORMAT_VERSION: u8 = 5;
+/// v6: EIP-1559 `Eip1559Config` includes `zero_base_fee` (bincode metastate layout).
+const TIP_FORMAT_VERSION: u8 = 6;
 
 /// Persisted chain tip for restore-from-disk on startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +316,9 @@ enum Commands {
         /// When enabled, block scanning only occurs when triggered via POST /do_poll endpoint
         #[arg(long)]
         on_demand_polling: bool,
+        /// Fix base fee at zero (no L2 burn); for derived lanes where DA/sequencer carries cost
+        #[arg(long)]
+        zero_base_fee: bool,
     },
 
     Burn {
@@ -512,6 +516,9 @@ enum Commands {
         /// When enabled, block scanning only occurs when triggered via POST /do_poll endpoint
         #[arg(long)]
         on_demand_polling: bool,
+        /// Fix base fee at zero (no L2 burn); for derived lanes where DA/sequencer carries cost
+        #[arg(long)]
+        zero_base_fee: bool,
     },
     /// Start a derived Core Lane node that reads bundles from an Espresso.
     DerivedEspressoStart {
@@ -544,6 +551,9 @@ enum Commands {
         /// If not provided, defaults to a well-known test address (insecure for production)
         #[arg(long)]
         sequencer_address: Option<String>,
+        /// Fix base fee at zero (no L2 burn); for derived lanes where DA/sequencer carries cost
+        #[arg(long)]
+        zero_base_fee: bool,
     },
 }
 
@@ -886,6 +896,14 @@ struct CoreLaneNode {
     core_lane_rpc_url: Option<String>,
 }
 
+fn eip1559_config_from_flag(zero_base_fee: bool) -> eip1559::Eip1559Config {
+    if zero_base_fee {
+        eip1559::Eip1559Config::derived_lane_zero_base_fee()
+    } else {
+        eip1559::Eip1559Config::default()
+    }
+}
+
 impl CoreLaneNode {
     fn new(
         bitcoin_client_read: Arc<dyn BitcoinRpcReadClient>,
@@ -894,6 +912,7 @@ impl CoreLaneNode {
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
+        eip1559_config: eip1559::Eip1559Config,
     ) -> Self {
         Self::new_with_clients(
             Some(bitcoin_client_read),
@@ -902,6 +921,7 @@ impl CoreLaneNode {
             data_dir,
             network,
             sequencer_address,
+            eip1559_config,
         )
     }
 
@@ -909,8 +929,17 @@ impl CoreLaneNode {
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
+        eip1559_config: eip1559::Eip1559Config,
     ) -> Self {
-        Self::new_with_clients(None, None, None, data_dir, network, sequencer_address)
+        Self::new_with_clients(
+            None,
+            None,
+            None,
+            data_dir,
+            network,
+            sequencer_address,
+            eip1559_config,
+        )
     }
 
     fn new_with_clients(
@@ -920,9 +949,9 @@ impl CoreLaneNode {
         data_dir: String,
         network: bitcoin::Network,
         sequencer_address: Option<Address>,
+        eip1559_config: eip1559::Eip1559Config,
     ) -> Self {
-        // Create genesis block with EIP-1559 default configuration (always needed)
-        let eip1559_config = eip1559::Eip1559Config::default();
+        // Create genesis block with EIP-1559 configuration (always needed)
         let genesis_block =
             CoreLaneBlock::genesis(eip1559_config.gas_limit, eip1559_config.initial_base_fee);
         let genesis_hash = genesis_block.hash;
@@ -1039,7 +1068,9 @@ impl CoreLaneNode {
                 genesis_block: genesis_block.clone(),
                 bitcoin_client_read: bitcoin_client_read.clone(),
                 bitcoin_client_write: bitcoin_client_write.clone(),
-                eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+                eip1559_fee_manager: eip1559::Eip1559FeeManager::with_config(
+                    eip1559_config.clone(),
+                ),
                 sequencer_address: sequencer_addr,
                 total_burned_amount: U256::ZERO,
                 bitcoin_network: network,
@@ -1053,7 +1084,7 @@ impl CoreLaneNode {
 
         // Write genesis state to disk only when we did not restore (so we don't overwrite existing state)
         if !restored {
-            if let Err(e) = Self::write_genesis_state(&data_dir, sequencer_addr) {
+            if let Err(e) = Self::write_genesis_state(&data_dir, sequencer_addr, &eip1559_config) {
                 error!("Failed to write genesis state to disk: {}", e);
             }
         }
@@ -1472,7 +1503,11 @@ impl CoreLaneNode {
     }
 
     /// Write the genesis state (block 0) to disk
-    pub fn write_genesis_state(data_dir: &str, sequencer_address: Address) -> Result<()> {
+    pub fn write_genesis_state(
+        data_dir: &str,
+        sequencer_address: Address,
+        eip1559_config: &eip1559::Eip1559Config,
+    ) -> Result<()> {
         use std::fs;
         use std::path::Path;
 
@@ -1499,7 +1534,7 @@ impl CoreLaneNode {
 
         // Create initial metastate for genesis block
         let genesis_metastate = MetaState {
-            eip1559_fee_manager: eip1559::Eip1559FeeManager::new(),
+            eip1559_fee_manager: eip1559::Eip1559FeeManager::with_config(eip1559_config.clone()),
             total_burned_amount: U256::ZERO,
             sequencer_address,
         };
@@ -2469,28 +2504,33 @@ impl CoreLaneNode {
                 total_fee, base_fee_portion, priority_fee_portion
             );
         } else if tx.0.is_legacy() {
-            // Legacy transaction handling (fallback to fixed gas price)
-            let gas_price = U256::from(214285714u64); // Fixed legacy gas price
-            let legacy_tx = tx.0.as_legacy().unwrap();
+            if state.eip1559_fee_manager.config().zero_base_fee {
+                // Align with EIP-1559 zero-fee mode: no on-chain L2 gas charge for derived lanes
+                info!("      💰 Legacy tx: zero base fee mode — no L2 gas charge");
+            } else {
+                let legacy_tx = tx.0.as_legacy().unwrap();
+                // Legacy transaction handling (fallback to fixed gas price)
+                let gas_price = U256::from(214285714u64); // Fixed legacy gas price
 
-            if gas_price > legacy_tx.tx().gas_price {
-                warn!(
-                    "      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}",
-                    tx.0
-                );
-                return None;
+                if gas_price > legacy_tx.tx().gas_price {
+                    warn!(
+                        "      ⚠️  Gas fee is greater than the legacy transaction gas price, skipping: {:?}",
+                        tx.0
+                    );
+                    return None;
+                }
+
+                let gas_fee = gas_price * gas_limit;
+                if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
+                    warn!(
+                        "      ⚠️  Failed to charge legacy gas fee: {}, skipping: {:?}",
+                        e, tx.0
+                    );
+                    return None;
+                }
+
+                info!("      💰 Charged legacy gas fee: {} wei", gas_fee);
             }
-
-            let gas_fee = gas_price * gas_limit;
-            if let Err(e) = bundle_state.sub_balance(&state.account_manager, tx.1, gas_fee) {
-                warn!(
-                    "      ⚠️  Failed to charge legacy gas fee: {}, skipping: {:?}",
-                    e, tx.0
-                );
-                return None;
-            }
-
-            info!("      💰 Charged legacy gas fee: {} wei", gas_fee);
         } else {
             warn!(
                 "      ⚠️  Unsupported transaction type, skipping: {:?}",
@@ -2551,7 +2591,12 @@ impl CoreLaneNode {
             (effective_price, gas_limit)
         } else if tx.0.is_legacy() {
             let legacy_tx = tx.0.as_legacy().unwrap();
-            (U256::from(legacy_tx.tx().gas_price), gas_limit)
+            let effective = if state.eip1559_fee_manager.config().zero_base_fee {
+                U256::ZERO
+            } else {
+                U256::from(legacy_tx.tx().gas_price)
+            };
+            (effective, gas_limit)
         } else {
             (U256::from(214285714u64), gas_limit) // Default fallback
         };
@@ -3311,6 +3356,7 @@ async fn main() -> Result<()> {
             sequencer_rpc_url,
             sequencer_address,
             on_demand_polling,
+            zero_base_fee,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -3328,6 +3374,11 @@ async fn main() -> Result<()> {
                 );
             } else {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
+            }
+
+            let eip1559_config = eip1559_config_from_flag(*zero_base_fee);
+            if *zero_base_fee {
+                info!("✅ EIP-1559 zero base fee mode (L2 burn disabled; use for derived lanes)");
             }
 
             // Resolve mnemonic from various sources (optional if sequencer_rpc_url is provided)
@@ -3421,6 +3472,7 @@ async fn main() -> Result<()> {
                         cli.data_dir.clone(),
                         network,
                         sequencer_addr,
+                        eip1559_config.clone(),
                     );
                     (Arc::clone(&node.state), None, None, None) // node_opt = None to skip block scanner
                 } else {
@@ -3474,6 +3526,7 @@ async fn main() -> Result<()> {
                         cli.data_dir.clone(),
                         network,
                         sequencer_addr,
+                        eip1559_config.clone(),
                     );
                     let shared_state = Arc::clone(&node.state);
                     let bitcoin_client_write = node
@@ -4042,6 +4095,7 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone(),
                 network,
                 None,
+                eip1559::Eip1559Config::default(),
             );
             node.send_transaction_to_da(
                 raw_tx_hex,
@@ -4132,6 +4186,7 @@ async fn main() -> Result<()> {
                 cli.data_dir.clone(),
                 network,
                 None,
+                eip1559::Eip1559Config::default(),
             );
             node.send_bundle_to_da(
                 raw_tx_hex_vec.clone(),
@@ -4675,6 +4730,7 @@ async fn main() -> Result<()> {
             sequencer_rpc_url,
             sequencer_address,
             on_demand_polling,
+            zero_base_fee,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -4694,8 +4750,17 @@ async fn main() -> Result<()> {
                 info!("✅ Using sequencer address: {:?}", sequencer_addr);
             }
 
-            let node =
-                CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
+            let eip1559_config = eip1559_config_from_flag(*zero_base_fee);
+            if *zero_base_fee {
+                info!("✅ EIP-1559 zero base fee mode (L2 burn disabled; use for derived lanes)");
+            }
+
+            let node = CoreLaneNode::new_derived(
+                cli.data_dir.clone(),
+                Network::Regtest,
+                sequencer_addr,
+                eip1559_config,
+            );
 
             let da_address = Address::from_str(derived_da_address).map_err(|err| {
                 anyhow::anyhow!(
@@ -4772,6 +4837,7 @@ async fn main() -> Result<()> {
             http_port,
             sequencer_rpc_url,
             sequencer_address,
+            zero_base_fee,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -4796,8 +4862,17 @@ async fn main() -> Result<()> {
                 espresso_base_url
             );
 
-            let mut node =
-                CoreLaneNode::new_derived(cli.data_dir.clone(), Network::Regtest, sequencer_addr);
+            let eip1559_config = eip1559_config_from_flag(*zero_base_fee);
+            if *zero_base_fee {
+                info!("✅ EIP-1559 zero base fee mode (L2 burn disabled; use for derived lanes)");
+            }
+
+            let mut node = CoreLaneNode::new_derived(
+                cli.data_dir.clone(),
+                Network::Regtest,
+                sequencer_addr,
+                eip1559_config,
+            );
             node.core_lane_rpc_url = Some(core_lane_rpc_url.clone());
 
             let shared_state = Arc::clone(&node.state);

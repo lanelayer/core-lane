@@ -275,6 +275,7 @@ mod integration_tests {
         if let Err(e) = crate::CoreLaneNode::write_genesis_state(
             temp_dir.to_str().unwrap(),
             test_sequencer_address,
+            &crate::eip1559::Eip1559Config::default(),
         ) {
             panic!("Failed to write genesis state: {}", e);
         }
