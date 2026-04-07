@@ -1319,13 +1319,10 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
         &RuntimeConfig::default(),
     )?);
 
-    // Get and print initial root hash before execution
     {
         let mut machine_guard = machine.lock().await;
-        if let Ok(initial_root_hash) = machine_guard.root_hash() {
-            info!("🔷 INITIAL ROOT HASH: {}", hex::encode(initial_root_hash));
-        } else {
-            tracing::warn!("Failed to get initial root hash");
+        if let Ok(cycle) = machine_guard.mcycle() {
+            info!("Starting cycle: {}", cycle);
         }
     }
 
@@ -1495,23 +1492,10 @@ async fn execute_cartesi_http_runner<T: ProcessingContext>(
 
     let output_len = machine_output.len();
 
-    // Get and print root_hash after execution
-    // The root_hash is now stored in RunnerState by run_machine_loop
-    let state_guard = runner_state.lock().await;
-    if let Some(root_hash) = state_guard.get_root_hash() {
-        info!("🔷 FINAL ROOT HASH: {}", hex::encode(root_hash));
-    } else {
-        tracing::warn!("Root hash not available after execution");
-        // Fallback: try to get it directly from the machine
-        drop(state_guard);
+    {
         let mut machine_guard = machine_arc.lock().await;
-        if let Ok(final_root_hash) = machine_guard.root_hash() {
-            info!(
-                "🔷 FINAL ROOT HASH (from machine): {}",
-                hex::encode(final_root_hash)
-            );
-        } else {
-            tracing::warn!("Failed to get final root hash from machine");
+        if let Ok(cycle) = machine_guard.mcycle() {
+            info!("Finishing cycle: {}", cycle);
         }
     }
 
