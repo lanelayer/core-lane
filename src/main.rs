@@ -544,6 +544,10 @@ enum Commands {
         /// If not provided, defaults to a well-known test address (insecure for production)
         #[arg(long)]
         sequencer_address: Option<String>,
+        /// Enable on-demand polling: wait for POST /do_poll instead of WebSocket block subscription.
+        /// Use with an external watcher that polls the lane and calls /do_poll on this node.
+        #[arg(long)]
+        on_demand_polling: bool,
     },
 }
 
@@ -2959,6 +2963,185 @@ impl CoreLaneNode {
         }
     }
 
+    /// On-demand Espresso catch-up: each POST /do_poll fetches DA for Espresso heights
+    /// from `last_processed_espresso + 1` through current `node/block-height` tip.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_espresso_scanner_on_demand(
+        &self,
+        espresso_base_url: String,
+        core_rpc_url: String,
+        start_block: Option<u64>,
+        espresso_namespace: u64,
+        chain_id: u32,
+        sequencer_address: Option<Address>,
+        poll_trigger_receiver: &mut mpsc::Receiver<()>,
+    ) -> Result<()> {
+        let mut last_espresso_height: Option<u64> = None;
+
+        loop {
+            match poll_trigger_receiver.recv().await {
+                Some(()) => {
+                    info!("🔄 Espresso on-demand: poll trigger received, catching up...");
+                }
+                None => {
+                    warn!("Espresso on-demand: poll trigger channel closed, stopping scanner");
+                    break;
+                }
+            }
+
+            let latest = derived_espresso::fetch_espresso_block_number(&espresso_base_url).await?;
+
+            let restored_anchor = {
+                let state = self.state.lock().await;
+                state.last_processed_anchor_height.map(|last_anchor_height| {
+                    let last_anchor_hash = match state.bitcoin_height_to_hash.get(&last_anchor_height)
+                    {
+                        Some(hash) => *hash,
+                        None => B256::ZERO,
+                    };
+
+                    let parent_hash = if last_anchor_height > 0 {
+                        state
+                            .bitcoin_height_to_hash
+                            .get(&(last_anchor_height - 1))
+                            .map(|h| h.to_vec())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
+                    (<[u8; 32]>::from(last_anchor_hash), last_anchor_height, parent_hash)
+                })
+            };
+
+            let (
+                mut current_core_lane_tip,
+                mut current_anchor_height,
+                mut current_anchor_parent_hash,
+            ) = if let Some(anchor) = restored_anchor {
+                anchor
+            } else {
+                match derived_espresso::fetch_core_lane_tip(&core_rpc_url).await {
+                    Ok(tip) => {
+                        info!(
+                            "Espresso on-demand: seeding from Core Lane tip height={}, hash={}",
+                            tip.height,
+                            hex::encode(tip.hash)
+                        );
+                        (tip.hash, tip.height, tip.parent_hash)
+                    }
+                    Err(e) => {
+                        warn!("Espresso on-demand: failed to fetch Core Lane tip: {}", e);
+                        ([0u8; 32], 0u64, Vec::new())
+                    }
+                }
+            };
+
+            let start_height = if let Some(last) = last_espresso_height {
+                last.saturating_add(1)
+            } else {
+                start_block.unwrap_or_else(|| latest.saturating_sub(10))
+            };
+
+            if start_height > latest {
+                info!(
+                    "Espresso on-demand: nothing to do (start_height {} > latest {})",
+                    start_height, latest
+                );
+                continue;
+            }
+
+            let mut catchup_aborted = false;
+            for height in start_height..=latest {
+                let block_timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                match derived_espresso::process_espresso_block_at_height(
+                    &espresso_base_url,
+                    &core_rpc_url,
+                    height,
+                    block_timestamp,
+                    espresso_namespace,
+                    chain_id,
+                    current_core_lane_tip,
+                    current_anchor_height,
+                    current_anchor_parent_hash.clone(),
+                    sequencer_address,
+                )
+                .await
+                {
+                    Ok(core_lane_block) => {
+                        let anchor_hash = core_lane_block.anchor_block_hash;
+                        current_core_lane_tip = anchor_hash;
+                        current_anchor_height = core_lane_block.anchor_block_height;
+                        current_anchor_parent_hash = core_lane_block.parent_hash.clone();
+
+                        let anchor_hash_bytes = anchor_hash.to_vec();
+
+                        match self.process_block(core_lane_block).await {
+                            Ok(core_lane_block_number) => {
+                                if core_lane_block_number == 0 {
+                                    info!(
+                                        "Espresso on-demand: reorg during catch-up; stop and retry /do_poll"
+                                    );
+                                    last_espresso_height = None;
+                                    catchup_aborted = true;
+                                    break;
+                                }
+
+                                let mut state = self.state.lock().await;
+
+                                if anchor_hash_bytes.len() == 32 {
+                                    let h = B256::from_slice(&anchor_hash_bytes);
+                                    state.block_hashes.insert(h, core_lane_block_number);
+                                    state
+                                        .bitcoin_height_to_hash
+                                        .insert(current_anchor_height, h);
+                                    state.bitcoin_height_to_core_block.insert(
+                                        current_anchor_height,
+                                        core_lane_block_number,
+                                    );
+                                    state.last_processed_anchor_height =
+                                        Some(current_anchor_height);
+                                } else {
+                                    warn!(
+                                        "Espresso on-demand: anchor hash bad length {} for espresso height {}",
+                                        anchor_hash_bytes.len(),
+                                        height
+                                    );
+                                }
+                                let block = state.blocks[&core_lane_block_number].clone();
+                                state.blocks.insert(core_lane_block_number, block);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Espresso on-demand: failed to process derived block (espresso height {}): {}",
+                                    height, err
+                                );
+                                return Err(err);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Espresso on-demand: error at espresso height {}: {}",
+                            height, err
+                        );
+                        return Err(err);
+                    }
+                }
+            }
+
+            if !catchup_aborted {
+                last_espresso_height = Some(latest);
+            }
+        }
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn start_espresso_scanner(
         &self,
@@ -2969,6 +3152,8 @@ impl CoreLaneNode {
         espresso_namespace: u64,
         chain_id: u32,
         sequencer_address: Option<Address>,
+        on_demand_polling: bool,
+        poll_trigger_receiver: Option<mpsc::Receiver<()>>,
     ) -> Result<()> {
         info!(
             "Starting Espresso-derived Core Lane scanner: base_url = {}, namespace = {}",
@@ -2984,6 +3169,24 @@ impl CoreLaneNode {
                 );
                 state.last_processed_anchor_height = Some(anchor);
             }
+        }
+
+        if on_demand_polling {
+            let mut receiver = poll_trigger_receiver.ok_or_else(|| {
+                anyhow::anyhow!("On-demand Espresso mode requires a poll trigger channel")
+            })?;
+            info!("✅ Espresso-derived scanner in on-demand mode; use POST /do_poll to catch up");
+            return self
+                .start_espresso_scanner_on_demand(
+                    espresso_base_url,
+                    core_rpc_url,
+                    start_block,
+                    espresso_namespace,
+                    chain_id,
+                    sequencer_address,
+                    &mut receiver,
+                )
+                .await;
         }
 
         loop {
@@ -4772,6 +4975,7 @@ async fn main() -> Result<()> {
             http_port,
             sequencer_rpc_url,
             sequencer_address,
+            on_demand_polling,
         } => {
             // Parse sequencer address if provided
             let sequencer_addr = sequencer_address
@@ -4804,6 +5008,15 @@ async fn main() -> Result<()> {
             // Pass the full Espresso server base URL (supports query and submit endpoints)
             // so /submit can forward transactions to POST {espresso_base_url}/submit/submit.
 
+            let poll_trigger = if *on_demand_polling {
+                let (tx, rx) = mpsc::channel::<()>(1);
+                Some((tx, rx))
+            } else {
+                None
+            };
+            let poll_trigger_sender = poll_trigger.as_ref().map(|(tx, _)| tx.clone());
+            let poll_trigger_receiver = poll_trigger.map(|(_, rx)| rx);
+
             let espresso_client = Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -4814,7 +5027,7 @@ async fn main() -> Result<()> {
                 sequencer_rpc_url.clone(),
                 Some(espresso_base_url.clone()),
                 Some(core_lane_rpc_url.clone()),
-                None,
+                poll_trigger_sender,
                 espresso_client,
                 *espresso_namespace,
             );
@@ -4836,6 +5049,7 @@ async fn main() -> Result<()> {
             let espresso_namespace = *espresso_namespace;
             let chain_id = *chain_id;
             let core_rpc_url = core_lane_rpc_url.clone();
+            let on_demand = *on_demand_polling;
             let scanner_handle = tokio::spawn(async move {
                 node.start_espresso_scanner(
                     espresso_base_url,
@@ -4845,6 +5059,8 @@ async fn main() -> Result<()> {
                     espresso_namespace,
                     chain_id,
                     sequencer_addr,
+                    on_demand,
+                    poll_trigger_receiver,
                 )
                 .await
             });

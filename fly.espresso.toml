@@ -29,6 +29,8 @@ primary_region = 'cdg'
   START_BLOCK = '11059050'
   START_ANCHOR = '23193'
 
+  # On-demand mode: no WS scanner until POST /do_poll (use with espresso-watcher + SPRITE_URLS)
+  # DERIVED_NO_POLL = 'true'
 
 [[mounts]]
   source = 'core_lane_espresso_storage'
